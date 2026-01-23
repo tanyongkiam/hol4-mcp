@@ -151,6 +151,21 @@ class FileProofCursor:
         """Compute SHA256 hash of content."""
         return hashlib.sha256(content.encode()).hexdigest()
 
+    def _first_changed_line(self, old_content: str, new_content: str) -> int | None:
+        """Return first line number (1-indexed) where content differs, or None if identical."""
+        old_lines = old_content.split('\n')
+        new_lines = new_content.split('\n')
+
+        for i, (old, new) in enumerate(zip(old_lines, new_lines)):
+            if old != new:
+                return i + 1
+
+        # Length difference (lines added/removed at end)
+        if len(old_lines) != len(new_lines):
+            return min(len(old_lines), len(new_lines)) + 1
+
+        return None
+
     def _reparse_if_changed(self) -> bool:
         """Re-read and parse file if content changed. Returns True if changed."""
         content = self.file.read_text()
@@ -159,10 +174,18 @@ class FileProofCursor:
         if content_hash == self._content_hash:
             return False
 
+        # Find first changed line before updating
+        old_content = self._content
+        first_changed = self._first_changed_line(old_content, content)
+
         self._content = content
         self._content_hash = content_hash
         self._line_starts = build_line_starts(content)
         self._theorems = parse_theorems(content)
+
+        # Invalidate checkpoints for theorems at or after the change
+        if first_changed is not None:
+            self._invalidate_checkpoints_from(first_changed)
 
         # Clear active theorem if it was renamed/deleted
         if self._active_theorem:
@@ -283,6 +306,16 @@ class FileProofCursor:
         """Invalidate all checkpoints (e.g., when file changes significantly)."""
         for name in list(self._checkpoints.keys()):
             self._invalidate_checkpoint(name)
+
+    def _invalidate_checkpoints_from(self, start_line: int) -> None:
+        """Invalidate checkpoints for theorems at or after start_line.
+
+        When content changes at line N, all theorems starting at N or later
+        have invalid checkpoints (their context may have changed).
+        """
+        for thm in self._theorems:
+            if thm.start_line >= start_line:
+                self._invalidate_checkpoint(thm.name)
 
     async def init(self, *, skip_holmake: bool = False) -> dict:
         """Initialize cursor - parse file, optionally load deps.

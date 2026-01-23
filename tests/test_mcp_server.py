@@ -245,6 +245,103 @@ async def test_file_status_shows_cheats(tmp_path):
         await hol_stop(session="status_test")
 
 
+async def test_state_at_returns_goals(tmp_path):
+    """Test hol_state_at returns goals when called on a line inside a theorem."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="state_at_test")
+
+        # needs_proof theorem starts at line 18, Proof at line 20, cheat at line 21
+        # Get state at line 21 (inside the proof, at the cheat line)
+        result = await hol_state_at(session="state_at_test", line=21, col=1)
+
+        # Should show tactic info (even if 0/N since cheat is the only tactic)
+        assert "Tactic" in result
+        # Should show goals (proof is not complete since cheat doesn't prove anything)
+        assert "Goals" in result or "goals" in result.lower()
+        # Should NOT have error about position outside theorem
+        assert "not within any theorem" not in result
+    finally:
+        await hol_stop(session="state_at_test")
+
+
+async def test_state_at_outside_theorem(tmp_path):
+    """Test hol_state_at returns error when called outside any theorem."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="outside_test")
+
+        # Line 8 is 'val _ = new_theory "test";' - outside any theorem
+        result = await hol_state_at(session="outside_test", line=8, col=1)
+
+        # Should return an error about position not being in a theorem
+        assert "ERROR" in result
+        assert "not within any theorem" in result
+    finally:
+        await hol_stop(session="outside_test")
+
+
+async def test_file_init_auto_starts_session(tmp_path):
+    """Test hol_file_init auto-starts HOL session if not running."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    session_name = "auto_start_test"
+
+    # Ensure session doesn't exist
+    await hol_stop(session=session_name)
+
+    try:
+        # hol_file_init should auto-start session
+        result = await hol_file_init(file=str(test_file), session=session_name)
+
+        # Should succeed and list theorems
+        assert "Theorems:" in result
+        assert "add_zero" in result
+
+        # Verify session is now running
+        sessions_result = await hol_sessions()
+        assert session_name in sessions_result
+        assert "running" in sessions_result
+    finally:
+        await hol_stop(session=session_name)
+
+
+async def test_state_at_after_file_edit(tmp_path):
+    """Test hol_state_at works correctly after file content changes."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="edit_test")
+
+        # First call to state_at - get state at needs_proof theorem
+        result1 = await hol_state_at(session="edit_test", line=21, col=1)
+        assert "Tactic" in result1
+
+        # Modify the file - add a comment (cursor should detect change and reparse)
+        content = test_file.read_text()
+        new_content = content.replace(
+            "(* Theorem with cheat for testing cheat detection *)",
+            "(* MODIFIED: Theorem with cheat for testing cheat detection *)"
+        )
+        test_file.write_text(new_content)
+
+        # Call state_at again - cursor should reparse the file
+        result2 = await hol_state_at(session="edit_test", line=21, col=1)
+
+        # Should still work (reparse successful)
+        assert "Tactic" in result2
+        # Should NOT error out
+        assert "ERROR" not in result2 or "not within any theorem" not in result2
+    finally:
+        await hol_stop(session="edit_test")
+
+
 # =============================================================================
 # Process Group Tests
 # =============================================================================
