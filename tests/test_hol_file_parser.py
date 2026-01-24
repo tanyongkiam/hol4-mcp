@@ -166,3 +166,99 @@ val it =
     assert result is not None
     assert result.strip().endswith('gvs[]')
     assert ': proof' not in result
+
+
+# Bug 3 regression tests: JSON parsing with preamble
+from hol4_mcp.hol_file_parser import parse_linearize_with_spans_output, HOLParseError
+
+
+def test_parse_linearize_with_preamble():
+    """JSON parsing should work when HOL outputs preamble lines before JSON."""
+    output = '''<<HOL message: loading stuff>>
+<<HOL warning: some warning>>
+{"ok":[{"t":"simp[]","s":0,"e":6,"a":false}]}
+val it = () : unit'''
+    result = parse_linearize_with_spans_output(output)
+    assert len(result) == 1
+    assert result[0][0] == "simp[]"
+
+
+def test_parse_linearize_json_not_first_line():
+    """JSON parsing should find JSON even if it's not on the first line."""
+    output = '''Some random output
+More output
+{"ok":[{"t":"tac","s":0,"e":3,"a":true}]}'''
+    result = parse_linearize_with_spans_output(output)
+    assert len(result) == 1
+    assert result[0][0] == "tac"
+    assert result[0][3] is True  # use_eall
+
+
+def test_parse_linearize_no_json():
+    """Should raise HOLParseError when no valid JSON found."""
+    output = '''No JSON here
+Just some text
+val it = () : unit'''
+    with pytest.raises(HOLParseError, match="No valid JSON"):
+        parse_linearize_with_spans_output(output)
+
+
+def test_parse_linearize_malformed_json_then_valid():
+    """Should skip malformed JSON lines and find valid one."""
+    output = '''{not valid json
+{"ok":[{"t":"good","s":0,"e":4,"a":false}]}'''
+    result = parse_linearize_with_spans_output(output)
+    assert len(result) == 1
+    assert result[0][0] == "good"
+
+
+# Bug 4 regression tests: proof_body_offset
+def test_proof_body_offset_computed():
+    """TheoremInfo should have correct proof_body_offset."""
+    content = '''Theorem foo:
+  !x. P x
+Proof
+  simp[]
+QED
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    thm = thms[0]
+
+    # proof_body_offset should point to 's' in 'simp[]' in the file
+    assert content[thm.proof_body_offset:thm.proof_body_offset + 6] == "simp[]"
+
+
+def test_proof_body_offset_with_leading_whitespace():
+    """proof_body_offset should account for leading whitespace after Proof."""
+    content = '''Theorem foo:
+  P
+Proof
+
+  rw[]
+QED
+'''
+    thms = parse_theorems(content)
+    thm = thms[0]
+
+    # Stripped body is "rw[]", offset should point to 'r'
+    assert thm.proof_body == "rw[]"
+    assert content[thm.proof_body_offset:thm.proof_body_offset + 4] == "rw[]"
+
+
+def test_proof_body_offset_multiline():
+    """proof_body_offset correct for multi-line proof body."""
+    content = '''Theorem foo:
+  !x. P x ==> Q x
+Proof
+  rpt strip_tac
+  >> simp[]
+  >> fs[]
+QED
+'''
+    thms = parse_theorems(content)
+    thm = thms[0]
+
+    # Body starts with 'rpt strip_tac'
+    assert thm.proof_body.startswith("rpt strip_tac")
+    assert content[thm.proof_body_offset:thm.proof_body_offset + 13] == "rpt strip_tac"

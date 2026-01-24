@@ -8,7 +8,7 @@ from pathlib import Path
 from .hol_file_parser import (
     TheoremInfo, parse_file, parse_p_output, parse_theorems,
     TacticSpan, build_line_starts, parse_linearize_with_spans_output,
-    make_tactic_spans, offset_to_line_col, HOLParseError,
+    make_tactic_spans, offset_to_line_col, HOLParseError, _find_json_line,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -483,16 +483,8 @@ class FileProofCursor:
             except HOLParseError as e:
                 return {"error": f"Failed to parse tactics: {e}"}
 
-            # Calculate proof body offset in file
-            # Find where proof body starts (after "Proof\n")
-            proof_start_offset = self._content.find(
-                thm.proof_body,
-                self._line_starts[thm.proof_start_line - 1] if thm.proof_start_line <= len(self._line_starts) else 0
-            )
-            if proof_start_offset == -1:
-                proof_start_offset = 0  # Fallback
-
-            self._active_tactics = make_tactic_spans(raw_spans, proof_start_offset, self._line_starts)
+            # Use the precomputed proof body offset from the parser
+            self._active_tactics = make_tactic_spans(raw_spans, thm.proof_body_offset, self._line_starts)
         else:
             self._active_tactics = []
 
@@ -575,13 +567,8 @@ class FileProofCursor:
                         file_hash=self._content_hash,
                         error=f"Failed to parse tactics: {e}"
                     )
-                proof_start_offset = self._content.find(
-                    thm.proof_body,
-                    self._line_starts[thm.proof_start_line - 1] if thm.proof_start_line <= len(self._line_starts) else 0
-                )
-                if proof_start_offset == -1:
-                    proof_start_offset = 0
-                self._active_tactics = make_tactic_spans(raw_spans, proof_start_offset, self._line_starts)
+                # Use the precomputed proof body offset from the parser
+                self._active_tactics = make_tactic_spans(raw_spans, thm.proof_body_offset, self._line_starts)
         timings['linearize'] = time.perf_counter() - t2
 
         # Check if position is within theorem bounds (include QED line)
@@ -781,12 +768,7 @@ class FileProofCursor:
         Returns: List of goal dicts with 'asms' (list of assumption strings) and 'goal' (conclusion string)
         Raises: HOLParseError if HOL4 returned an error or output is malformed.
         """
-        import json
-
-        try:
-            result = json.loads(output.strip().split('\n')[0])
-        except (ValueError, json.JSONDecodeError) as e:
-            raise HOLParseError(f"Invalid JSON from goals_json: {e}") from e
+        result = _find_json_line(output, "goals_json")
 
         if 'ok' in result:
             goals = []

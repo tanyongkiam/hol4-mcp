@@ -48,6 +48,35 @@ class HOLParseError(Exception):
     pass
 
 
+def _find_json_line(output: str, context: str) -> dict:
+    """Find and parse the first JSON object line in output.
+
+    HOL may print warnings/messages before the JSON line. This scans for the
+    first line starting with '{' and attempts to parse it as JSON.
+
+    Args:
+        output: Raw output from HOL
+        context: Description for error messages (e.g., "linearize_with_spans_json")
+
+    Returns:
+        Parsed JSON object
+
+    Raises:
+        HOLParseError if no valid JSON object found
+    """
+    import json
+
+    for line in output.strip().split('\n'):
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    raise HOLParseError(f"No valid JSON object found in {context} output")
+
+
 def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, bool]]:
     """Parse JSON output from linearize_with_spans_json.
 
@@ -55,12 +84,7 @@ def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, 
     Returns: list of (text, start_offset, end_offset, use_eall) tuples.
     Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
-    import json
-
-    try:
-        result = json.loads(output.strip().split('\n')[0])
-    except (ValueError, json.JSONDecodeError) as e:
-        raise HOLParseError(f"Invalid JSON from linearize_with_spans_json: {e}") from e
+    result = _find_json_line(output, "linearize_with_spans_json")
 
     if 'ok' in result:
         try:
@@ -109,7 +133,8 @@ class TheoremInfo:
     proof_start_line: int  # Line after "Proof" (first line of proof body)
     proof_end_line: int  # Line after "QED" (first line after theorem)
     has_cheat: bool
-    proof_body: str = ""  # Content between Proof and QED
+    proof_body: str = ""  # Content between Proof and QED (stripped)
+    proof_body_offset: int = 0  # File offset where proof_body starts
     attributes: list[str] = field(default_factory=list)
 
     @property
@@ -158,11 +183,18 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         proof_start_line = start_line + rest[:proof_match.start()].count('\n') + 1
         proof_end_line = start_line + rest[:qed_match.start()].count('\n') + 1
 
-        # Extract proof body
-        proof_body = rest[proof_match.end():qed_match.start()]
+        # Extract proof body and calculate its exact file offset
+        proof_body_raw = rest[proof_match.end():qed_match.start()]
+        proof_body_stripped = proof_body_raw.strip()
+        # Calculate where the stripped body starts in the file:
+        # match.end() is where 'rest' starts in content
+        # proof_match.end() is where proof_body_raw starts in rest
+        # leading whitespace chars = len(raw) - len(lstripped)
+        leading_ws = len(proof_body_raw) - len(proof_body_raw.lstrip())
+        proof_body_offset = match.end() + proof_match.end() + leading_ws
 
         # Check for cheat
-        has_cheat = bool(re.search(r'\bcheat\b', proof_body, re.IGNORECASE))
+        has_cheat = bool(re.search(r'\bcheat\b', proof_body_raw, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
             name=name,
@@ -172,7 +204,8 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
             proof_start_line=proof_start_line,
             proof_end_line=proof_end_line,
             has_cheat=has_cheat,
-            proof_body=proof_body.strip(),
+            proof_body=proof_body_stripped,
+            proof_body_offset=proof_body_offset,
             attributes=attributes,
         ))
 
