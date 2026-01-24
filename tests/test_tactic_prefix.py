@@ -259,3 +259,127 @@ class TestFineGrainedStepping:
             # Should have matching parens if non-empty
             if "e(" in result:
                 assert result.count("(") >= result.count(")")  # may have trailing newline
+
+
+class TestReplayEquivalence:
+    """Tests verifying e(a >> b) is equivalent to e(a); eall(b).
+
+    This is critical for understanding whether sliceTacticBlock-based replay
+    (single e(prefix) call) matches the DESIGN's e+eall sequential approach.
+    """
+
+    async def _get_goal_count(self, session: HOLSession) -> int:
+        """Get number of current goals."""
+        result = await session.send('length (top_goals());', timeout=5)
+        # Look for "val it = N : int" pattern
+        import re
+        match = re.search(r'val it\s*=\s*(\d+)', result)
+        if match:
+            return int(match.group(1))
+        # Fallback: look for bare number
+        for line in result.strip().split('\n'):
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+        return -1
+
+    async def _goals_equal(self, session: HOLSession, method1_cmds: list[str], method2_cmds: list[str], goal: str) -> tuple[int, int]:
+        """Run two methods and return their goal counts."""
+        # Method 1
+        await session.send(f'g `{goal}`;', timeout=5)
+        for cmd in method1_cmds:
+            await session.send(cmd, timeout=5)
+        count1 = await self._get_goal_count(session)
+        await session.send('drop();', timeout=5)
+
+        # Method 2
+        await session.send(f'g `{goal}`;', timeout=5)
+        for cmd in method2_cmds:
+            await session.send(cmd, timeout=5)
+        count2 = await self._get_goal_count(session)
+        await session.send('drop();', timeout=5)
+
+        return count1, count2
+
+    async def test_simple_then_chain(self, hol_session):
+        """e(a >> b) should equal e(a); eall(b) for simple chain."""
+        # conj_tac >> conj_tac on (A /\ B) /\ (C /\ D)
+        # First conj_tac: [A /\ B, C /\ D] - 2 goals, both are conjunctions
+        # Second conj_tac on both: [A, B, C, D] - 4 goals
+        # Note: avoid S as it's a reserved combinator in HOL
+        count1, count2 = await self._goals_equal(
+            hol_session,
+            ['e(conj_tac >> conj_tac);'],
+            ['e(conj_tac);', 'eall(conj_tac);'],
+            '(A /\\ B) /\\ (C /\\ D)'
+        )
+        assert count1 == count2 == 4
+
+    async def test_three_step_chain(self, hol_session):
+        """e(a >> b >> c) should equal e(a); eall(b); eall(c)."""
+        # conj_tac >> conj_tac >> all_tac on (A /\ B) /\ (C /\ D)
+        count1, count2 = await self._goals_equal(
+            hol_session,
+            ['e(conj_tac >> conj_tac >> all_tac);'],
+            ['e(conj_tac);', 'eall(conj_tac);', 'eall(all_tac);'],
+            '(A /\\ B) /\\ (C /\\ D)'
+        )
+        assert count1 == count2 == 4
+
+    async def test_thenlt_atomic(self, hol_session):
+        """e(tac >- arm) should be atomic - single step."""
+        # conj_tac >- all_tac leaves second goal
+        count1, count2 = await self._goals_equal(
+            hol_session,
+            ['e(conj_tac >- all_tac);'],
+            ['e(conj_tac >- all_tac);'],  # Same - it's atomic
+            'P /\\ Q'
+        )
+        # conj_tac produces 2 goals, >- all_tac handles first, leaves 1
+        assert count1 == count2 == 1
+
+    async def test_prefix_vs_eall_chain(self, hol_session):
+        """sliceTacticBlock prefix should match e+eall replay."""
+        # For a >> b, sliceTacticBlock at end of a gives e(a)
+        # This should match e(a) directly
+        tactic = "conj_tac >> conj_tac"
+
+        # Get prefix at end of first step (after conj_tac, before >>)
+        prefix = await call_prefix_commands(hol_session, tactic, 8)  # "conj_tac" is 8 chars
+
+        # Method 1: Use the prefix
+        await hol_session.send('g `P /\\ Q /\\ R`;', timeout=5)
+        await hol_session.send(prefix, timeout=5)
+        count1 = await self._get_goal_count(hol_session)
+        await hol_session.send('drop();', timeout=5)
+
+        # Method 2: Direct e(conj_tac)
+        await hol_session.send('g `P /\\ Q /\\ R`;', timeout=5)
+        await hol_session.send('e(conj_tac);', timeout=5)
+        count2 = await self._get_goal_count(hol_session)
+        await hol_session.send('drop();', timeout=5)
+
+        assert count1 == count2 == 2
+
+    async def test_full_prefix_vs_eall(self, hol_session):
+        """Full prefix e(a >> b) should match e(a); eall(b)."""
+        tactic = "conj_tac >> conj_tac"
+        goal = "(A /\\ B) /\\ (C /\\ D)"  # Avoid S (reserved combinator)
+
+        # Get full prefix
+        prefix = await call_prefix_commands(hol_session, tactic, len(tactic))
+
+        # Method 1: Use the prefix
+        await hol_session.send(f'g `{goal}`;', timeout=5)
+        await hol_session.send(prefix, timeout=5)
+        count1 = await self._get_goal_count(hol_session)
+        await hol_session.send('drop();', timeout=5)
+
+        # Method 2: e + eall
+        await hol_session.send(f'g `{goal}`;', timeout=5)
+        await hol_session.send('e(conj_tac);', timeout=5)
+        await hol_session.send('eall(conj_tac);', timeout=5)
+        count2 = await self._get_goal_count(hol_session)
+        await hol_session.send('drop();', timeout=5)
+
+        assert count1 == count2 == 4
