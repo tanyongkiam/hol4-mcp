@@ -566,22 +566,24 @@ async def hol_file_init(
     # Build status output
     lines = [
         f"File: {file_path}",
-        f"Theorems: {len(result['theorems'])}",
-        f"Cheats: {len(result['cheats'])}",
-        "",
+        f"Theorems: {len(result['theorems'])} ({len(result['cheats'])} cheats)",
     ]
 
-    if result['theorems']:
-        lines.append("Theorems:")
-        for t in result['theorems']:
-            cheat_marker = " [CHEAT]" if t['has_cheat'] else ""
-            lines.append(f"  {t['name']} (line {t['line']}){cheat_marker}")
+    # Show verification status
+    broken = result.get('broken')
+    if broken:
+        lines.append(f"Verified: {result['verified']}/{result['total_non_cheat']} non-cheat theorems")
+        lines.append("")
+        lines.append(f"BROKEN: {broken['name']} (line {broken['line']})")
+        lines.append(f"  {broken['error']}")
+    else:
+        lines.append(f"Verified: {result['verified']}/{result['total_non_cheat']} non-cheat theorems ✓")
 
     if result['cheats']:
         lines.append("")
-        lines.append("Use hol_state_at to navigate to a position. Example:")
-        cheat = result['cheats'][0]
-        lines.append(f"  hol_state_at(session='{session}', line={cheat['line']})")
+        lines.append("Cheats to fix:")
+        for cheat in result['cheats']:
+            lines.append(f"  {cheat['theorem']} (line {cheat['line']})")
 
     return "\n".join(lines)
 

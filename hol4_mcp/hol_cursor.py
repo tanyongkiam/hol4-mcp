@@ -324,16 +324,16 @@ class FileProofCursor:
             if thm.start_line >= start_line:
                 self._invalidate_checkpoint(thm.name)
 
-    async def init(self, *, skip_holmake: bool = False) -> dict:
-        """Initialize cursor - parse file, optionally load deps.
-
-        Args:
-            skip_holmake: If True, skip holmake (deps must already be loaded)
+    async def init(self) -> dict:
+        """Initialize cursor - parse file, load deps, verify theorems.
 
         Returns:
             dict with:
               - theorems: list of {name, line, has_cheat}
-              - cheats: list of theorem names with cheats
+              - cheats: list of cheat locations
+              - verified: number of verified non-cheat theorems
+              - total_non_cheat: total non-cheat theorems
+              - broken: {name, line, error} if a theorem is broken, else None
               - error: error message if init failed
         """
         self._reparse_if_changed()
@@ -344,14 +344,13 @@ class FileProofCursor:
         if not self.session.is_running:
             await self.session.start()
 
-        # Load dependencies if not skipping holmake
-        if not skip_holmake:
-            try:
-                deps = await get_script_dependencies(self.file)
-                for dep in deps:
-                    await self.session.send(f'load "{dep}";', timeout=60)
-            except FileNotFoundError:
-                pass  # holdeptool not available, skip dep loading
+        # Load dependencies
+        try:
+            deps = await get_script_dependencies(self.file)
+            for dep in deps:
+                await self.session.send(f'load "{dep}";', timeout=60)
+        except FileNotFoundError:
+            pass  # holdeptool not available, skip dep loading
 
         thm_list = [
             {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
@@ -367,7 +366,72 @@ class FileProofCursor:
             for t in self._theorems if t.has_cheat
         ]
 
-        return {"theorems": thm_list, "cheats": cheats}
+        # Verify all non-cheat theorems (stop on first failure)
+        verify_result = await self._verify_all_theorems()
+        
+        return {
+            "theorems": thm_list,
+            "cheats": cheats,
+            "verified": verify_result.get("verified", 0),
+            "total_non_cheat": verify_result.get("total", 0),
+            "broken": verify_result.get("broken"),  # None if all pass
+        }
+
+    async def _verify_all_theorems(self) -> dict:
+        """Verify all non-cheat theorems by replaying their tactics.
+        
+        Stops on first failure. Builds checkpoints for verified theorems.
+        
+        Returns:
+            dict with:
+              - verified: number of successfully verified theorems
+              - total: total non-cheat theorems
+              - broken: {name, line, error} if a theorem is broken, else None
+        """
+        non_cheat_thms = [t for t in self._theorems if not t.has_cheat]
+        verified = 0
+        
+        for thm in non_cheat_thms:
+            # Use state_at to replay all tactics (goes to end of proof)
+            # This will enter the theorem, load context, and replay tactics
+            end_line = thm.proof_end_line - 1  # Line before QED
+            result = await self.state_at(end_line)
+            
+            # Check for tactic errors (not goals_json errors)
+            # If all tactics replayed but goals_json says "no goals", that's actually success
+            is_no_goals_error = (
+                result.error and 
+                "no goals" in result.error.lower() and
+                result.tactics_replayed == result.tactics_total
+            )
+            
+            if result.error and not is_no_goals_error:
+                return {
+                    "verified": verified,
+                    "total": len(non_cheat_thms),
+                    "broken": {
+                        "name": thm.name,
+                        "line": thm.start_line,
+                        "error": result.error,
+                    }
+                }
+            
+            # Check that proof is complete (no remaining goals)
+            # Empty goals with no error OR "no goals" error = proof complete
+            if result.goals and not is_no_goals_error:
+                return {
+                    "verified": verified,
+                    "total": len(non_cheat_thms),
+                    "broken": {
+                        "name": thm.name,
+                        "line": thm.start_line,
+                        "error": f"Proof incomplete: {len(result.goals)} goals remaining",
+                    }
+                }
+            
+            verified += 1
+        
+        return {"verified": verified, "total": len(non_cheat_thms), "broken": None}
 
     async def enter_theorem(self, name: str) -> dict:
         """Enter a theorem for proof state inspection.

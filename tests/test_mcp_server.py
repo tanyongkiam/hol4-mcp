@@ -213,9 +213,11 @@ async def test_file_init_lists_theorems(tmp_path):
     try:
         result = await hol_file_init(file=str(test_file), session="file_init_test")
         assert "Theorems:" in result
+        assert "cheats" in result.lower()
+        assert "Verified:" in result
+        # Should list cheats to fix
         assert "needs_proof" in result
         assert "partial_proof" in result
-        assert "[CHEAT]" in result
     finally:
         await hol_stop(session="file_init_test")
 
@@ -353,9 +355,9 @@ async def test_file_init_auto_starts_session(tmp_path):
         # hol_file_init should auto-start session
         result = await hol_file_init(file=str(test_file), session=session_name)
 
-        # Should succeed and list theorems
+        # Should succeed and show verification status
         assert "Theorems:" in result
-        assert "add_zero" in result
+        assert "Verified:" in result
 
         # Verify session is now running
         sessions_result = await hol_sessions()
