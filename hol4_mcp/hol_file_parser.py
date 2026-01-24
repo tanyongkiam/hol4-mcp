@@ -97,6 +97,43 @@ def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, 
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 
 
+def parse_step_positions_output(output: str) -> list[int]:
+    """Parse JSON output from step_positions_json.
+
+    Expects: {"ok":[offset1, offset2, ...]} or {"err":"message"}
+    Returns: list of end offsets for each tactic step.
+    Raises: HOLParseError if HOL4 returned an error or output is malformed.
+    """
+    result = _find_json_line(output, "step_positions_json")
+
+    if 'ok' in result:
+        try:
+            return [int(pos) for pos in result['ok']]
+        except (TypeError, ValueError) as e:
+            raise HOLParseError(f"Malformed step positions in output: {e}") from e
+    elif 'err' in result:
+        raise HOLParseError(f"step_positions_json: {result['err']}")
+    else:
+        raise HOLParseError(f"Unexpected JSON structure: {result}")
+
+
+def parse_prefix_commands_output(output: str) -> str:
+    """Parse JSON output from prefix_commands_json.
+
+    Expects: {"ok":"e(...);\n"} or {"err":"message"}
+    Returns: The e() command string to execute.
+    Raises: HOLParseError if HOL4 returned an error or output is malformed.
+    """
+    result = _find_json_line(output, "prefix_commands_json")
+
+    if 'ok' in result:
+        return result['ok']
+    elif 'err' in result:
+        raise HOLParseError(f"prefix_commands_json: {result['err']}")
+    else:
+        raise HOLParseError(f"Unexpected JSON structure: {result}")
+
+
 def make_tactic_spans(
     raw_spans: list[tuple[str, int, int, bool]],
     proof_body_offset: int,

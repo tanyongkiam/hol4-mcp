@@ -68,13 +68,10 @@ class HOLSession:
         # Load etq.sml (goaltree mode helpers)
         await self.send(ETQ_PATH.read_text(), timeout=30)
 
-        # Load TacticParse for tactic validation
-        await self.send('load "TacticParse";', timeout=30)
-
-        # Load cheat_finder for pre-cheat extraction
-        cheat_finder = SCRIPT_DIR / "sml_helpers" / "cheat_finder.sml"
-        if cheat_finder.exists():
-            await self.send(cheat_finder.read_text(), timeout=30)
+        # Load tactic_prefix for prefix-based replay (includes TacticParse)
+        tactic_prefix = SCRIPT_DIR / "sml_helpers" / "tactic_prefix.sml"
+        if tactic_prefix.exists():
+            await self.send(tactic_prefix.read_text(), timeout=30)
 
         # Load .hol_init.sml if present
         init_file = self.workdir / ".hol_init.sml"

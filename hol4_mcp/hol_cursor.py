@@ -8,7 +8,8 @@ from pathlib import Path
 from .hol_file_parser import (
     TheoremInfo, parse_file, parse_p_output, parse_theorems,
     TacticSpan, build_line_starts, parse_linearize_with_spans_output,
-    make_tactic_spans, offset_to_line_col, HOLParseError, _find_json_line,
+    make_tactic_spans, offset_to_line_col, line_col_to_offset, HOLParseError,
+    _find_json_line, parse_step_positions_output, parse_prefix_commands_output,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -140,8 +141,10 @@ class FileProofCursor:
 
         # Active theorem state
         self._active_theorem: str | None = None
-        self._active_tactics: list[TacticSpan] = []
+        self._active_tactics: list[TacticSpan] = []  # Deprecated, kept for compatibility
+        self._step_positions: list[int] = []  # End offsets for each step (relative to proof body)
         self._current_tactic_idx: int = 0  # Current position in proof (for backup optimization)
+        self._current_offset: int = -1  # Current proof body offset (-1 = not set)
         self._proof_initialized: bool = False  # Whether g/gt has been called for current theorem
 
         # What's been loaded into HOL
@@ -472,38 +475,36 @@ class FileProofCursor:
             self._loaded_to_line = thm.start_line
             self._loaded_content_hash = self._compute_hash(loaded_content)
 
-        # Parse tactics from proof body
+        # Parse step positions from proof body using TacticParse
         if thm.proof_body:
             escaped_body = escape_sml_string(thm.proof_body)
-            lin_result = await self.session.send(
-                f'linearize_with_spans_json "{escaped_body}";', timeout=30
+            step_result = await self.session.send(
+                f'step_positions_json "{escaped_body}";', timeout=30
             )
             try:
-                raw_spans = parse_linearize_with_spans_output(lin_result)
+                self._step_positions = parse_step_positions_output(step_result)
             except HOLParseError as e:
-                return {"error": f"Failed to parse tactics: {e}"}
-
-            # Use the precomputed proof body offset from the parser
-            self._active_tactics = make_tactic_spans(raw_spans, thm.proof_body_offset, self._line_starts)
+                return {"error": f"Failed to parse step positions: {e}"}
         else:
-            self._active_tactics = []
+            self._step_positions = []
 
         self._active_theorem = name
+        self._active_tactics = []  # Deprecated
         self._current_tactic_idx = 0  # Reset position for new theorem
         self._proof_initialized = False  # Will be set on first state_at
 
         return {
             "theorem": name,
             "goal": thm.goal,
-            "tactics": len(self._active_tactics),
+            "tactics": len(self._step_positions),
             "has_cheat": thm.has_cheat,
         }
 
     async def state_at(self, line: int, col: int = 1) -> StateAtResult:
-        """Get proof state at file position.
+        """Get proof state at file position using prefix-based replay.
 
-        Uses checkpoint + backup_n for fast navigation (~80-130ms constant time)
-        when checkpoint is available. Falls back to incremental replay otherwise.
+        Uses HOL's TacticParse.sliceTacticBlock to generate a valid prefix
+        for any position, then executes it with a single e() call.
 
         Auto-enters the theorem containing the position if not already active.
 
@@ -550,26 +551,26 @@ class FileProofCursor:
                 file_hash=self._content_hash, error=f"Theorem '{self._active_theorem}' no longer exists"
             )
 
-        # If file changed, invalidate checkpoint and re-parse tactics
+        # If file changed, invalidate checkpoint and re-parse step positions
         t2 = time.perf_counter()
         if changed:
             self._invalidate_checkpoint(self._active_theorem)
             if thm.proof_body:
                 escaped_body = escape_sml_string(thm.proof_body)
-                lin_result = await self.session.send(
-                    f'linearize_with_spans_json "{escaped_body}";', timeout=30
+                step_result = await self.session.send(
+                    f'step_positions_json "{escaped_body}";', timeout=30
                 )
                 try:
-                    raw_spans = parse_linearize_with_spans_output(lin_result)
+                    self._step_positions = parse_step_positions_output(step_result)
                 except HOLParseError as e:
                     return StateAtResult(
                         goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
                         file_hash=self._content_hash,
-                        error=f"Failed to parse tactics: {e}"
+                        error=f"Failed to parse step positions: {e}"
                     )
-                # Use the precomputed proof body offset from the parser
-                self._active_tactics = make_tactic_spans(raw_spans, thm.proof_body_offset, self._line_starts)
-        timings['linearize'] = time.perf_counter() - t2
+            else:
+                self._step_positions = []
+        timings['parse_steps'] = time.perf_counter() - t2
 
         # Check if position is within theorem bounds (include QED line)
         # proof_end_line is "line after QED", so QED is at proof_end_line - 1
@@ -583,161 +584,68 @@ class FileProofCursor:
                       f"(valid lines {proof_keyword_line}-{qed_line})"
             )
 
-        # Find tactic index at position (state BEFORE tactic at position)
-        # If on QED line, replay all tactics to show final state
+        # Convert (line, col) to proof body offset
+        # If on QED line, use end of proof body
         if line == qed_line:
-            tactic_idx = len(self._active_tactics)
+            proof_body_offset = len(thm.proof_body)
         else:
-            tactic_idx = 0
-            for i, tac in enumerate(self._active_tactics):
-                if (line, col) < tac.start:
-                    break
-                tactic_idx = i + 1
+            file_offset = line_col_to_offset(line, col, self._line_starts)
+            proof_body_offset = max(0, file_offset - thm.proof_body_offset)
 
-        tactics_to_replay = min(tactic_idx, len(self._active_tactics))
+        # Find tactic index for reporting (which step boundary we're at/past)
+        tactic_idx = 0
+        for i, end_pos in enumerate(self._step_positions):
+            if proof_body_offset >= end_pos:
+                tactic_idx = i + 1
+            else:
+                break
+
+        total_tactics = len(self._step_positions)
         error_msg = None
-        actual_replayed = 0
-        used_checkpoint = False
-        strategy_used = "none"
         t3 = time.perf_counter()
 
-        # Strategy 0: Already at target position - no navigation needed
-        if not changed and self._proof_initialized and self._current_tactic_idx == tactics_to_replay:
-            actual_replayed = tactics_to_replay
-            used_checkpoint = True  # Skip other strategies
+        # Always replay from start using prefix_commands
+        # This is simpler and uses HOL's exact semantics
+        await self.session.send('drop_all();', timeout=5)
+        goal = thm.goal.replace('\n', ' ').strip()
+        goal_cmd = "g" if self._mode == "g" else "gt"
+        gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
+        if _is_hol_error(gt_result):
+            self._proof_initialized = False
+            return StateAtResult(
+                goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
+                tactics_total=total_tactics, file_hash=self._content_hash,
+                error=f"Failed to set up goal: {gt_result[:300]}"
+            )
+        self._proof_initialized = True
 
-        # Strategy 1: Use checkpoint + backup_n (fast path: ~80-130ms constant)
-        if not used_checkpoint and self._is_checkpoint_valid(self._active_theorem):
-            if await self._load_checkpoint_and_backup(self._active_theorem, tactics_to_replay):
-                actual_replayed = tactics_to_replay
-                used_checkpoint = True
+        # Get prefix commands for this offset and execute
+        actual_replayed = 0
+        if proof_body_offset > 0 and thm.proof_body:
+            escaped_body = escape_sml_string(thm.proof_body)
+            prefix_result = await self.session.send(
+                f'prefix_commands_json "{escaped_body}" {proof_body_offset};', timeout=30
+            )
+            try:
+                prefix_cmd = parse_prefix_commands_output(prefix_result)
+            except HOLParseError as e:
+                error_msg = f"Failed to get prefix commands: {e}"
+                prefix_cmd = ""
 
-        # Strategy 2: Incremental navigation (when goaltree already initialized)
-        if not used_checkpoint and not changed and self._proof_initialized:
-            if tactics_to_replay < self._current_tactic_idx:
-                # Going backwards - use backup()
-                backup_failed = False
-                for _ in range(self._current_tactic_idx - tactics_to_replay):
-                    result = await self.session.send('backup();', timeout=5)
-                    if _is_hol_error(result):
-                        backup_failed = True
-                        break
-                if not backup_failed:
-                    self._current_tactic_idx = tactics_to_replay
-                    actual_replayed = tactics_to_replay
-                    used_checkpoint = True  # Skip full replay
-
-            elif tactics_to_replay > self._current_tactic_idx:
-                # Going forwards - replay only the delta (batched)
-                tactics_to_apply = self._active_tactics[self._current_tactic_idx:tactics_to_replay]
-                if tactics_to_apply:
-                    # goalstack: e(tactic) or eall(tactic); goaltree: etq "tactic" (string parsed)
-                    if self._mode == "g":
-                        tactic_cmds = [
-                            f'eall({t.text})' if t.use_eall else f'e({t.text})'
-                            for t in tactics_to_apply
-                        ]
-                    else:
-                        tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in tactics_to_apply]
-                    batch = "; ".join(tactic_cmds) + ";"
-                    # Batch timeout = per-tactic timeout * num tactics (min 30s)
-                    batch_timeout = max(30, int(self._tactic_timeout * len(tactics_to_apply))) if self._tactic_timeout else 300
-                    result = await self.session.send(batch, timeout=batch_timeout)
-                    if _is_hol_error(result):
-                        error_msg = f"Tactic replay failed (batch of {len(tactics_to_apply)}): {result[:200]}"
-                        # Don't know exact failure point in batch - reset to start
-                        self._proof_initialized = False
-                        used_checkpoint = False  # Force full replay to find exact error
-                    else:
-                        self._current_tactic_idx = tactics_to_replay
-                        actual_replayed = tactics_to_replay
-                        used_checkpoint = True  # Skip full replay
-                else:
-                    used_checkpoint = True
-
-            else:
-                # Same position - no replay needed
-                actual_replayed = tactics_to_replay
-                used_checkpoint = True  # Skip full replay
-
-        # Strategy 3: Full replay from start (creates checkpoint opportunity)
-        if not used_checkpoint:
-            await self.session.send('drop_all();', timeout=5)
-            goal = thm.goal.replace('\n', ' ').strip()
-            goal_cmd = "g" if self._mode == "g" else "gt"
-            gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
-            if _is_hol_error(gt_result):
-                self._current_tactic_idx = 0
-                self._proof_initialized = False
-                return StateAtResult(
-                    goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
-                    tactics_total=len(self._active_tactics), file_hash=self._content_hash,
-                    error=f"Failed to set up goal: {gt_result[:300]}"
-                )
-            self._proof_initialized = True
-
-            # Replay all tactics (to end of proof) for checkpoint, then backup
-            total_tactics = len(self._active_tactics)
-
-            if total_tactics > 0:
-                # Batch all tactics in single send
-                # goalstack: e(tactic) or eall(tactic); goaltree: etq "tactic" (string parsed)
-                # Use eall for tactics that came from >> chains (need to apply to all goals)
-                if self._mode == "g":
-                    tactic_cmds = [
-                        f'eall({t.text})' if t.use_eall else f'e({t.text})'
-                        for t in self._active_tactics
-                    ]
-                else:
-                    tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in self._active_tactics]
-                batch = "; ".join(tactic_cmds) + ";"
-                # Batch timeout = per-tactic timeout * num tactics (min 30s)
-                batch_timeout = max(30, int(self._tactic_timeout * total_tactics)) if self._tactic_timeout else 300
-                result = await self.session.send(batch, timeout=batch_timeout)
+            if prefix_cmd.strip():
+                # Execute the e() command(s) returned by prefix_commands
+                # Timeout based on estimated tactics
+                batch_timeout = max(30, int(self._tactic_timeout * max(1, tactic_idx))) if self._tactic_timeout else 300
+                result = await self.session.send(prefix_cmd, timeout=batch_timeout)
                 if _is_hol_error(result):
-                    # Fallback: replay individually up to requested position
-                    # Only report error if it's at or before the requested position
-                    await self.session.send('drop_all();', timeout=5)
-                    await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
-                    actual_replayed = 0
-                    # Per-tactic timeout (default 5s)
-                    tac_timeout = int(self._tactic_timeout) if self._tactic_timeout else 300
-                    # Only replay up to tactics_to_replay, not all tactics
-                    for i, tac in enumerate(self._active_tactics[:tactics_to_replay]):
-                        if self._mode == "g":
-                            # Use eall for tactics from >> chains (apply to all goals)
-                            cmd = f'eall({tac.text})' if tac.use_eall else f'e({tac.text})'
-                            result = await self.session.send(f'{cmd};', timeout=tac_timeout)
-                        else:
-                            tac_escaped = escape_sml_string(tac.text)
-                            result = await self.session.send(f'etq "{tac_escaped}";', timeout=tac_timeout)
-                        if _is_hol_error(result):
-                            if result.startswith("TIMEOUT"):
-                                error_msg = f"Tactic {i+1} timed out (>{tac_timeout}s): {tac.text[:50]}"
-                            else:
-                                error_msg = f"Tactic {i+1} failed: {tac.text[:50]}"
-                            self._current_tactic_idx = i
-                            actual_replayed = i
-                            break
-                        actual_replayed = i + 1
+                    if result.startswith("TIMEOUT"):
+                        error_msg = f"Tactic replay timed out (>{batch_timeout}s)"
                     else:
-                        self._current_tactic_idx = actual_replayed
+                        error_msg = f"Tactic replay failed: {result[:200]}"
                 else:
-                    actual_replayed = total_tactics
-                    self._current_tactic_idx = total_tactics
+                    actual_replayed = tactic_idx
 
-                    # Save checkpoint if we replayed all tactics successfully
-                    await self._save_end_of_proof_checkpoint(self._active_theorem, total_tactics)
-
-                    # Backup to target position if needed
-                    if tactics_to_replay < total_tactics:
-                        backups_needed = total_tactics - tactics_to_replay
-                        result = await self.session.send(f'backup_n {backups_needed};', timeout=30)
-                        if not _is_hol_error(result):
-                            self._current_tactic_idx = tactics_to_replay
-                            actual_replayed = tactics_to_replay
-
-        timings['strategy'] = time.perf_counter() - t3
+        timings['replay'] = time.perf_counter() - t3
 
         # Get current goals as JSON
         t4 = time.perf_counter()
@@ -755,7 +663,7 @@ class FileProofCursor:
             goals=goals,
             tactic_idx=tactic_idx,
             tactics_replayed=actual_replayed,
-            tactics_total=len(self._active_tactics),
+            tactics_total=total_tactics,
             file_hash=self._content_hash,
             error=error_msg,
             timings=timings,
@@ -794,7 +702,7 @@ class FileProofCursor:
             "file": str(self.file),
             "file_hash": self._content_hash,
             "active_theorem": self._active_theorem,
-            "active_tactics": len(self._active_tactics),
+            "active_tactics": len(self._step_positions),
             "loaded_to_line": self._loaded_to_line,
             "stale": stale,
             "completed": list(self._completed),
