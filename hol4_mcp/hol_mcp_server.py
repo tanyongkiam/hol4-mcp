@@ -67,13 +67,16 @@ def _session_age(name: str) -> str:
 
 @mcp.tool()
 async def hol_start(workdir: str, name: str = "default") -> str:
-    """Start HOL session (idempotent - returns existing if running).
+    """Start a HOL4 REPL session.
+
+    Idempotent - returns existing session if already running.
+    Usually called automatically by hol_file_init or hol_state_at.
 
     Args:
-        workdir: Working directory for HOL (where Holmakefile is)
-        name: Session identifier (use simple names like 'main')
+        workdir: Working directory (should contain Holmakefile for dependencies)
+        name: Session identifier (e.g., "main")
 
-    Returns: Session status and current proof state
+    Returns: Session status
     """
     # If session exists and is running, return its state
     if name in _sessions:
@@ -136,15 +139,22 @@ async def hol_sessions() -> str:
 
 @mcp.tool()
 async def hol_send(session: str, command: str, timeout: int = 5) -> str:
-    """Send SML to HOL.
+    """Send raw SML command to HOL session.
 
-    NEVER use g/e (goalstack). ALWAYS use gt/etq (goaltree):
-      gt `goal`;         (* start proof *)
-      etq "tactic";      (* apply tactic, records for p() *)
-      p();               (* extract proof script *)
-      backup(); drop();  (* undo / abandon *)
+    For proof navigation, prefer hol_state_at over manual commands.
 
-    Args: session, command, timeout (default 5, max 600)
+    Common commands:
+      top_goals();       (* show current goals *)
+      backup();          (* undo last tactic *)
+      drop();            (* abandon current proof *)
+      p();               (* show tactic history - goaltree mode only *)
+
+    Args:
+        session: Session name
+        command: SML command to execute
+        timeout: Max seconds to wait (default 5, max 600)
+
+    Returns: HOL output (may include errors)
     """
     s = _get_session(session)
     if not s:
@@ -492,16 +502,16 @@ async def hol_file_init(
 ) -> str:
     """Initialize cursor for a HOL4 script file.
 
-    Parses file for theorems, auto-starts HOL session if needed, loads dependencies.
-    Use hol_state_at to navigate to specific positions after init.
+    Parses file for theorems and their proofs. Auto-starts HOL session if needed.
+    After init, use hol_state_at to navigate to specific positions and see goals.
 
     Args:
-        file: Path to .sml file containing theorems
+        file: Path to *Script.sml file containing theorems
         session: Session name (default: "default")
         workdir: Working directory for HOL (default: file's parent directory)
-        mode: "g" for goalstack (default) or "gt" for goaltree with proof extraction
+        mode: "g" goalstack (default) or "gt" goaltree (use p() to see tactic history)
 
-    Returns: File info with theorems and cheats list
+    Returns: List of theorems with line numbers and cheat status
     """
     # Validate file first
     file_path = Path(file).resolve()
@@ -566,18 +576,19 @@ async def hol_state_at(
     file: str = None,
     workdir: str = None,
 ) -> str:
-    """Get proof state at file position.
+    """Get proof state at a file position.
 
-    Replays tactics from theorem start to position. Auto-enters theorem if needed.
+    Replays tactics from theorem start up to (but not including) the tactic at
+    the given position, then shows current goals. Auto-enters theorem if needed.
 
     Args:
         session: Session name
-        line: 1-indexed line number
+        line: 1-indexed line number (position in the proof)
         col: 1-indexed column number (default 1)
-        file: Optional path to .sml file (auto-calls hol_file_init if provided)
-        workdir: Optional working directory (used with file)
+        file: Path to .sml file (auto-calls hol_file_init if no cursor exists)
+        workdir: Working directory for HOL (used with file)
 
-    Returns: Goals, tactic index, error info
+    Returns: Tactic position (N/M), goals at that position, errors if any
     """
     cursor = _get_cursor(session)
 
