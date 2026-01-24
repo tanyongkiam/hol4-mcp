@@ -141,13 +141,15 @@ async def hol_sessions() -> str:
 async def hol_send(session: str, command: str, timeout: int = 5) -> str:
     """Send raw SML command to HOL session.
 
-    For proof navigation, prefer hol_state_at over manual commands.
+    WARNING: Do NOT use for proof navigation - use hol_state_at instead.
+    hol_state_at handles file changes, checkpoints, and tactic replay automatically.
 
-    Common commands:
-      top_goals();       (* show current goals *)
-      backup();          (* undo last tactic *)
-      drop();            (* abandon current proof *)
-      p();               (* show tactic history - goaltree mode only *)
+    Only use hol_send for:
+      - Database queries: DB.match [], ``add _ _``
+      - Type checking: type_of ``expr``
+      - Term parsing: Term `expr`
+      - One-off SML evaluation
+      - Debugging session state
 
     Args:
         session: Session name
