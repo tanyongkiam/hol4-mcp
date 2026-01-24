@@ -22,11 +22,12 @@ fun json_escape_char c =
 fun json_escape_string s =
   String.concat (map json_escape_char (String.explode s))
 
-(* Convert tactic span to JSON object: {"t":"text","s":start,"e":end} *)
-fun tactic_span_to_json (text, start_off, end_off) =
+(* Convert tactic span to JSON object: {"t":"text","s":start,"e":end,"a":use_eall} *)
+fun tactic_span_to_json (text, start_off, end_off, use_eall) =
   "{\"t\":\"" ^ json_escape_string text ^ 
   "\",\"s\":" ^ Int.toString start_off ^ 
-  ",\"e\":" ^ Int.toString end_off ^ "}"
+  ",\"e\":" ^ Int.toString end_off ^
+  ",\"a\":" ^ (if use_eall then "true" else "false") ^ "}"
 
 (* Convert list of tactic spans to JSON array *)
 fun tactic_spans_to_json spans =
@@ -58,11 +59,12 @@ fun goals_json () =
   in print (json_ok (goals_to_json_array goals) ^ "\n") end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
-(* linearize_with_spans - Return list of (tactic, start, end) for navigation
+(* linearize_with_spans - Return list of (tactic, start, end, use_eall) for navigation
 
    Linearization semantics:
    - Split at >- boundaries (each arm becomes separate tactic)
-   - Keep >> chains together (they form single compound tactic)
+   - Split >> chains but mark subsequent items with use_eall=true
+   - use_eall=true means the tactic should apply to ALL goals (for replay)
    - Processes ALL tactics (no cheat stopping)
    - Returns spans for each tactic (char offsets into source)
 *)
@@ -112,12 +114,12 @@ fun linearize_with_spans source = let
     | is_split_node (TacticParse.Group (_, _, inner)) = is_split_node inner
     | is_split_node _ = false
 
-  (* Flatten a >- node into (text, start, end) tuples - handles left-associative nesting
-     Note: ThenLT with Subgoal base is `by`/`suffices_by` - keep atomic *)
+  (* Flatten a >- node into (text, start, end, use_eall) tuples - handles left-associative nesting
+     Note: ThenLT with Subgoal base is `by`/`suffices_by` - keep atomic
+     Within each >- arm, >> chains get use_eall=true for non-first items *)
   fun flatten_split_spans (TacticParse.ThenLT (base, arms)) =
         if is_subgoal_base base then
-          (* by/suffices_by: return as single atomic tactic *)
-          (* ThenLT has no span itself - compute from base and arms *)
+          (* by/suffices_by: return as single atomic tactic, use_eall=false *)
           let
             val (_, base_s, _) = node_text_span base
             fun last_span [] = (0, 0)
@@ -125,70 +127,57 @@ fun linearize_with_spans source = let
               | last_span (_::xs) = last_span xs
             val (_, arm_e) = last_span arms
             val t = text_at (base_s, arm_e)
-          in if t = "" then [] else [(t, base_s, arm_e)] end
+          in if t = "" then [] else [(t, base_s, arm_e, false)] end
         else
-          flatten_split_spans base @ List.concat (List.map flatten_split_spans arms)
+          (* Each arm is a separate context, so each arm starts fresh with use_eall=false *)
+          flatten_split_spans base @ List.concat (List.map flatten_arm_spans arms)
     | flatten_split_spans (TacticParse.LThen (base, arms)) =
-        flatten_split_spans base @ List.concat (List.map flatten_split_spans arms)
+        flatten_split_spans base @ List.concat (List.map flatten_arm_spans arms)
     | flatten_split_spans (TacticParse.LThen1 inner) = flatten_split_spans inner
     | flatten_split_spans (TacticParse.Then items) =
-        List.concat (List.map flatten_split_spans items)
+        (* >> chain: first item use_eall=false, rest use_eall=true *)
+        flatten_then_chain items
     | flatten_split_spans (TacticParse.Group (_, span, inner)) =
-        (* Only recurse if inner is a split node (ThenLT/LThen without Subgoal base).
-           Otherwise emit the Group's span as a single atomic tactic.
-           This preserves wrappers like rpt, TRY, by, etc. *)
         if is_split_node inner then
           flatten_split_spans inner
         else
-          let val t = text_at span in if t = "" then [] else [(t, #1 span, #2 span)] end
+          let val t = text_at span in if t = "" then [] else [(t, #1 span, #2 span, false)] end
     | flatten_split_spans node =
         let val (t, s, e) = node_text_span node
-        in if t = "" then [] else [(t, s, e)] end
+        in if t = "" then [] else [(t, s, e, false)] end
 
-  (* Emit items with spans: keep >> chains together, split at >- boundaries *)
-  fun emit_with_spans items = let
-    fun take_non_split [] = ([], [])
-      | take_non_split (x::xs) =
-          if is_split_node x then ([], x::xs)
-          else let val (took, rest) = take_non_split xs in (x::took, rest) end
-
-    (* Compute combined span for >> chain *)
-    fun chain_span [] = (0, 0)
-      | chain_span items = let
-          val spans = List.map node_span items
-          val s = foldl Int.min (String.size source) (List.map #1 spans)
-          val e = foldl Int.max 0 (List.map #2 spans)
-        in (s, e) end
-
-    fun process [] = []
-      | process items = let
-          val (non_split, rest) = take_non_split items
-          val (s, e) = chain_span non_split
-          val txt = text_at (s, e)
-          val prefix = if txt = "" then [] else [(txt, s, e)]
+  (* Flatten a >> chain: first item gets use_eall=false, rest get use_eall=true *)
+  and flatten_then_chain [] = []
+    | flatten_then_chain [x] = flatten_split_spans x  (* Single item keeps its own eall flag *)
+    | flatten_then_chain (first::rest) =
+        let
+          (* First item: use_eall stays false (unless it's itself a >> chain) *)
+          val first_spans = flatten_split_spans first
+          (* Rest items: force use_eall=true for all *)
+          val rest_spans = List.concat (List.map flatten_split_spans rest)
+          val rest_with_eall = List.map (fn (t,s,e,_) => (t,s,e,true)) rest_spans
         in
-          case rest of
-            [] => prefix
-          | (x::xs) => prefix @ flatten_split_spans x @ process xs
+          first_spans @ rest_with_eall
         end
-  in
-    process items
-  end
 
-  (* Main traversal - returns reversed list of (text, start, end) *)
+  (* Flatten a >- arm: each arm starts fresh (use_eall=false for first item) *)
+  and flatten_arm_spans node = flatten_split_spans node
+
+  (* Main traversal - returns reversed list of (text, start, end, use_eall) *)
   fun go (TacticParse.Then []) acc = acc
     | go (TacticParse.Then items) acc =
-        (* Split >> chains into individual tactics for position mapping *)
-        List.foldl (fn (item, a) => go item a) acc items
+        (* Split >> chains: first item use_eall=false, rest use_eall=true *)
+        let val spans = flatten_then_chain items
+            val acc' = List.foldl (fn ((t,s,e,a), acc) => if t = "" then acc else (t,s,e,a) :: acc) acc spans
+        in acc' end
     | go (TacticParse.LThen (base, arms)) acc = let
         (* Recursively flatten the whole >- structure *)
         val all_items = flatten_split_spans (TacticParse.LThen (base, arms))
-        val acc' = List.foldl (fn ((t,s,e), a) => if t = "" then a else (t,s,e) :: a) acc all_items
+        val acc' = List.foldl (fn ((t,s,e,a), acc) => if t = "" then acc else (t,s,e,a) :: acc) acc all_items
       in acc' end
     | go (TacticParse.ThenLT (base, arms)) acc =
         if is_subgoal_base base then
           (* by/suffices_by: emit as single atomic tactic *)
-          (* ThenLT has no span itself - compute from base and arms *)
           let
             val (_, base_s, _) = node_text_span base
             fun last_span [] = (0, 0)
@@ -198,10 +187,10 @@ fun linearize_with_spans source = let
             val s = base_s
             val e = arm_e
             val t = text_at (s, e)
-          in if t = "" then acc else (t, s, e) :: acc end
+          in if t = "" then acc else (t, s, e, false) :: acc end
         else let
           val all_items = flatten_split_spans (TacticParse.ThenLT (base, arms))
-          val acc' = List.foldl (fn ((t,s,e), a) => if t = "" then a else (t,s,e) :: a) acc all_items
+          val acc' = List.foldl (fn ((t,s,e,a), acc) => if t = "" then acc else (t,s,e,a) :: acc) acc all_items
         in acc' end
     | go (TacticParse.Group (_, span, inner)) acc =
         (* Check if inner needs splitting (ThenLT/LThen without Subgoal base).
@@ -210,7 +199,7 @@ fun linearize_with_spans source = let
         if is_split_node inner then
           go inner acc
         else
-          let val t = text_at span in if t = "" then acc else (t, #1 span, #2 span) :: acc end
+          let val t = text_at span in if t = "" then acc else (t, #1 span, #2 span, false) :: acc end
     | go (TacticParse.First items) acc =
         List.foldl (fn (item, a) => go item a) acc items
     | go (TacticParse.LFirst items) acc =
@@ -238,13 +227,13 @@ fun linearize_with_spans source = let
     | go (TacticParse.LThenLT items) acc =
         List.foldl (fn (item, a) => go item a) acc items
     | go (TacticParse.RepairGroup (_, _, inner, _)) acc = go inner acc
-    (* Terminal cases *)
+    (* Terminal cases - all use_eall=false by default *)
     | go (TacticParse.Opaque (_, (s, e))) acc =
-        let val t = text_at (s, e) in if t = "" then acc else (t, s, e) :: acc end
+        let val t = text_at (s, e) in if t = "" then acc else (t, s, e, false) :: acc end
     | go (TacticParse.LOpaque (_, (s, e))) acc =
-        let val t = text_at (s, e) in if t = "" then acc else (t, s, e) :: acc end
+        let val t = text_at (s, e) in if t = "" then acc else (t, s, e, false) :: acc end
     | go (TacticParse.OOpaque (_, (s, e))) acc =
-        let val t = text_at (s, e) in if t = "" then acc else (t, s, e) :: acc end
+        let val t = text_at (s, e) in if t = "" then acc else (t, s, e, false) :: acc end
     | go _ acc = acc
 in
   List.rev (go tree [])

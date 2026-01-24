@@ -211,7 +211,8 @@ class TestLinearizeSpans:
         tactic = "simp[] >> fs[]"
         result = await call_linearize(hol_session, tactic)
         
-        for text, start, end in result:
+        for item in result:
+            text, start, end = item[0], item[1], item[2]
             # Extract from original using span
             extracted = tactic[start:end]
             # Should match the text (allowing for whitespace trimming)
@@ -222,13 +223,13 @@ class TestLinearizeSpans:
         tactic = "a >- b >- c >- d"
         result = await call_linearize(hol_session, tactic)
         
-        # Sort by start position
+        # Sort by start position (item[1] is start offset)
         sorted_result = sorted(result, key=lambda x: x[1])
         
         # Check no overlaps
         for i in range(len(sorted_result) - 1):
-            _, _, end1 = sorted_result[i]
-            _, start2, _ = sorted_result[i + 1]
+            end1 = sorted_result[i][2]
+            start2 = sorted_result[i + 1][1]
             assert end1 <= start2, f"Overlap: item {i} ends at {end1}, item {i+1} starts at {start2}"
 
 
@@ -301,3 +302,89 @@ class TestLinearizeLongProofs:
         texts = [r[0] for r in result]
         # Should have all the Cases_on
         assert sum(1 for t in texts if "Cases_on" in t) >= 3
+
+
+class TestUseEallFlag:
+    """Tests for the use_eall flag (4th element) which indicates >> chain membership."""
+
+    async def test_single_tactic_no_eall(self, hol_session):
+        """Single tactic should have use_eall=False."""
+        result = await call_linearize(hol_session, "simp[]")
+        assert len(result) == 1
+        text, start, end, use_eall = result[0]
+        assert use_eall is False
+
+    async def test_then_chain_first_no_eall(self, hol_session):
+        """First tactic in >> chain should have use_eall=False."""
+        result = await call_linearize(hol_session, "simp[] >> gvs[]")
+        assert len(result) == 2
+        text1, start1, end1, use_eall1 = result[0]
+        assert "simp" in text1
+        assert use_eall1 is False
+
+    async def test_then_chain_subsequent_eall(self, hol_session):
+        """Subsequent tactics in >> chain should have use_eall=True."""
+        result = await call_linearize(hol_session, "simp[] >> gvs[] >> rw[]")
+        assert len(result) == 3
+        # First: use_eall=False
+        assert result[0][3] is False
+        # Second: use_eall=True
+        assert result[1][3] is True
+        # Third: use_eall=True
+        assert result[2][3] is True
+
+    async def test_thenl_arms_reset_eall(self, hol_session):
+        """Each >- arm should start with use_eall=False."""
+        result = await call_linearize(hol_session, "a >- b >- c")
+        # Each arm is independent, all should be use_eall=False
+        assert len(result) == 3
+        for item in result:
+            assert item[3] is False, f"Expected use_eall=False for {item[0]}"
+
+    async def test_then_inside_thenl_arm(self, hol_session):
+        """>> chain inside >- arm: parenthesized groups stay atomic."""
+        result = await call_linearize(hol_session, "a >- (b >> c >> d)")
+        # Parenthesized groups are kept atomic, so:
+        # a: use_eall=False (base)
+        # (b >> c >> d): use_eall=False (atomic group in arm)
+        assert len(result) == 2
+        assert result[0][0] == "a"
+        assert result[0][3] is False
+        assert "(b >> c >> d)" in result[1][0]
+        assert result[1][3] is False
+
+    async def test_unparensed_then_inside_thenl_arm(self, hol_session):
+        """>> chain inside >- arm without parens: gets split with eall flags."""
+        # Without parens at top level of arm, the >> chain gets split
+        result = await call_linearize(hol_session, "a >- b >> c >> d")
+        # This parses as: a >- ((b >> c) >> d), so arm has >> chain
+        # But actually ThenLT flattens, so we get: base=a, arm=[b >> c >> d]
+        # The arm's >> chain gets split:
+        # a: use_eall=False (base)
+        # b: use_eall=False (first in arm's >> chain)
+        # c: use_eall=True
+        # d: use_eall=True
+        assert len(result) >= 3
+        # First should be a
+        assert result[0][3] is False
+
+    async def test_complex_chain(self, hol_session):
+        """Complex pattern: a >> b >- (c >> d) >- e."""
+        result = await call_linearize(hol_session, "a >> b >- (c >> d) >- e")
+        # Parenthesized (c >> d) is kept atomic. Expected:
+        # a: use_eall=False (first in base >> chain)
+        # b: use_eall=True (second in base >> chain)
+        # (c >> d): use_eall=False (atomic group in arm)
+        # e: use_eall=False (single tactic in arm)
+        texts = [r[0] for r in result]
+        ealls = [r[3] for r in result]
+        
+        assert len(result) == 4
+        # a is first in base chain
+        assert ealls[0] is False
+        # b follows a in >> chain
+        assert ealls[1] is True
+        # (c >> d) is atomic group
+        assert ealls[2] is False
+        # e is alone in its arm
+        assert ealls[3] is False

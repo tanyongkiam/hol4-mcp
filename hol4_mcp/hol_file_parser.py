@@ -12,6 +12,7 @@ class TacticSpan:
     text: str
     start: tuple[int, int]  # (line, col), 1-indexed
     end: tuple[int, int]    # (line, col), 1-indexed
+    use_eall: bool = False  # True if tactic should apply to ALL goals (for >> chains)
 
 
 def build_line_starts(content: str) -> list[int]:
@@ -47,11 +48,11 @@ class HOLParseError(Exception):
     pass
 
 
-def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int]]:
+def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, bool]]:
     """Parse JSON output from linearize_with_spans_json.
 
-    Expects: {"ok":[{"t":"text","s":0,"e":8},...]} or {"err":"message"}
-    Returns: list of (text, start_offset, end_offset) tuples.
+    Expects: {"ok":[{"t":"text","s":0,"e":8,"a":false},...]} or {"err":"message"}
+    Returns: list of (text, start_offset, end_offset, use_eall) tuples.
     Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
     import json
@@ -63,7 +64,7 @@ def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int]]
 
     if 'ok' in result:
         try:
-            return [(item['t'], item['s'], item['e']) for item in result['ok']]
+            return [(item['t'], item['s'], item['e'], item.get('a', False)) for item in result['ok']]
         except (KeyError, TypeError) as e:
             raise HOLParseError(f"Malformed tactic span in output: {e}") from e
     elif 'err' in result:
@@ -73,11 +74,11 @@ def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int]]
 
 
 def make_tactic_spans(
-    raw_spans: list[tuple[str, int, int]],
+    raw_spans: list[tuple[str, int, int, bool]],
     proof_body_offset: int,
     line_starts: list[int],
 ) -> list[TacticSpan]:
-    """Convert raw (text, start, end) tuples to TacticSpan with line/col.
+    """Convert raw (text, start, end, use_eall) tuples to TacticSpan with line/col.
 
     Args:
         raw_spans: Output from parse_linearize_with_spans_output (offsets relative to proof body)
@@ -88,13 +89,13 @@ def make_tactic_spans(
         List of TacticSpan with absolute line/col positions in the file.
     """
     result = []
-    for text, start, end in raw_spans:
+    for text, start, end, use_eall in raw_spans:
         # Convert relative offsets to absolute
         abs_start = proof_body_offset + start
         abs_end = proof_body_offset + end
         start_lc = offset_to_line_col(abs_start, line_starts)
         end_lc = offset_to_line_col(abs_end, line_starts)
-        result.append(TacticSpan(text=text, start=start_lc, end=end_lc))
+        result.append(TacticSpan(text=text, start=start_lc, end=end_lc, use_eall=use_eall))
     return result
 
 

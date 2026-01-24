@@ -639,9 +639,12 @@ class FileProofCursor:
                 # Going forwards - replay only the delta (batched)
                 tactics_to_apply = self._active_tactics[self._current_tactic_idx:tactics_to_replay]
                 if tactics_to_apply:
-                    # goalstack: e(tactic) directly; goaltree: etq "tactic" (string parsed)
+                    # goalstack: e(tactic) or eall(tactic); goaltree: etq "tactic" (string parsed)
                     if self._mode == "g":
-                        tactic_cmds = [f'e({t.text})' for t in tactics_to_apply]
+                        tactic_cmds = [
+                            f'eall({t.text})' if t.use_eall else f'e({t.text})'
+                            for t in tactics_to_apply
+                        ]
                     else:
                         tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in tactics_to_apply]
                     batch = "; ".join(tactic_cmds) + ";"
@@ -686,9 +689,13 @@ class FileProofCursor:
 
             if total_tactics > 0:
                 # Batch all tactics in single send
-                # goalstack: e(tactic) directly; goaltree: etq "tactic" (string parsed)
+                # goalstack: e(tactic) or eall(tactic); goaltree: etq "tactic" (string parsed)
+                # Use eall for tactics that came from >> chains (need to apply to all goals)
                 if self._mode == "g":
-                    tactic_cmds = [f'e({t.text})' for t in self._active_tactics]
+                    tactic_cmds = [
+                        f'eall({t.text})' if t.use_eall else f'e({t.text})'
+                        for t in self._active_tactics
+                    ]
                 else:
                     tactic_cmds = [f'etq "{escape_sml_string(t.text)}"' for t in self._active_tactics]
                 batch = "; ".join(tactic_cmds) + ";"
@@ -706,7 +713,9 @@ class FileProofCursor:
                     # Only replay up to tactics_to_replay, not all tactics
                     for i, tac in enumerate(self._active_tactics[:tactics_to_replay]):
                         if self._mode == "g":
-                            result = await self.session.send(f'e({tac.text});', timeout=tac_timeout)
+                            # Use eall for tactics from >> chains (apply to all goals)
+                            cmd = f'eall({tac.text})' if tac.use_eall else f'e({tac.text})'
+                            result = await self.session.send(f'{cmd};', timeout=tac_timeout)
                         else:
                             tac_escaped = escape_sml_string(tac.text)
                             result = await self.session.send(f'etq "{tac_escaped}";', timeout=tac_timeout)
