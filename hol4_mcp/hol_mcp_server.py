@@ -32,8 +32,18 @@ class SessionEntry:
     holmake_env: Optional[dict] = None  # env vars for holmake (auto-captured on success)
 
 
-mcp = FastMCP("hol", instructions="""HOL4 theorem prover.
-holmake: build. hol_start/hol_send: interactive. hol_cursor_*: file-based proofs.""")
+mcp = FastMCP("hol", instructions="""HOL4 theorem prover - proof development workflow:
+
+1. hol_file_init: Open a *Script.sml file (loads dependencies)
+2. hol_state_at: Check proof state at cursor position (auto-detects file changes)
+3. Edit file directly, then hol_state_at to see new goals
+4. Repeat until proof complete
+5. holmake: Only at the end to verify the build
+
+Do NOT:
+- Call hol_restart after file edits (state_at auto-detects changes)
+- Use hol_send for proof navigation (use hol_state_at instead)
+""")
 _sessions: dict[str, SessionEntry] = {}
 
 
