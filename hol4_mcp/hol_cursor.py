@@ -636,9 +636,9 @@ class FileProofCursor:
                             self._current_tactic_idx = tactics_to_replay
                             actual_replayed = tactics_to_replay
 
-        # Get current goals
-        goals_output = await self.session.send('top_goals();', timeout=10)
-        goals = self._parse_goals(goals_output)
+        # Get current goals - use map snd for cleaner parsing
+        goals_output = await self.session.send('map snd (top_goals());', timeout=10)
+        goals = self._parse_goal_terms(goals_output)
 
         return StateAtResult(
             goals=goals,
@@ -649,22 +649,24 @@ class FileProofCursor:
             error=error_msg,
         )
 
-    def _parse_goals(self, output: str) -> list[str]:
-        """Parse goal list from top_goals() output."""
-        # Output format: val it = [(asms, "goal"), ...]: goal list
-        # Simplified: just return the raw output for now
-        # TODO: proper parsing if needed
-        if "[]" in output:
+    def _parse_goal_terms(self, output: str) -> list[str]:
+        """Parse goal terms from 'map snd (top_goals())' output.
+
+        Output format: val it = ["goal1", "goal2", ...]: term list
+        Empty: val it = []: term list
+        """
+        # Check for empty list
+        if "[]: term list" in output or "= []\n" in output:
             return []
-        # Extract goal strings (rough parsing)
+
+        # Extract quoted strings from the term list
+        # Format: val it = ["A ⇒ B", "C"]: term list
+        import re
         goals = []
-        for line in output.split('\n'):
-            if '"' in line:
-                # Extract quoted goal
-                start = line.find('"')
-                end = line.rfind('"')
-                if start < end:
-                    goals.append(line[start+1:end])
+        # Find all quoted strings - goals are simple quoted terms
+        for match in re.finditer(r'"([^"]*)"', output):
+            goals.append(match.group(1))
+
         return goals if goals else [output.strip()]
 
     @property

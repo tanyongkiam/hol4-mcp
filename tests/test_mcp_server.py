@@ -469,6 +469,35 @@ def _pid_exists(pid: int) -> bool:
 import subprocess
 
 
+def test_parse_goal_terms():
+    """Test _parse_goal_terms parses HOL4 goal output correctly."""
+    from hol4_mcp.hol_cursor import FileProofCursor
+
+    # Create a minimal cursor just to test the parsing method
+    class MockCursor(FileProofCursor):
+        def __init__(self):
+            pass  # Skip normal init
+
+    cursor = MockCursor()
+
+    # Empty goals
+    assert cursor._parse_goal_terms('val it = []: term list\n') == []
+
+    # Single goal
+    assert cursor._parse_goal_terms('val it = ["A ⇒ A"]: term list\n') == ['A ⇒ A']
+
+    # Multiple goals
+    assert cursor._parse_goal_terms('val it = ["A", "B"]: term list\n') == ['A', 'B']
+
+    # Complex goal with symbols
+    result = cursor._parse_goal_terms('val it = ["B ⇒ A ∧ B"]: term list\n')
+    assert result == ['B ⇒ A ∧ B']
+
+    # Regression test: empty list should not match embedded []
+    # (This was a bug where [([], "goal")] was parsed as empty because of "[]")
+    assert cursor._parse_goal_terms('val it = ["goal"]: term list\n') != []
+
+
 def test_cli_help():
     """Test that hol4-mcp --help works."""
     result = subprocess.run(
