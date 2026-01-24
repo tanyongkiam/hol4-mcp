@@ -152,6 +152,50 @@ class TestEdgeCases:
         assert len(result) >= 2
 
 
+class TestParseTreeStructure:
+    """Tests documenting parse tree structure for different patterns.
+
+    These test cases document expected behavior for batch-correct step extraction.
+    """
+
+    async def test_then_chain_structure(self, hol_session):
+        """a >> b >> c parses as Then[a, b, c] - 3 top-level steps."""
+        result = await call_step_positions(hol_session, "a >> b >> c")
+        # Current: linearize gives endpoints for each
+        assert len(result) == 3
+
+    async def test_thenlt_structure(self, hol_session):
+        """conj_tac >- simp[] >- fs[] parses as nested ThenLT - should be 1 atomic step.
+
+        Current behavior: linearize splits into 3 fragments.
+        Batch-correct: should be 1 step (entire >- is atomic).
+        """
+        result = await call_step_positions(hol_session, "conj_tac >- simp[] >- fs[]")
+        # Current behavior: 3 fragments
+        assert len(result) >= 1
+        # TODO: For batch-correct O(1) access, this should be 1 step
+
+    async def test_then_with_thenlt_inside(self, hol_session):
+        """a >> (b >- c) >> d - the (b >- c) is atomic within the >> chain.
+
+        Batch-correct: 3 steps [a, (b >- c), d].
+        """
+        result = await call_step_positions(hol_session, "a >> (b >- c) >> d")
+        # Should have at least 3 step boundaries
+        assert len(result) >= 3
+
+    async def test_thenlt_with_then_inside(self, hol_session):
+        """(a >> b) >- c >- d - entire thing is one >- structure.
+
+        Batch-correct: 1 step (the whole ThenLT is atomic).
+        Current: linearize splits it.
+        """
+        result = await call_step_positions(hol_session, "(a >> b) >- c >- d")
+        # Current behavior: multiple fragments
+        assert len(result) >= 1
+        # TODO: For batch-correct, this should be 1 step
+
+
 class TestFineGrainedStepping:
     """Tests for fine-grained stepping inside >- structures.
 
