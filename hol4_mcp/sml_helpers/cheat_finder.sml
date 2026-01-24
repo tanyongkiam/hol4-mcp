@@ -80,6 +80,8 @@ fun linearize_with_spans source = let
     | flatten_split_spans (TacticParse.LThen (base, arms)) =
         flatten_split_spans base @ List.concat (List.map flatten_split_spans arms)
     | flatten_split_spans (TacticParse.LThen1 inner) = flatten_split_spans inner
+    | flatten_split_spans (TacticParse.Then items) =
+        List.concat (List.map flatten_split_spans items)
     | flatten_split_spans (TacticParse.Group (_, span, inner)) =
         (* Check if inner is by/suffices_by - if so, emit Group as atomic *)
         if is_subgoal_base inner then

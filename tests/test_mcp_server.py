@@ -42,6 +42,16 @@ def workdir():
     return str(FIXTURES_DIR)
 
 
+@pytest.fixture
+def isolated_workdir(tmp_path):
+    """Copy fixtures to isolated temp directory for tests that modify state."""
+    # Copy all fixture files to temp dir
+    for f in FIXTURES_DIR.iterdir():
+        if f.is_file():
+            shutil.copy(f, tmp_path / f.name)
+    return str(tmp_path)
+
+
 async def test_session_lifecycle(workdir):
     """Test basic session start/list/send/stop."""
     result = await hol_start(workdir=workdir, name="test")
@@ -135,42 +145,26 @@ async def test_db_search(workdir):
         await hol_stop(session="db_test")
 
 
-async def test_build_and_logs(workdir):
+async def test_build_and_logs(isolated_workdir):
     """Test holmake generates logs, then test hol_logs/hol_log."""
-    # Clean build artifacts to ensure fresh build
-    hol_dir = Path(workdir) / ".hol"
-    if hol_dir.exists():
-        shutil.rmtree(hol_dir)
-    for f in Path(workdir).glob("*.uo"):
-        f.unlink()
-    for f in Path(workdir).glob("*.ui"):
-        f.unlink()
-    for f in Path(workdir).glob("*Theory.*"):
-        f.unlink()
-
-    result = await holmake(workdir=workdir, target="testTheory")
+    result = await holmake(workdir=isolated_workdir, target="testTheory")
     assert "Build succeeded" in result
     assert "testTheory" in result
 
-    result = await hol_logs(workdir=workdir)
+    result = await hol_logs(workdir=isolated_workdir)
     assert "Build logs:" in result
     assert "testTheory" in result
 
-    result = await hol_log(workdir=workdir, theory="testTheory", limit=500)
+    result = await hol_log(workdir=isolated_workdir, theory="testTheory", limit=500)
     assert 'theory "test"' in result.lower()
 
-    result = await hol_log(workdir=workdir, theory="test", limit=500)
+    result = await hol_log(workdir=isolated_workdir, theory="test", limit=500)
     assert 'theory "test"' in result.lower()
 
 
-async def test_build_failure_includes_logs(workdir):
+async def test_build_failure_includes_logs(isolated_workdir):
     """Test that build failure includes log output."""
-    # Clean to ensure fresh build attempt
-    hol_dir = Path(workdir) / ".hol"
-    if hol_dir.exists():
-        shutil.rmtree(hol_dir)
-
-    result = await holmake(workdir=workdir, target="failTheory")
+    result = await holmake(workdir=isolated_workdir, target="failTheory")
     assert "Build failed" in result
     assert "=== Build Logs ===" in result
     assert "failTheory" in result
@@ -183,13 +177,13 @@ async def test_log_nonexistent(workdir):
     assert "Available:" in result
 
 
-async def test_holmake_env_in_output(workdir):
+async def test_holmake_env_in_output(isolated_workdir):
     """Test that holmake returns env in output on success."""
     import json
 
     # Build with env - should include in output
     test_env = {"TEST_VAR": "test_value"}
-    result = await holmake(workdir=workdir, target="testTheory", env=test_env)
+    result = await holmake(workdir=isolated_workdir, target="testTheory", env=test_env)
     assert "Build succeeded" in result
     assert "HOLMAKE_ENV: " in result
 
@@ -201,7 +195,7 @@ async def test_holmake_env_in_output(workdir):
     assert parsed_env == test_env
 
     # Build without env - no HOLMAKE_ENV line
-    result = await holmake(workdir=workdir, target="testTheory", env=None)
+    result = await holmake(workdir=isolated_workdir, target="testTheory", env=None)
     assert "Build succeeded" in result
     assert "HOLMAKE_ENV: " not in result
 
