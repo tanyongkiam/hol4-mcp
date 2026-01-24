@@ -218,7 +218,11 @@ async def hol_stop(session: str) -> str:
 async def hol_restart(session: str) -> str:
     """Restart HOL session (stop + start, preserves workdir).
 
-    Use when HOL state is corrupted or you need to reload theories after file changes.
+    Only needed when:
+    - HOL state is corrupted (rare)
+    - Upstream dependencies changed (edited other .sml files that need Holmake)
+
+    NOT needed for edits to current proof file - state_at auto-detects changes.
 
     Args:
         session: Session name to restart
