@@ -134,10 +134,13 @@ fun linearize_with_spans source = let
     | flatten_split_spans (TacticParse.Then items) =
         List.concat (List.map flatten_split_spans items)
     | flatten_split_spans (TacticParse.Group (_, span, inner)) =
-        (* Check if inner is by/suffices_by - if so, emit Group as atomic *)
-        if is_subgoal_base inner then
+        (* Only recurse if inner is a split node (ThenLT/LThen without Subgoal base).
+           Otherwise emit the Group's span as a single atomic tactic.
+           This preserves wrappers like rpt, TRY, by, etc. *)
+        if is_split_node inner then
+          flatten_split_spans inner
+        else
           let val t = text_at span in if t = "" then [] else [(t, #1 span, #2 span)] end
-        else flatten_split_spans inner
     | flatten_split_spans node =
         let val (t, s, e) = node_text_span node
         in if t = "" then [] else [(t, s, e)] end
@@ -201,10 +204,13 @@ fun linearize_with_spans source = let
           val acc' = List.foldl (fn ((t,s,e), a) => if t = "" then a else (t,s,e) :: a) acc all_items
         in acc' end
     | go (TacticParse.Group (_, span, inner)) acc =
-        (* Check if inner is by/suffices_by - if so, emit Group as atomic *)
-        if is_subgoal_base inner then
+        (* Check if inner needs splitting (ThenLT/LThen without Subgoal base).
+           If so, recurse to flatten. Otherwise emit Group as single atomic tactic.
+           This preserves wrappers like rpt, TRY, etc. *)
+        if is_split_node inner then
+          go inner acc
+        else
           let val t = text_at span in if t = "" then acc else (t, #1 span, #2 span) :: acc end
-        else go inner acc
     | go (TacticParse.First items) acc =
         List.foldl (fn (item, a) => go item a) acc items
     | go (TacticParse.LFirst items) acc =
