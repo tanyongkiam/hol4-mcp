@@ -25,13 +25,14 @@ def _is_hol_error(output: str) -> bool:
 
     Returns False for:
     - HOL warnings/messages ("<<HOL message:", "<<HOL warning:")
-    - The word "error" appearing in goal terms (e.g., "error_state")
+    - The word "Exception" in identifiers (e.g., "no_ReturnException")
     """
     if output.startswith("TIMEOUT"):
         return True
     if output.lstrip().startswith("ERROR:") or output.lstrip().startswith("Error:"):
         return True
-    if "Exception" in output:
+    # Poly/ML uncaught exception format: "Exception- Fail ..." or "Exception- HOL_ERR ..."
+    if any(line.startswith("Exception- ") for line in output.split('\n')):
         return True
     if "HOL_ERR" in output:
         return True
