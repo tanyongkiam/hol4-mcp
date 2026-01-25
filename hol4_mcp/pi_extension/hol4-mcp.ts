@@ -83,7 +83,8 @@ class McpClient {
   private send(msg: object): void {
     if (!this.proc?.stdin) throw new Error("Not connected");
     // NDJSON: send JSON followed by newline
-    this.proc.stdin.write(JSON.stringify(msg) + "\n");
+    const json = JSON.stringify(msg);
+    this.proc.stdin.write(json + "\n");
   }
 
   private notify(method: string, params: object): void {
@@ -202,7 +203,17 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
             return { content: [{ type: "text", text: "Error: tool_name required for 'call' action" }], details: {}, isError: true };
           }
 
-          const result = await mcpClient.callTool(params.tool_name, (params.args || {}) as Record<string, unknown>);
+          // Parse args if it's a JSON string (LLM sometimes passes stringified JSON)
+          let args = params.args || {};
+          if (typeof args === "string") {
+            try {
+              args = JSON.parse(args);
+            } catch {
+              return { content: [{ type: "text", text: `Error: Invalid JSON in args: ${args}` }], details: {}, isError: true };
+            }
+          }
+
+          const result = await mcpClient.callTool(params.tool_name, args as Record<string, unknown>);
           const textContent = result.content
             .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
             .map((c) => c.text)
