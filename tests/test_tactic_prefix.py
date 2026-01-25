@@ -8,7 +8,7 @@ import pytest
 from pathlib import Path
 
 from hol4_mcp.hol_session import HOLSession, escape_sml_string
-from hol4_mcp.hol_file_parser import parse_step_positions_output, parse_prefix_commands_output
+from hol4_mcp.hol_file_parser import parse_step_positions_output, parse_prefix_commands_output, parse_step_plan_output
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SML_HELPERS_DIR = Path(__file__).parent.parent / "hol4_mcp" / "sml_helpers"
@@ -450,3 +450,100 @@ class TestStepCommands:
 
         # Should be a valid SML expression (may be empty or contain partial)
         assert isinstance(partial_cmd, str)
+
+
+async def call_step_plan(session: HOLSession, tactic_str: str):
+    """Call step_plan_json and parse the result."""
+    escaped = escape_sml_string(tactic_str)
+    result = await session.send(f'step_plan_json "{escaped}";', timeout=10)
+    return parse_step_plan_output(result)
+
+
+class TestStepPlan:
+    """Tests for step_plan_json - the main API for tactic navigation.
+
+    step_plan_json returns (end_offset, cmd) pairs for each executable step.
+    This is the single source of truth for O(1) tactic navigation.
+    """
+
+    async def test_simple_then_chain(self, hol_session):
+        """>> chain should return one step per tactic.
+
+        This was a bug: step_plan returned 1 step instead of 3.
+        """
+        result = await call_step_plan(hol_session, "simp[] >> rpt strip_tac >> gvs[]")
+        assert len(result) == 3
+        # End positions should be monotonically increasing
+        ends = [step.end for step in result]
+        assert ends == sorted(ends)
+        # Each cmd should be cumulative e() command
+        assert "simp" in result[0].cmd
+        assert "simp" in result[1].cmd and "strip_tac" in result[1].cmd
+        assert "gvs" in result[2].cmd
+
+    async def test_thenlt_chain(self, hol_session):
+        """>- should return steps for head and each arm."""
+        result = await call_step_plan(hol_session, "Induct >- simp[]")
+        assert len(result) == 2
+        assert "Induct" in result[0].cmd
+        assert "simp" in result[1].cmd
+
+    async def test_mixed_then_and_thenlt(self, hol_session):
+        """Mixed >> and >- should handle both."""
+        result = await call_step_plan(hol_session, "Induct >- simp[] >> gvs[]")
+        # Induct, simp[], gvs[] = 3 steps
+        assert len(result) >= 2
+
+    async def test_with_quotations(self, hol_session):
+        """Backtick quotations should be handled."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >> simp[]")
+        assert len(result) == 2
+        assert "Cases_on" in result[0].cmd
+        assert "simp" in result[1].cmd
+
+    async def test_single_tactic(self, hol_session):
+        """Single tactic should return one step."""
+        result = await call_step_plan(hol_session, "simp[]")
+        assert len(result) == 1
+
+    async def test_matches_tactic_steps(self, hol_session):
+        """step_plan should return same step count as tactic_steps."""
+        tactic = "simp[] >> rpt strip_tac >> gvs[]"
+        escaped = escape_sml_string(tactic)
+
+        # Get step_plan results
+        plan_result = await call_step_plan(hol_session, tactic)
+
+        # Get tactic_steps results
+        steps_output = await hol_session.send(f'tactic_steps_json "{escaped}";', timeout=10)
+        # Parse manually since we don't have a dedicated parser
+        import json
+        for line in steps_output.strip().split('\n'):
+            if line.startswith('{"ok":'):
+                steps_data = json.loads(line)['ok']
+                break
+
+        # Same number of steps
+        assert len(plan_result) == len(steps_data)
+
+        # Same end positions
+        plan_ends = [step.end for step in plan_result]
+        steps_ends = [step['end'] for step in steps_data]
+        assert plan_ends == steps_ends
+
+    async def test_by_construct(self, hol_session):
+        """`by` should be atomic."""
+        result = await call_step_plan(hol_session, "`P` by simp[]")
+        assert len(result) == 1
+
+    async def test_by_in_chain(self, hol_session):
+        """`by` in >> chain should be one step."""
+        result = await call_step_plan(hol_session, "rpt strip_tac >> `P` by simp[] >> fs[]")
+        assert len(result) == 3
+
+    async def test_commands_are_valid_e_calls(self, hol_session):
+        """Each cmd should be a valid e() command."""
+        result = await call_step_plan(hol_session, "a >> b >> c")
+        for step in result:
+            assert step.cmd.strip().startswith("e(")
+            assert step.cmd.strip().endswith(");") or step.cmd.strip().endswith(";\n")

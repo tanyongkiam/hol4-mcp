@@ -197,33 +197,34 @@ fun step_plan proofBody =
   let
     val tree = TacticParse.parseTacticBlock proofBody
     val defaultSpan = (0, String.size proofBody)
-    val frags = TacticParse.sliceTacticBlock 0 (String.size proofBody) false defaultSpan tree
-    
-    (* Extract the maximum end offset from a fragment *)
-    fun fragEnd (TacticParse.FAtom a) = 
-        (case TacticParse.topSpan a of SOME (_, r) => r | NONE => 0)
-      | fragEnd (TacticParse.FGroup ((_, r), _)) = r
-      | fragEnd (TacticParse.FBracket (_, _, _, a)) = 
-        (case TacticParse.topSpan a of SOME (_, r) => r | NONE => 0)
-      | fragEnd (TacticParse.FMBracket (_, _, _, _, a)) = 
-        (case TacticParse.topSpan a of SOME (_, r) => r | NONE => 0)
-      | fragEnd _ = 0
-    
-    (* Get max end offset from a list of fragments *)
-    fun fragsEnd [] = 0
-      | fragsEnd fs = List.foldl (fn (f, mx) => Int.max (fragEnd f, mx)) 0 fs
-    
-    (* Process each step (frag list) to get (end_offset, cmd) *)
-    fun processStep fragList =
+
+    (* Use linearize to get individual fragments - same pattern as tactic_steps *)
+    fun isAtom e = Option.isSome (TacticParse.topSpan e)
+    val allFrags = TacticParse.linearize isAtom tree
+
+    (* Extract spans from fragments to find step boundaries *)
+    fun fragSpan (TacticParse.FAtom a) = TacticParse.topSpan a
+      | fragSpan (TacticParse.FGroup (p, _)) = SOME p
+      | fragSpan _ = NONE
+
+    (* Collect end positions of each step *)
+    fun collectEnds [] acc = rev acc
+      | collectEnds (f::fs) acc =
+          case fragSpan f of
+            SOME (_, endPos) => collectEnds fs (endPos :: acc)
+          | NONE => collectEnds fs acc
+    val endPositions = collectEnds allFrags []
+
+    (* For each end position, generate the cumulative e() command *)
+    fun makeStep endPos =
       let
-        val endOff = fragsEnd fragList
-        val cmd = TacticParse.printFragsAsE proofBody [fragList]
+        val frags = TacticParse.sliceTacticBlock 0 endPos false defaultSpan tree
+        val cmd = TacticParse.printFragsAsE proofBody frags
       in
-        (endOff, cmd)
+        (endPos, cmd)
       end
-    
-    (* Filter out empty commands *)
-    val steps = map processStep frags
+
+    val steps = map makeStep endPositions
     val nonEmpty = List.filter (fn (_, cmd) => String.size cmd > 0) steps
   in
     nonEmpty
