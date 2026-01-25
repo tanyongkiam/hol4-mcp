@@ -134,6 +134,38 @@ def parse_prefix_commands_output(output: str) -> str:
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 
 
+@dataclass
+class StepPlan:
+    """A step with its end offset and command."""
+    end: int       # End offset in proof body
+    cmd: str       # e() command to execute this step
+
+
+def parse_step_plan_output(output: str) -> list[StepPlan]:
+    """Parse JSON output from step_plan_json.
+
+    Expects: {"ok":[{"end":N,"cmd":"e(...);\\n"}, ...]} or {"err":"message"}
+    Returns: list of StepPlan objects, one per executable step.
+    Raises: HOLParseError if HOL4 returned an error or output is malformed.
+    """
+    result = _find_json_line(output, "step_plan_json")
+
+    if 'ok' in result:
+        try:
+            steps = []
+            for item in result['ok']:
+                end = int(item['end'])
+                cmd = str(item['cmd'])
+                steps.append(StepPlan(end=end, cmd=cmd))
+            return steps
+        except (TypeError, ValueError, KeyError) as e:
+            raise HOLParseError(f"Malformed step plan in output: {e}") from e
+    elif 'err' in result:
+        raise HOLParseError(f"step_plan_json: {result['err']}")
+    else:
+        raise HOLParseError(f"Unexpected JSON structure: {result}")
+
+
 def make_tactic_spans(
     raw_spans: list[tuple[str, int, int, bool]],
     proof_body_offset: int,

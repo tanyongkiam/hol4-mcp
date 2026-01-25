@@ -9,7 +9,8 @@ from .hol_file_parser import (
     TheoremInfo, parse_file, parse_p_output, parse_theorems,
     TacticSpan, build_line_starts, parse_linearize_with_spans_output,
     make_tactic_spans, offset_to_line_col, line_col_to_offset, HOLParseError,
-    _find_json_line, parse_step_positions_output, parse_prefix_commands_output,
+    _find_json_line, parse_prefix_commands_output,
+    parse_step_plan_output, StepPlan,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -142,7 +143,7 @@ class FileProofCursor:
         # Active theorem state
         self._active_theorem: str | None = None
         self._active_tactics: list[TacticSpan] = []  # Deprecated, kept for compatibility
-        self._step_positions: list[int] = []  # End offsets for each step (relative to proof body)
+        self._step_plan: list[StepPlan] = []  # Step boundaries aligned with e() commands
         self._current_tactic_idx: int = 0  # Current position in proof (for backup optimization)
         self._current_offset: int = -1  # Current proof body offset (-1 = not set)
         self._proof_initialized: bool = False  # Whether g/gt has been called for current theorem
@@ -264,10 +265,11 @@ class FileProofCursor:
         """
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = self._get_checkpoint_path(theorem_name, "end_of_proof")
+        ckpt_path_str = escape_sml_string(str(ckpt_path))
 
         # Save child checkpoint (incremental, ~35-45ms, 1-7MB)
         result = await self.session.send(
-            f'PolyML.SaveState.saveChild ("{ckpt_path}", 1);', timeout=30
+            f'PolyML.SaveState.saveChild ("{ckpt_path_str}", 1);', timeout=30
         )
         if _is_hol_error(result):
             return False
@@ -293,8 +295,9 @@ class FileProofCursor:
             return False
 
         # Load checkpoint (~70-120ms depending on loaded theories)
+        ckpt_path_str = escape_sml_string(str(ckpt.end_of_proof_path))
         result = await self.session.send(
-            f'PolyML.SaveState.loadState "{ckpt.end_of_proof_path}";', timeout=30
+            f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
         )
         if _is_hol_error(result):
             return False
@@ -324,11 +327,13 @@ class FileProofCursor:
     def _invalidate_checkpoints_from(self, start_line: int) -> None:
         """Invalidate checkpoints for theorems at or after start_line.
 
-        When content changes at line N, all theorems starting at N or later
-        have invalid checkpoints (their context may have changed).
+        When content changes at line N, all theorems starting at N or later,
+        OR containing line N, have invalid checkpoints.
         """
         for thm in self._theorems:
-            if thm.start_line >= start_line:
+            # Invalidate if theorem ends at or after the change point
+            # (i.e. change is before theorem or inside theorem)
+            if thm.proof_end_line >= start_line:
                 self._invalidate_checkpoint(thm.name)
 
     async def init(self) -> dict:
@@ -479,18 +484,18 @@ class FileProofCursor:
             self._loaded_to_line = thm.start_line
             self._loaded_content_hash = self._compute_hash(loaded_content)
 
-        # Parse step positions from proof body using TacticParse
+        # Parse step plan from proof body using TacticParse
         if thm.proof_body:
             escaped_body = escape_sml_string(thm.proof_body)
             step_result = await self.session.send(
-                f'step_positions_json "{escaped_body}";', timeout=30
+                f'step_plan_json "{escaped_body}";', timeout=30
             )
             try:
-                self._step_positions = parse_step_positions_output(step_result)
+                self._step_plan = parse_step_plan_output(step_result)
             except HOLParseError as e:
-                return {"error": f"Failed to parse step positions: {e}"}
+                return {"error": f"Failed to parse step plan: {e}"}
         else:
-            self._step_positions = []
+            self._step_plan = []
 
         self._active_theorem = name
         self._active_tactics = []  # Deprecated
@@ -500,7 +505,7 @@ class FileProofCursor:
         return {
             "theorem": name,
             "goal": thm.goal,
-            "tactics": len(self._step_positions),
+            "tactics": len(self._step_plan),
             "has_cheat": thm.has_cheat,
         }
 
@@ -562,18 +567,18 @@ class FileProofCursor:
             if thm.proof_body:
                 escaped_body = escape_sml_string(thm.proof_body)
                 step_result = await self.session.send(
-                    f'step_positions_json "{escaped_body}";', timeout=30
+                    f'step_plan_json "{escaped_body}";', timeout=30
                 )
                 try:
-                    self._step_positions = parse_step_positions_output(step_result)
+                    self._step_plan = parse_step_plan_output(step_result)
                 except HOLParseError as e:
                     return StateAtResult(
                         goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
                         file_hash=self._content_hash,
-                        error=f"Failed to parse step positions: {e}"
+                        error=f"Failed to parse step plan: {e}"
                     )
             else:
-                self._step_positions = []
+                self._step_plan = []
         timings['parse_steps'] = time.perf_counter() - t2
 
         # Check if position is within theorem bounds (include QED line)
@@ -597,20 +602,21 @@ class FileProofCursor:
             proof_body_offset = max(0, file_offset - thm.proof_body_offset)
 
         # Find tactic index for reporting (which step boundary we're at/past)
+        # Uses step_plan ends which are aligned with executable e() commands
         tactic_idx = 0
-        for i, end_pos in enumerate(self._step_positions):
-            if proof_body_offset >= end_pos:
+        for i, step in enumerate(self._step_plan):
+            if proof_body_offset >= step.end:
                 tactic_idx = i + 1
             else:
                 break
 
-        total_tactics = len(self._step_positions)
+        total_tactics = len(self._step_plan)
         error_msg = None
         t3 = time.perf_counter()
 
         # Calculate step boundary info for O(1) access
         # step_before_end: end offset of last complete step (0 if none)
-        step_before_end = self._step_positions[tactic_idx - 1] if tactic_idx > 0 else 0
+        step_before_end = self._step_plan[tactic_idx - 1].end if tactic_idx > 0 else 0
         # Only execute partial at proof end. Within a step, partial_step_commands may return
         # the full step (for atomic tactics), which we don't want to execute.
         # Fine-grained stepping within compound tactics is sacrificed for correctness.
@@ -642,15 +648,8 @@ class FileProofCursor:
             self._proof_initialized = True
 
             if thm.proof_body and total_tactics > 0:
-                # Execute all steps individually for backup_n to work
-                step_result = await self.session.send(
-                    f'step_commands_json "{escaped_body}";', timeout=30
-                )
-                try:
-                    step_cmds = parse_prefix_commands_output(step_result)
-                except HOLParseError as e:
-                    error_msg = f"Failed to get step commands: {e}"
-                    step_cmds = ""
+                # Execute all steps from step_plan (aligned with backup_n)
+                step_cmds = "".join(step.cmd for step in self._step_plan)
 
                 if step_cmds.strip():
                     batch_timeout = max(30, int(self._tactic_timeout * total_tactics)) if self._tactic_timeout else 300
@@ -744,7 +743,7 @@ class FileProofCursor:
             "file": str(self.file),
             "file_hash": self._content_hash,
             "active_theorem": self._active_theorem,
-            "active_tactics": len(self._step_positions),
+            "active_tactics": len(self._step_plan),
             "loaded_to_line": self._loaded_to_line,
             "stale": stale,
             "completed": list(self._completed),

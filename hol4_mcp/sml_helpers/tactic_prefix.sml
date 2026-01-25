@@ -189,3 +189,53 @@ fun partial_step_commands proofBody startOffset endOffset =
 fun partial_step_commands_json proofBody startOffset endOffset =
   print (json_ok (json_string (partial_step_commands proofBody startOffset endOffset)) ^ "\n")
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* step_plan: Get step boundaries aligned with executable commands.
+   Returns (end_offset, command) pairs where each command is one e() call.
+   This is the single source of truth for O(1) tactic navigation. *)
+fun step_plan proofBody =
+  let
+    val tree = TacticParse.parseTacticBlock proofBody
+    val defaultSpan = (0, String.size proofBody)
+    val frags = TacticParse.sliceTacticBlock 0 (String.size proofBody) false defaultSpan tree
+    
+    (* Extract the maximum end offset from a fragment *)
+    fun fragEnd (TacticParse.FAtom a) = 
+        (case TacticParse.topSpan a of SOME (_, r) => r | NONE => 0)
+      | fragEnd (TacticParse.FGroup ((_, r), _)) = r
+      | fragEnd (TacticParse.FBracket (_, _, _, a)) = 
+        (case TacticParse.topSpan a of SOME (_, r) => r | NONE => 0)
+      | fragEnd (TacticParse.FMBracket (_, _, _, _, a)) = 
+        (case TacticParse.topSpan a of SOME (_, r) => r | NONE => 0)
+      | fragEnd _ = 0
+    
+    (* Get max end offset from a list of fragments *)
+    fun fragsEnd [] = 0
+      | fragsEnd fs = List.foldl (fn (f, mx) => Int.max (fragEnd f, mx)) 0 fs
+    
+    (* Process each step (frag list) to get (end_offset, cmd) *)
+    fun processStep fragList =
+      let
+        val endOff = fragsEnd fragList
+        val cmd = TacticParse.printFragsAsE proofBody [fragList]
+      in
+        (endOff, cmd)
+      end
+    
+    (* Filter out empty commands *)
+    val steps = map processStep frags
+    val nonEmpty = List.filter (fn (_, cmd) => String.size cmd > 0) steps
+  in
+    nonEmpty
+  end
+
+fun step_plan_json proofBody =
+  let
+    val steps = step_plan proofBody
+    fun stepToJson (endOff, cmd) =
+      "{\"end\":" ^ json_int endOff ^ ",\"cmd\":" ^ json_string cmd ^ "}"
+    val stepsJson = "[" ^ String.concatWith "," (map stepToJson steps) ^ "]"
+  in
+    print (json_ok stepsJson ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");

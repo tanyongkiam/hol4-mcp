@@ -464,6 +464,48 @@ async def test_state_at_uses_checkpoint_on_repeat(tmp_path):
         await hol_stop(session="checkpoint_test")
 
 
+async def test_checkpoint_with_then_chain(tmp_path):
+    """Test O(1) checkpoint navigation with THEN chain (>>) treats it as one step.
+
+    Regression test: Previously step_positions gave 3 positions for "a >> b >> c"
+    but step_commands gave 1 e() call, causing backup_n(3-idx) to fail.
+    Now we use step_plan which gives consistent step count.
+    """
+    # Create test file with THEN chain
+    test_file = tmp_path / "testScript.sml"
+    test_file.write_text('''
+open HolKernel boolLib bossLib;
+
+val _ = new_theory "test";
+
+Theorem then_chain:
+  T /\\ T
+Proof
+  conj_tac >> simp[] >> simp[]
+QED
+
+val _ = export_theory();
+''')
+
+    try:
+        result = await hol_file_init(file=str(test_file), session="then_test")
+        assert "error" not in str(result).lower()
+
+        # Request state at QED line (line 10) - builds checkpoint
+        result1 = await hol_state_at(session="then_test", line=10, col=1)
+        assert "error" not in result1.lower(), f"First call failed: {result1}"
+
+        # Request state at start of proof (line 9) - should use checkpoint
+        result2 = await hol_state_at(session="then_test", line=9, col=3)
+        assert "error" not in result2.lower(), f"Second call failed: {result2}"
+
+        # Should show goal at start (before THEN chain executes)
+        # The THEN chain is ONE step, so position inside it maps to before it
+        assert "Goals remaining:" in result2 or "goals" in result2.lower()
+    finally:
+        await hol_stop(session="then_test")
+
+
 # =============================================================================
 # Process Group Tests
 # =============================================================================
