@@ -607,7 +607,10 @@ class FileProofCursor:
         # Calculate step boundary info for O(1) access
         # step_before_end: end offset of last complete step (0 if none)
         step_before_end = self._step_positions[tactic_idx - 1] if tactic_idx > 0 else 0
-        need_partial = proof_body_offset > step_before_end
+        # Only execute partial at proof end. Within a step, partial_step_commands may return
+        # the full step (for atomic tactics), which we don't want to execute.
+        # Fine-grained stepping within compound tactics is sacrificed for correctness.
+        need_partial = tactic_idx >= total_tactics and proof_body_offset > step_before_end
         actual_replayed = 0
         escaped_body = escape_sml_string(thm.proof_body) if thm.proof_body else ""
 
