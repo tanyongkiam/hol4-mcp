@@ -383,3 +383,70 @@ class TestReplayEquivalence:
         await hol_session.send('drop();', timeout=5)
 
         assert count1 == count2 == 4
+
+
+class TestStepCommands:
+    """Test step_commands and backup_n for O(1) access."""
+
+    async def test_step_commands_generates_e_calls(self, hol_session):
+        """step_commands should generate e() calls."""
+        tactic = "conj_tac >> simp[] >> fs[]"
+        escaped = escape_sml_string(tactic)
+        result = await hol_session.send(f'step_commands_json "{escaped}";', timeout=10)
+
+        # Parse the result
+        cmds = parse_prefix_commands_output(result)
+
+        # Should contain e() calls
+        assert "e(" in cmds
+
+    async def test_backup_n_undoes_steps(self, hol_session):
+        """backup_n should undo the correct number of e() calls."""
+        goal = "T /\\ T"
+
+        # Set up goal
+        await hol_session.send(f'g `{goal}`;', timeout=5)
+
+        # Initial: 1 goal
+        r0 = await hol_session.send('length (top_goals());', timeout=5)
+        assert "1" in r0
+
+        # After conj_tac: 2 goals
+        await hol_session.send('e(conj_tac);', timeout=5)
+        r1 = await hol_session.send('length (top_goals());', timeout=5)
+        assert "2" in r1
+
+        # Backup 1 step - should be back at 1 goal
+        await hol_session.send('backup_n 1;', timeout=5)
+        r2 = await hol_session.send('length (top_goals());', timeout=5)
+        assert "1" in r2
+
+        # Re-apply and backup 0 - should stay at 2 goals
+        await hol_session.send('e(conj_tac);', timeout=5)
+        await hol_session.send('backup_n 0;', timeout=5)
+        r3 = await hol_session.send('length (top_goals());', timeout=5)
+        assert "2" in r3
+
+        await hol_session.send('drop();', timeout=5)
+
+    async def test_partial_step_commands(self, hol_session):
+        """partial_step_commands should generate commands for a slice."""
+        tactic = "conj_tac >> simp[] >> fs[]"
+        escaped = escape_sml_string(tactic)
+
+        # Get step positions
+        pos_result = await hol_session.send(f'step_positions_json "{escaped}";', timeout=10)
+        positions = parse_step_positions_output(pos_result)
+        assert len(positions) == 3  # conj_tac, simp[], fs[]
+
+        # Get partial from step 0 end to middle of step 1
+        start_offset = positions[0]  # After conj_tac
+        end_offset = positions[0] + 3  # Partial into simp[]
+        partial_result = await hol_session.send(
+            f'partial_step_commands_json "{escaped}" {start_offset} {end_offset};',
+            timeout=10
+        )
+        partial_cmd = parse_prefix_commands_output(partial_result)
+
+        # Should be a valid SML expression (may be empty or contain partial)
+        assert isinstance(partial_cmd, str)

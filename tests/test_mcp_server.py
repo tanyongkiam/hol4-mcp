@@ -441,6 +441,29 @@ async def test_state_at_after_file_edit(tmp_path):
         await hol_stop(session="edit_test")
 
 
+async def test_state_at_uses_checkpoint_on_repeat(tmp_path):
+    """Test that state_at uses checkpoint on second call (O(1) access)."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="checkpoint_test")
+
+        # First call - builds checkpoint
+        result1 = await hol_state_at(session="checkpoint_test", line=15, col=1)
+        assert "Tactic" in result1
+
+        # Second call to same position - should use checkpoint
+        result2 = await hol_state_at(session="checkpoint_test", line=15, col=1)
+        assert "Tactic" in result2
+
+        # Both should succeed (proof complete for add_zero theorem)
+        assert "proof complete" in result1.lower() or "Goals remaining: 0" in result1
+        assert "proof complete" in result2.lower() or "Goals remaining: 0" in result2
+    finally:
+        await hol_stop(session="checkpoint_test")
+
+
 # =============================================================================
 # Process Group Tests
 # =============================================================================

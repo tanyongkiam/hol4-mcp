@@ -149,3 +149,43 @@ fun step_positions_json proofBody =
     print (json_ok jsonArr ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* Generate e() commands for full proof using sliceTacticBlock.
+   Each step becomes a separate e() call, enabling backup_n. *)
+fun step_commands proofBody =
+  let
+    val tree = TacticParse.parseTacticBlock proofBody
+    val defaultSpan = (0, String.size proofBody)
+    (* Full slice from 0 to end, sliceClose=false *)
+    val frags = TacticParse.sliceTacticBlock 0 (String.size proofBody) false defaultSpan tree
+    val cmds = TacticParse.printFragsAsE proofBody frags
+  in
+    cmds
+  end
+
+fun step_commands_json proofBody =
+  print (json_ok (json_string (step_commands proofBody)) ^ "\n")
+  handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* backup_n - undo N e() calls in the goaltree *)
+fun backup_n 0 = ()
+  | backup_n n = (proofManagerLib.b(); backup_n (n - 1));
+
+(* Generate e() commands for a slice of the proof body.
+   Used after backup_n to execute just the remaining portion.
+   startOffset/endOffset are character positions in proofBody.
+   When slicing inside >-, generates HEADGOAL automatically. *)
+fun partial_step_commands proofBody startOffset endOffset =
+  let
+    val tree = TacticParse.parseTacticBlock proofBody
+    val defaultSpan = (0, String.size proofBody)
+    (* sliceClose=false to avoid FFClose tokens unlinearize can't handle *)
+    val frags = TacticParse.sliceTacticBlock startOffset endOffset false defaultSpan tree
+    val cmds = TacticParse.printFragsAsE proofBody frags
+  in
+    cmds
+  end
+
+fun partial_step_commands_json proofBody startOffset endOffset =
+  print (json_ok (json_string (partial_step_commands proofBody startOffset endOffset)) ^ "\n")
+  handle e => print (json_err (exnMessage e) ^ "\n");

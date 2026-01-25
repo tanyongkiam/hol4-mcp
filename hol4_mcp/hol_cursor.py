@@ -604,48 +604,83 @@ class FileProofCursor:
         error_msg = None
         t3 = time.perf_counter()
 
-        # Always replay from start using prefix_commands
-        # This is simpler and uses HOL's exact semantics
-        await self.session.send('drop_all();', timeout=5)
-        goal = thm.goal.replace('\n', ' ').strip()
-        goal_cmd = "g" if self._mode == "g" else "gt"
-        gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
-        if _is_hol_error(gt_result):
-            self._proof_initialized = False
-            return StateAtResult(
-                goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
-                tactics_total=total_tactics, file_hash=self._content_hash,
-                error=f"Failed to set up goal: {gt_result[:300]}"
-            )
-        self._proof_initialized = True
-
-        # Get prefix commands for this offset and execute
+        # Calculate step boundary info for O(1) access
+        # step_before_end: end offset of last complete step (0 if none)
+        step_before_end = self._step_positions[tactic_idx - 1] if tactic_idx > 0 else 0
+        need_partial = proof_body_offset > step_before_end
         actual_replayed = 0
-        if proof_body_offset > 0 and thm.proof_body:
-            escaped_body = escape_sml_string(thm.proof_body)
-            prefix_result = await self.session.send(
-                f'prefix_commands_json "{escaped_body}" {proof_body_offset};', timeout=30
+        escaped_body = escape_sml_string(thm.proof_body) if thm.proof_body else ""
+
+        # Try O(1) path: checkpoint + backup_n
+        used_checkpoint = False
+        if self._is_checkpoint_valid(self._active_theorem) and thm.proof_body:
+            # Load checkpoint (at proof end) and backup to target step
+            if await self._load_checkpoint_and_backup(self._active_theorem, tactic_idx):
+                used_checkpoint = True
+                actual_replayed = tactic_idx
+
+        if not used_checkpoint:
+            # Build checkpoint: replay all steps, then backup
+            await self.session.send('drop_all();', timeout=5)
+            goal = thm.goal.replace('\n', ' ').strip()
+            goal_cmd = "g" if self._mode == "g" else "gt"
+            gt_result = await self.session.send(f'{goal_cmd} `{goal}`;', timeout=30)
+            if _is_hol_error(gt_result):
+                self._proof_initialized = False
+                return StateAtResult(
+                    goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
+                    tactics_total=total_tactics, file_hash=self._content_hash,
+                    error=f"Failed to set up goal: {gt_result[:300]}"
+                )
+            self._proof_initialized = True
+
+            if thm.proof_body and total_tactics > 0:
+                # Execute all steps individually for backup_n to work
+                step_result = await self.session.send(
+                    f'step_commands_json "{escaped_body}";', timeout=30
+                )
+                try:
+                    step_cmds = parse_prefix_commands_output(step_result)
+                except HOLParseError as e:
+                    error_msg = f"Failed to get step commands: {e}"
+                    step_cmds = ""
+
+                if step_cmds.strip():
+                    batch_timeout = max(30, int(self._tactic_timeout * total_tactics)) if self._tactic_timeout else 300
+                    result = await self.session.send(step_cmds, timeout=batch_timeout)
+                    if _is_hol_error(result):
+                        if result.startswith("TIMEOUT"):
+                            error_msg = f"Tactic replay timed out (>{batch_timeout}s)"
+                        else:
+                            error_msg = f"Tactic replay failed: {result[:200]}"
+                    else:
+                        # Save checkpoint at proof end
+                        await self._save_end_of_proof_checkpoint(self._active_theorem, total_tactics)
+                        # Backup to target position
+                        backups_needed = total_tactics - tactic_idx
+                        if backups_needed > 0:
+                            await self.session.send(f'backup_n {backups_needed};', timeout=30)
+                        actual_replayed = tactic_idx
+
+        # If fine-grained position (within a step), execute partial
+        if need_partial and not error_msg and thm.proof_body:
+            partial_result = await self.session.send(
+                f'partial_step_commands_json "{escaped_body}" {step_before_end} {proof_body_offset};',
+                timeout=30
             )
             try:
-                prefix_cmd = parse_prefix_commands_output(prefix_result)
+                partial_cmd = parse_prefix_commands_output(partial_result)
             except HOLParseError as e:
-                error_msg = f"Failed to get prefix commands: {e}"
-                prefix_cmd = ""
+                error_msg = f"Failed to get partial step commands: {e}"
+                partial_cmd = ""
 
-            if prefix_cmd.strip():
-                # Execute the e() command(s) returned by prefix_commands
-                # Timeout based on estimated tactics
-                batch_timeout = max(30, int(self._tactic_timeout * max(1, tactic_idx))) if self._tactic_timeout else 300
-                result = await self.session.send(prefix_cmd, timeout=batch_timeout)
+            if partial_cmd.strip():
+                result = await self.session.send(partial_cmd, timeout=self._tactic_timeout or 30)
                 if _is_hol_error(result):
-                    if result.startswith("TIMEOUT"):
-                        error_msg = f"Tactic replay timed out (>{batch_timeout}s)"
-                    else:
-                        error_msg = f"Tactic replay failed: {result[:200]}"
-                else:
-                    actual_replayed = tactic_idx
+                    error_msg = f"Partial step failed: {result[:200]}"
 
         timings['replay'] = time.perf_counter() - t3
+        timings['used_checkpoint'] = 1.0 if used_checkpoint else 0.0
 
         # Get current goals as JSON
         t4 = time.perf_counter()
