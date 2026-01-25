@@ -12,7 +12,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
 
-// Minimal MCP client - JSON-RPC 2.0 over stdio with content-length framing
+// Minimal MCP client - JSON-RPC 2.0 over stdio with NDJSON framing (FastMCP style)
 class McpClient {
   private proc: ChildProcess | null = null;
   private buffer = "";
@@ -55,26 +55,16 @@ class McpClient {
   }
 
   private processBuffer(): void {
-    while (true) {
-      const headerEnd = this.buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) return;
+    // NDJSON: one JSON object per line
+    let newlineIdx: number;
+    while ((newlineIdx = this.buffer.indexOf("\n")) !== -1) {
+      const line = this.buffer.slice(0, newlineIdx).trim();
+      this.buffer = this.buffer.slice(newlineIdx + 1);
 
-      const header = this.buffer.slice(0, headerEnd);
-      const match = header.match(/Content-Length:\s*(\d+)/i);
-      if (!match) {
-        this.buffer = this.buffer.slice(headerEnd + 4);
-        continue;
-      }
-
-      const contentLength = parseInt(match[1], 10);
-      const contentStart = headerEnd + 4;
-      if (this.buffer.length < contentStart + contentLength) return;
-
-      const content = this.buffer.slice(contentStart, contentStart + contentLength);
-      this.buffer = this.buffer.slice(contentStart + contentLength);
+      if (!line) continue;
 
       try {
-        const msg = JSON.parse(content);
+        const msg = JSON.parse(line);
         if ("id" in msg && this.pending.has(msg.id)) {
           const { resolve, reject } = this.pending.get(msg.id)!;
           this.pending.delete(msg.id);
@@ -92,9 +82,8 @@ class McpClient {
 
   private send(msg: object): void {
     if (!this.proc?.stdin) throw new Error("Not connected");
-    const json = JSON.stringify(msg);
-    const frame = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n${json}`;
-    this.proc.stdin.write(frame);
+    // NDJSON: send JSON followed by newline
+    this.proc.stdin.write(JSON.stringify(msg) + "\n");
   }
 
   private notify(method: string, params: object): void {
