@@ -159,7 +159,6 @@ function jsonSchemaToTypebox(schema: any): TSchema {
 export default function hol4McpExtension(pi: ExtensionAPI) {
   let client: McpClient | null = null;
   let connecting: Promise<McpClient> | null = null;
-  let toolsRegistered = false;
 
   async function getClient(): Promise<McpClient> {
     if (client) return client;
@@ -184,59 +183,55 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
     client = null;
   }
 
-  async function registerMcpTools() {
-    if (toolsRegistered) return;
+  // Register a single entry-point tool that lazily connects to MCP server
+  // This avoids errors on startup if hol4-mcp isn't installed
+  pi.registerTool({
+    name: "hol4_mcp",
+    label: "HOL4 MCP",
+    description: "HOL4 theorem prover tools. On first call, discovers and registers all available tools from the hol4-mcp server. Use action='list' to see available tools, or action='call' with tool_name and args to call a specific tool.",
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("list"), Type.Literal("call")], { description: "Action: 'list' to discover tools, 'call' to invoke a tool" }),
+      tool_name: Type.Optional(Type.String({ description: "Tool name (required for 'call')" })),
+      args: Type.Optional(Type.Any({ description: "Tool arguments as object (for 'call')" })),
+    }),
 
-    const mcpClient = await getClient();
-    const { tools } = await mcpClient.listTools();
+    async execute(toolCallId, params, onUpdate, ctx, signal) {
+      try {
+        const mcpClient = await getClient();
 
-    for (const tool of tools) {
-      const inputSchema = tool.inputSchema || { type: "object", properties: {} };
-      const parameters = jsonSchemaToTypebox(inputSchema);
+        if (params.action === "list") {
+          const { tools } = await mcpClient.listTools();
+          const toolList = tools.map(t => `- ${t.name}: ${t.description || "(no description)"}`).join("\n");
+          return {
+            content: [{ type: "text", text: `Available HOL4 MCP tools:\n\n${toolList}` }],
+            details: { tools },
+          };
+        }
 
-      pi.registerTool({
-        name: tool.name,
-        label: tool.name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
-        description: tool.description || `MCP tool: ${tool.name}`,
-        parameters,
-
-        async execute(toolCallId, params, onUpdate, ctx, signal) {
-          try {
-            const mcpClient = await getClient();
-
-            if (signal?.aborted) {
-              return { content: [{ type: "text", text: "Cancelled" }], details: {}, isError: true };
-            }
-
-            const result = await mcpClient.callTool(tool.name, params as Record<string, unknown>);
-
-            const textContent = result.content
-              .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
-              .map((c) => c.text)
-              .join("\n");
-
-            return {
-              content: [{ type: "text", text: textContent || "(no output)" }],
-              details: { mcpResult: result },
-              isError: result.isError === true,
-            };
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            return { content: [{ type: "text", text: `MCP error: ${message}` }], details: {}, isError: true };
+        if (params.action === "call") {
+          if (!params.tool_name) {
+            return { content: [{ type: "text", text: "Error: tool_name required for 'call' action" }], details: {}, isError: true };
           }
-        },
-      });
-    }
 
-    toolsRegistered = true;
-  }
+          const result = await mcpClient.callTool(params.tool_name, (params.args || {}) as Record<string, unknown>);
+          const textContent = result.content
+            .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
+            .map((c) => c.text)
+            .join("\n");
 
-  pi.on("session_start", async () => {
-    try {
-      await registerMcpTools();
-    } catch (err) {
-      console.error(`HOL4 MCP init failed: ${err instanceof Error ? err.message : err}`);
-    }
+          return {
+            content: [{ type: "text", text: textContent || "(no output)" }],
+            details: { mcpResult: result },
+            isError: result.isError === true,
+          };
+        }
+
+        return { content: [{ type: "text", text: "Unknown action" }], details: {}, isError: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: `HOL4 MCP error: ${message}` }], details: {}, isError: true };
+      }
+    },
   });
 
   pi.on("session_shutdown", async () => {
