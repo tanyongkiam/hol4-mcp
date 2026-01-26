@@ -92,20 +92,45 @@ class McpClient {
     this.send({ jsonrpc: "2.0", method, params });
   }
 
-  request<T = any>(method: string, params: object): Promise<T> {
+  request<T = any>(method: string, params: object, signal?: AbortSignal): Promise<T> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
+      
+      // Handle abort signal
+      if (signal) {
+        if (signal.aborted) {
+          reject(new Error("Aborted"));
+          return;
+        }
+        const onAbort = () => {
+          this.pending.delete(id);
+          reject(new Error("Aborted"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        // Clean up listener when request completes
+        const originalResolve = resolve;
+        const originalReject = reject;
+        resolve = (v) => {
+          signal.removeEventListener("abort", onAbort);
+          originalResolve(v);
+        };
+        reject = (e) => {
+          signal.removeEventListener("abort", onAbort);
+          originalReject(e);
+        };
+      }
+      
       this.pending.set(id, { resolve, reject });
       this.send({ jsonrpc: "2.0", id, method, params });
     });
   }
 
-  async listTools(): Promise<{ tools: Array<{ name: string; description?: string; inputSchema?: any }> }> {
-    return this.request("tools/list", {});
+  async listTools(signal?: AbortSignal): Promise<{ tools: Array<{ name: string; description?: string; inputSchema?: any }> }> {
+    return this.request("tools/list", {}, signal);
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
-    return this.request("tools/call", { name, arguments: args });
+  async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
+    return this.request("tools/call", { name, arguments: args }, signal);
   }
 
   close(): void {
@@ -113,6 +138,26 @@ class McpClient {
       this.proc.kill();
       this.proc = null;
     }
+  }
+
+  /**
+   * Send SIGINT to the MCP server process.
+   * The server catches this and interrupts all HOL sessions.
+   */
+  interrupt(): boolean {
+    if (this.proc?.pid) {
+      try {
+        process.kill(this.proc.pid, "SIGINT");
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  get isConnected(): boolean {
+    return this.proc !== null;
   }
 }
 
@@ -152,7 +197,7 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
   let connecting: Promise<McpClient> | null = null;
 
   async function getClient(): Promise<McpClient> {
-    if (client) return client;
+    if (client?.isConnected) return client;
     if (connecting) return connecting;
 
     connecting = (async () => {
@@ -169,6 +214,13 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
     }
   }
 
+  async function restartClient(): Promise<McpClient> {
+    client?.close();
+    client = null;
+    connecting = null;
+    return getClient();
+  }
+
   async function cleanup() {
     client?.close();
     client = null;
@@ -179,23 +231,77 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "hol4_mcp",
     label: "HOL4 MCP",
-    description: "HOL4 theorem prover tools. On first call, discovers and registers all available tools from the hol4-mcp server. Use action='list' to see available tools, or action='call' with tool_name and args to call a specific tool.",
+    description: `HOL4 theorem prover tools. Actions:
+- action='list': Discover available tools from hol4-mcp server
+- action='call': Invoke a tool (requires tool_name, optional args)
+- action='interrupt': Send interrupt to all HOL sessions (use when ESC pressed or tactic hangs)
+- action='restart': Kill and restart the MCP server (use if server is in bad state)`,
     parameters: Type.Object({
-      action: Type.Union([Type.Literal("list"), Type.Literal("call")], { description: "Action: 'list' to discover tools, 'call' to invoke a tool" }),
+      action: Type.Union([
+        Type.Literal("list"),
+        Type.Literal("call"),
+        Type.Literal("interrupt"),
+        Type.Literal("restart"),
+      ], { description: "Action: 'list', 'call', 'interrupt', or 'restart'" }),
       tool_name: Type.Optional(Type.String({ description: "Tool name (required for 'call')" })),
       args: Type.Optional(Type.Any({ description: "Tool arguments as object (for 'call')" })),
     }),
 
     async execute(toolCallId, params, onUpdate, ctx, signal) {
       try {
+        // Handle restart action - doesn't need existing client
+        if (params.action === "restart") {
+          await restartClient();
+          return {
+            content: [{ type: "text", text: "MCP server restarted. All HOL sessions have been terminated." }],
+            details: {},
+          };
+        }
+
         const mcpClient = await getClient();
 
         if (params.action === "list") {
-          const { tools } = await mcpClient.listTools();
+          const { tools } = await mcpClient.listTools(signal);
           const toolList = tools.map(t => `- ${t.name}: ${t.description || "(no description)"}`).join("\n");
           return {
             content: [{ type: "text", text: `Available HOL4 MCP tools:\n\n${toolList}` }],
             details: { tools },
+          };
+        }
+
+        if (params.action === "interrupt") {
+          // Get list of sessions and interrupt each one
+          const sessionsResult = await mcpClient.callTool("hol_sessions", {}, signal);
+          const sessionsText = sessionsResult.content
+            .filter((c): c is { type: "text"; text: string } => c.type === "text")
+            .map(c => c.text)
+            .join("\n");
+          
+          // Parse session names from output (first column after header)
+          const lines = sessionsText.split("\n");
+          const interrupted: string[] = [];
+          for (const line of lines.slice(2)) { // Skip header and separator
+            const sessionName = line.split(/\s+/)[0];
+            if (sessionName && !sessionName.startsWith("-")) {
+              try {
+                await mcpClient.callTool("hol_interrupt", { session: sessionName });
+                interrupted.push(sessionName);
+              } catch {
+                // Session may have died
+              }
+            }
+          }
+          
+          if (interrupted.length === 0) {
+            return {
+              content: [{ type: "text", text: "No active sessions to interrupt." }],
+              details: {},
+            };
+          }
+          
+          return {
+            content: [{ type: "text", text: `Sent interrupt to sessions: ${interrupted.join(", ")}` }],
+            details: { interrupted },
           };
         }
 
@@ -214,7 +320,7 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
             }
           }
 
-          const result = await mcpClient.callTool(params.tool_name, args as Record<string, unknown>);
+          const result = await mcpClient.callTool(params.tool_name, args as Record<string, unknown>, signal);
           const textContent = result.content
             .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
             .map((c) => c.text)
@@ -230,6 +336,18 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text", text: "Unknown action" }], details: {}, isError: true };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        
+        // If aborted (ESC pressed), send SIGINT to MCP server
+        // The server catches this and interrupts all HOL sessions
+        if (message === "Aborted" && client?.isConnected) {
+          client.interrupt();
+          return { 
+            content: [{ type: "text", text: "Interrupted (sent SIGINT to HOL sessions)." }], 
+            details: {},
+            isError: true,
+          };
+        }
+        
         return { content: [{ type: "text", text: `HOL4 MCP error: ${message}` }], details: {}, isError: true };
       }
     },
@@ -237,6 +355,12 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
     renderCall(args, theme) {
       if (args.action === "list") {
         return new Text(theme.fg("toolTitle", theme.bold("hol4 ")) + theme.fg("accent", "list"), 0, 0);
+      }
+      if (args.action === "interrupt") {
+        return new Text(theme.fg("toolTitle", theme.bold("hol4 ")) + theme.fg("warning", "interrupt"), 0, 0);
+      }
+      if (args.action === "restart") {
+        return new Text(theme.fg("toolTitle", theme.bold("hol4 ")) + theme.fg("warning", "restart"), 0, 0);
       }
       
       const toolName = args.tool_name || "?";

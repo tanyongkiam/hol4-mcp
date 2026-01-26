@@ -47,6 +47,24 @@ Do NOT:
 _sessions: dict[str, SessionEntry] = {}
 
 
+def _sigint_handler(signum, frame):
+    """Handle SIGINT by interrupting all HOL sessions.
+    
+    Called when pi sends SIGINT (e.g., user pressed ESC during tool execution).
+    Interrupts all running HOL sessions to abort runaway tactics.
+    """
+    for name, entry in _sessions.items():
+        if entry.session.is_running:
+            try:
+                entry.session.interrupt()
+            except Exception:
+                pass  # Best effort
+
+
+# Install SIGINT handler (replaces default KeyboardInterrupt behavior)
+signal.signal(signal.SIGINT, _sigint_handler)
+
+
 def _get_session(name: str) -> Optional[HOLSession]:
     """Get session from registry, or None if not found."""
     entry = _sessions.get(name)
