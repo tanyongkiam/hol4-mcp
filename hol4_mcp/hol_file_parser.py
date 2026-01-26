@@ -262,8 +262,9 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         leading_ws = len(proof_body_raw) - len(proof_body_raw.lstrip())
         proof_body_offset = match.end() + proof_match.end() + leading_ws
 
-        # Check for cheat
-        has_cheat = bool(re.search(r'\bcheat\b', proof_body_raw, re.IGNORECASE))
+        # Check for cheat (strip comments first to avoid false positives)
+        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
             name=name,

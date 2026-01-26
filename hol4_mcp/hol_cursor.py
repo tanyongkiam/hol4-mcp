@@ -2,16 +2,15 @@
 
 import asyncio
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .hol_file_parser import (
-    TheoremInfo, parse_file, parse_p_output, parse_theorems,
-    TacticSpan, build_line_starts, parse_linearize_with_spans_output,
-    make_tactic_spans, offset_to_line_col, line_col_to_offset, HOLParseError,
-    _find_json_line, parse_prefix_commands_output,
-    parse_step_plan_output, StepPlan,
+    TheoremInfo, parse_p_output, parse_theorems,
+    build_line_starts, offset_to_line_col, line_col_to_offset, HOLParseError,
+    _find_json_line, parse_step_plan_output, StepPlan,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -97,6 +96,7 @@ class TheoremCheckpoint:
     tactics_count: int            # Number of tactics when checkpoint saved
     end_of_proof_path: Path | None = None   # Checkpoint after all tactics (for state_at)
     last_accessed: float = field(default_factory=time.time)  # For LRU eviction
+    content_hash: str = ""        # File hash when checkpoint was saved
 
 
 class FileProofCursor:
@@ -152,10 +152,8 @@ class FileProofCursor:
 
         # Active theorem state
         self._active_theorem: str | None = None
-        self._active_tactics: list[TacticSpan] = []  # Deprecated, kept for compatibility
         self._step_plan: list[StepPlan] = []  # Step boundaries aligned with e() commands
         self._current_tactic_idx: int = 0  # Current position in proof (for backup optimization)
-        self._current_offset: int = -1  # Current proof body offset (-1 = not set)
         self._proof_initialized: bool = False  # Whether g/gt has been called for current theorem
 
         # What's been loaded into HOL
@@ -221,7 +219,6 @@ class FileProofCursor:
         if self._active_theorem:
             if not any(t.name == self._active_theorem for t in self._theorems):
                 self._active_theorem = None
-                self._active_tactics = []
 
         return True
 
@@ -257,8 +254,8 @@ class FileProofCursor:
 
     def _get_checkpoint_path(self, theorem_name: str, checkpoint_type: str) -> Path:
         """Get path for a checkpoint file."""
-        # Sanitize theorem name for filename
-        safe_name = theorem_name.replace("/", "_").replace("\\", "_")
+        # Sanitize: allow only alphanumeric, underscore, prime (valid SML identifiers)
+        safe_name = re.sub(r"[^a-zA-Z0-9_']", "_", theorem_name) or "unnamed"
         return self._checkpoint_dir / f"{safe_name}_{checkpoint_type}.save"
 
     async def _save_base_checkpoint(self) -> bool:
@@ -365,6 +362,7 @@ class FileProofCursor:
             tactics_count=tactics_count,
             end_of_proof_path=ckpt_path,
             last_accessed=time.time(),
+            content_hash=self._content_hash,
         )
         # Evict old checkpoints if over limit
         self._evict_lru_checkpoints()
@@ -398,10 +396,10 @@ class FileProofCursor:
             return False
         
         # Checkpoint (child of base) has all file content, mark as fully loaded
-        # Use a high value to indicate all content is available
+        # Restore the hash from when checkpoint was saved for correct staleness detection
         last_thm = self._theorems[-1] if self._theorems else None
         self._loaded_to_line = last_thm.proof_end_line if last_thm else 0
-        self._loaded_content_hash = self._content_hash  # Full file hash
+        self._loaded_content_hash = ckpt.content_hash
 
         # Backup to target position (~11ms for any N)
         backups_needed = ckpt.tactics_count - target_tactic_idx
@@ -686,7 +684,6 @@ class FileProofCursor:
             self._step_plan = []
 
         self._active_theorem = name
-        self._active_tactics = []  # Deprecated
         self._current_tactic_idx = 0  # Reset position for new theorem
         self._proof_initialized = False  # Will be set on first state_at
 
