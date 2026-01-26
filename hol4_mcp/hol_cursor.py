@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .hol_file_parser import (
-    TheoremInfo, parse_p_output, parse_theorems,
-    build_line_starts, offset_to_line_col, line_col_to_offset, HOLParseError,
+    TheoremInfo, parse_theorems,
+    build_line_starts, line_col_to_offset, HOLParseError,
     _find_json_line, parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
 )
