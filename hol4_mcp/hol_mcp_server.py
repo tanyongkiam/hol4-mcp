@@ -52,13 +52,16 @@ def _sigint_handler(signum, frame):
     
     Called when pi sends SIGINT (e.g., user pressed ESC during tool execution).
     Interrupts all running HOL sessions to abort runaway tactics.
+    
+    Note: Takes a snapshot of sessions to avoid RuntimeError if dict is modified
+    concurrently (e.g., session being added/removed when signal arrives).
     """
-    for name, entry in _sessions.items():
-        if entry.session.is_running:
-            try:
-                entry.session.interrupt()
-            except Exception:
-                pass  # Best effort
+    # Snapshot to avoid "dictionary changed size during iteration"
+    for entry in list(_sessions.values()):
+        try:
+            entry.session.interrupt()
+        except Exception:
+            pass  # Best effort - signal handlers must not raise
 
 
 # Install SIGINT handler (replaces default KeyboardInterrupt behavior)

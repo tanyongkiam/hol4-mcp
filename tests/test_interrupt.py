@@ -1,275 +1,167 @@
-"""
-Test interrupt functionality for hol4-mcp server.
+"""Test SIGINT interrupt handling for hol4-mcp server.
 
-Tests:
-1. MCP server starts and responds to tool calls
-2. SIGINT to MCP server interrupts HOL sessions
+Tests that:
+1. SIGINT handler is installed
+2. SIGINT interrupts HOL sessions
 3. Server survives SIGINT and continues serving requests
 """
 
 import asyncio
-import json
 import os
 import signal
-import subprocess
-import sys
-import time
 
 import pytest
 
+from hol4_mcp.hol_mcp_server import (
+    _sigint_handler,
+    _sessions,
+    hol_start as _hol_start,
+    hol_send as _hol_send,
+    hol_sessions as _hol_sessions,
+    hol_stop as _hol_stop,
+    hol_interrupt as _hol_interrupt,
+)
 
-class McpClient:
-    """Minimal MCP client for testing."""
-    
-    def __init__(self):
-        self.proc = None
-        self.buffer = ""
-        self.next_id = 1
-        self.pending = {}
-        self._reader_task = None
-    
-    async def connect(self, command: list[str]):
-        self.proc = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        
-        # Start reader task
-        self._reader_task = asyncio.create_task(self._read_loop())
-        
-        # Initialize
-        await self.request("initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test-client", "version": "0.1.0"},
-        })
-        
-        # Send initialized notification
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-    
-    async def _read_loop(self):
-        while self.proc and self.proc.returncode is None:
-            try:
-                line = await asyncio.wait_for(
-                    self.proc.stdout.readline(),
-                    timeout=0.1
-                )
-                if not line:
-                    break
-                self._process_line(line.decode())
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                break
-    
-    def _process_line(self, line: str):
-        line = line.strip()
-        if not line:
-            return
-        try:
-            msg = json.loads(line)
-            if "id" in msg and msg["id"] in self.pending:
-                future = self.pending.pop(msg["id"])
-                if "error" in msg:
-                    future.set_exception(Exception(msg["error"].get("message", str(msg["error"]))))
-                else:
-                    future.set_result(msg.get("result"))
-        except json.JSONDecodeError:
-            pass
-    
-    def _send(self, msg: dict):
-        if not self.proc or not self.proc.stdin:
-            raise Exception("Not connected")
-        data = json.dumps(msg) + "\n"
-        self.proc.stdin.write(data.encode())
-    
-    async def request(self, method: str, params: dict, timeout: float = 30.0):
-        req_id = self.next_id
-        self.next_id += 1
-        
-        future = asyncio.get_event_loop().create_future()
-        self.pending[req_id] = future
-        
-        self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
-        await self.proc.stdin.drain()
-        
-        return await asyncio.wait_for(future, timeout=timeout)
-    
-    async def call_tool(self, name: str, args: dict, timeout: float = 30.0):
-        return await self.request("tools/call", {"name": name, "arguments": args}, timeout=timeout)
-    
-    def interrupt(self) -> bool:
-        """Send SIGINT to the MCP server process."""
-        if self.proc and self.proc.pid:
-            try:
-                os.kill(self.proc.pid, signal.SIGINT)
-                return True
-            except Exception:
-                return False
-        return False
-    
-    async def close(self):
-        if self._reader_task:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-        if self.proc:
-            self.proc.terminate()
-            await self.proc.wait()
-            self.proc = None
+# Unwrap FunctionTool to get actual functions
+hol_start = _hol_start.fn
+hol_send = _hol_send.fn
+hol_sessions = _hol_sessions.fn
+hol_stop = _hol_stop.fn
+hol_interrupt = _hol_interrupt.fn
 
 
-def extract_text(result: dict) -> str:
-    """Extract text content from MCP tool result."""
-    content = result.get("content", [])
-    return "\n".join(c.get("text", "") for c in content if c.get("type") == "text")
-
-
-@pytest.fixture
-async def mcp_client():
-    """Create and connect an MCP client."""
-    client = McpClient()
-    await client.connect(["hol4-mcp", "--transport", "stdio"])
-    yield client
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_basic_connection(mcp_client):
-    """Test basic MCP server connection and tool call."""
-    result = await mcp_client.call_tool("hol_sessions", {})
-    text = extract_text(result)
-    assert "No active sessions" in text or "SESSION" in text
-
-
-@pytest.mark.asyncio
 async def test_sigint_handler_installed():
     """Test that SIGINT handler is installed in the server."""
-    # Import and check directly
-    from hol4_mcp.hol_mcp_server import _sigint_handler
-    import signal as sig
-    
-    # The handler should be a function
+    # The handler should be installed at module load time
+    current_handler = signal.getsignal(signal.SIGINT)
+    assert current_handler == _sigint_handler, "SIGINT handler not installed"
+
+
+async def test_sigint_handler_callable():
+    """Test that SIGINT handler is a callable function."""
     assert callable(_sigint_handler)
 
 
-@pytest.mark.asyncio
-async def test_sigint_interrupts_and_server_survives(mcp_client):
-    """Test that SIGINT interrupts sessions but server survives."""
+async def test_hol_interrupt_tool():
+    """Test the hol_interrupt tool sends SIGINT to session."""
     # Start a session
-    result = await mcp_client.call_tool("hol_start", {
-        "workdir": "/tmp",
-        "name": "test_sigint"
-    })
-    text = extract_text(result)
-    assert "started" in text.lower() or "running" in text.lower()
+    result = await hol_start(workdir="/tmp", name="test_interrupt_tool")
+    assert "started" in result.lower() or "running" in result.lower()
     
-    # Verify session exists
-    result = await mcp_client.call_tool("hol_sessions", {})
-    text = extract_text(result)
-    assert "test_sigint" in text
-    
-    # Send SIGINT
-    interrupted = mcp_client.interrupt()
-    assert interrupted, "Failed to send SIGINT"
-    
-    # Give it a moment
-    await asyncio.sleep(0.5)
-    
-    # Server should still respond
-    result = await mcp_client.call_tool("hol_sessions", {})
-    text = extract_text(result)
-    # Server survived if we got a response
-    assert "SESSION" in text or "No active sessions" in text
-    
-    # Clean up
     try:
-        await mcp_client.call_tool("hol_stop", {"session": "test_sigint"})
-    except Exception:
-        pass  # Session may have died from SIGINT
+        # Call hol_interrupt
+        result = await hol_interrupt(session="test_interrupt_tool")
+        assert "SIGINT" in result
+    finally:
+        await hol_stop(session="test_interrupt_tool")
 
 
-@pytest.mark.asyncio
-async def test_multiple_sigints(mcp_client):
-    """Test that server survives multiple SIGINTs."""
-    # Send multiple SIGINTs
-    for _ in range(3):
-        mcp_client.interrupt()
-        await asyncio.sleep(0.1)
-    
-    # Server should still respond
-    result = await mcp_client.call_tool("hol_sessions", {})
-    text = extract_text(result)
-    assert "SESSION" in text or "No active sessions" in text
-
-
-@pytest.mark.asyncio
 async def test_sigint_during_command():
-    """Test SIGINT during a long-running HOL command."""
-    client = McpClient()
-    await client.connect(["hol4-mcp", "--transport", "stdio"])
+    """Test that SIGINT interrupts a running HOL command."""
+    result = await hol_start(workdir="/tmp", name="test_sigint_cmd")
+    assert "started" in result.lower() or "running" in result.lower()
     
     try:
-        # Start a session
-        await client.call_tool("hol_start", {
-            "workdir": "/tmp",
-            "name": "test_long"
-        })
-        
-        # Start a long command (will timeout or be interrupted)
+        # Start a long-running command
         async def long_command():
-            try:
-                return await client.call_tool("hol_send", {
-                    "session": "test_long",
-                    "command": "let val _ = OS.Process.sleep (Time.fromSeconds 30) in 1 end;",
-                    "timeout": 60
-                }, timeout=60)
-            except Exception as e:
-                return str(e)
+            return await hol_send(
+                session="test_sigint_cmd",
+                command="let val _ = OS.Process.sleep (Time.fromSeconds 30) in 1 end;",
+                timeout=60
+            )
         
-        # Start the command
         task = asyncio.create_task(long_command())
         
-        # Wait a bit then send SIGINT
+        # Wait a bit then send interrupt
         await asyncio.sleep(1)
-        client.interrupt()
         
-        # The command should complete (interrupted or timeout)
-        result = await asyncio.wait_for(task, timeout=10)
+        # Get the session and interrupt it directly
+        entry = _sessions.get("test_sigint_cmd")
+        assert entry is not None
+        entry.session.interrupt()
         
-        # Server should still be alive
-        await asyncio.sleep(0.5)
-        sessions_result = await client.call_tool("hol_sessions", {})
-        text = extract_text(sessions_result)
-        assert "SESSION" in text or "No active sessions" in text
+        # Command should complete with interrupt
+        result = await asyncio.wait_for(task, timeout=5)
+        assert "Interrupt" in result
         
     finally:
-        await client.close()
+        await hol_stop(session="test_sigint_cmd")
 
 
-@pytest.mark.asyncio  
-async def test_hol_interrupt_tool(mcp_client):
-    """Test the hol_interrupt tool works."""
-    # Start a session
-    await mcp_client.call_tool("hol_start", {
-        "workdir": "/tmp",
-        "name": "test_tool_interrupt"
-    })
+async def test_sigint_handler_interrupts_all_sessions():
+    """Test that SIGINT handler interrupts all running sessions."""
+    # Start two sessions
+    await hol_start(workdir="/tmp", name="test_sigint_1")
+    await hol_start(workdir="/tmp", name="test_sigint_2")
     
-    # Call hol_interrupt
-    result = await mcp_client.call_tool("hol_interrupt", {
-        "session": "test_tool_interrupt"
-    })
-    text = extract_text(result)
-    assert "SIGINT" in text or "interrupt" in text.lower()
+    try:
+        # Verify both sessions exist
+        result = await hol_sessions()
+        assert "test_sigint_1" in result
+        assert "test_sigint_2" in result
+        
+        # Call the handler directly (simulates receiving SIGINT)
+        _sigint_handler(signal.SIGINT, None)
+        
+        # Sessions should still be running (interrupt doesn't kill them)
+        result = await hol_sessions()
+        assert "test_sigint_1" in result
+        assert "test_sigint_2" in result
+        
+    finally:
+        await hol_stop(session="test_sigint_1")
+        await hol_stop(session="test_sigint_2")
+
+
+async def test_session_survives_interrupt():
+    """Test that a session survives interrupt and can be used again."""
+    await hol_start(workdir="/tmp", name="test_survive")
     
-    # Clean up
-    await mcp_client.call_tool("hol_stop", {"session": "test_tool_interrupt"})
+    try:
+        # Send a command
+        result = await hol_send(session="test_survive", command="1 + 1;")
+        assert "val it = 2" in result
+        
+        # Send interrupt
+        await hol_interrupt(session="test_survive")
+        
+        # Session should still work
+        await asyncio.sleep(0.5)  # Give it a moment
+        result = await hol_send(session="test_survive", command="2 + 2;")
+        assert "val it = 4" in result
+        
+    finally:
+        await hol_stop(session="test_survive")
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+async def test_interrupt_nonexistent_session():
+    """Test that interrupting a nonexistent session returns error."""
+    result = await hol_interrupt(session="nonexistent_session_xyz")
+    assert "ERROR" in result or "not found" in result.lower()
+
+
+async def test_interrupt_empty_sessions():
+    """Test that SIGINT handler works with no sessions."""
+    # Clear any existing sessions first
+    for name in list(_sessions.keys()):
+        await hol_stop(session=name)
+    
+    # Should not raise
+    _sigint_handler(signal.SIGINT, None)
+
+
+async def test_double_interrupt():
+    """Test that double interrupt doesn't crash."""
+    await hol_start(workdir="/tmp", name="test_double")
+    
+    try:
+        # Send two interrupts in quick succession
+        await hol_interrupt(session="test_double")
+        await hol_interrupt(session="test_double")
+        
+        # Session should still work
+        await asyncio.sleep(0.3)
+        result = await hol_send(session="test_double", command="1;")
+        assert "val it = 1" in result
+    finally:
+        await hol_stop(session="test_double")
