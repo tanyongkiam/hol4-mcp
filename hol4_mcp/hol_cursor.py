@@ -950,23 +950,26 @@ class FileProofCursor:
         # Calculate step boundary info for O(1) access
         # step_before_end: end offset of last complete step (0 if none)
         step_before_end = self._step_plan[tactic_idx - 1].end if tactic_idx > 0 else 0
-        # Only execute partial at proof end. Within a step, partial_step_commands may return
-        # the full step (for atomic tactics), which we don't want to execute.
-        # Fine-grained stepping within compound tactics is sacrificed for correctness.
-        need_partial = tactic_idx >= total_tactics and proof_body_offset > step_before_end
+        # Current step end (for detecting if we're inside a step)
+        current_step_end = self._step_plan[tactic_idx].end if tactic_idx < total_tactics else (len(thm.proof_body) if thm.proof_body else 0)
+        # Need partial replay if we're inside a step (not at a boundary)
+        # This enables fine-grained navigation within atomic ThenLT steps
+        need_partial = proof_body_offset > step_before_end and proof_body_offset < current_step_end
         actual_replayed = 0
         escaped_body = escape_sml_string(thm.proof_body) if thm.proof_body else ""
 
-        # Try O(1) path: checkpoint + backup_n
+        # Two paths for navigation:
+        # 1. Checkpoint path: O(1) to step boundaries via checkpoint + backup_n
+        # 2. Prefix path: O(n) for fine-grained positions via sliceTacticBlock
+        #
+        # For fine-grained positions (need_partial=true), use prefix replay directly.
+        # This handles ThenLT proofs correctly and also works for broken proofs.
+        
         used_checkpoint = False
-        if self._is_checkpoint_valid(self._active_theorem) and thm.proof_body:
-            # Load checkpoint (at proof end) and backup to target step
-            if await self._load_checkpoint_and_backup(self._active_theorem, tactic_idx):
-                used_checkpoint = True
-                actual_replayed = tactic_idx
-
-        if not used_checkpoint:
-            # Build checkpoint: replay all steps, then backup
+        
+        if need_partial and thm.proof_body:
+            # Fine-grained position: use prefix replay from theorem start
+            # This correctly handles ThenLT semantics via sliceTacticBlock
             await self.session.send('drop_all();', timeout=5)
             goal = thm.goal.replace('\n', ' ').strip()
             gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
@@ -978,47 +981,65 @@ class FileProofCursor:
                     error=f"Failed to set up goal: {gt_result[:300]}"
                 )
             self._proof_initialized = True
-
-            if thm.proof_body and total_tactics > 0:
-                # Execute all steps as batch for checkpoint building (optimized for speed).
-                # Uses batch timeout (tactic_timeout * N), not per-tactic - this is intentional
-                # since checkpoint path is O(1) after first access and we need fast replay.
-                # Verification (init) uses per-tactic timeout to catch slow individual tactics.
-                step_cmds = "".join(step.cmd for step in self._step_plan)
-
-                if step_cmds.strip():
-                    batch_timeout = max(30, int(self._tactic_timeout * total_tactics)) if self._tactic_timeout else 300
-                    result = await self.session.send(step_cmds, timeout=batch_timeout)
-                    if _is_hol_error(result):
-                        if result.startswith("TIMEOUT"):
-                            error_msg = f"Tactic replay timed out (>{batch_timeout}s)"
-                        else:
-                            error_msg = f"Tactic replay failed: {result[:200]}"
-                    else:
-                        # Save checkpoint at proof end
-                        await self._save_end_of_proof_checkpoint(self._active_theorem, total_tactics)
-                        # Backup to target position
-                        backups_needed = total_tactics - tactic_idx
-                        if backups_needed > 0:
-                            await self.session.send(f'backup_n {backups_needed};', timeout=30)
-                        actual_replayed = tactic_idx
-
-        # If fine-grained position (within a step), execute partial
-        if need_partial and not error_msg and thm.proof_body:
-            partial_result = await self.session.send(
-                f'partial_step_commands_json "{escaped_body}" {step_before_end} {proof_body_offset};',
+            
+            # Get prefix command from start to current position
+            prefix_result = await self.session.send(
+                f'prefix_commands_json "{escaped_body}" {proof_body_offset};',
                 timeout=30
             )
             try:
-                partial_cmd = parse_prefix_commands_output(partial_result)
+                prefix_cmd = parse_prefix_commands_output(prefix_result)
             except HOLParseError as e:
-                error_msg = f"Failed to get partial step commands: {e}"
-                partial_cmd = ""
-
-            if partial_cmd.strip():
-                result = await self.session.send(partial_cmd, timeout=self._tactic_timeout or 30)
+                error_msg = f"Failed to get prefix commands: {e}"
+                prefix_cmd = ""
+            
+            if prefix_cmd.strip() and not error_msg:
+                result = await self.session.send(prefix_cmd, timeout=self._tactic_timeout or 30)
                 if _is_hol_error(result):
-                    error_msg = f"Partial step failed: {result[:200]}"
+                    error_msg = f"Prefix replay failed: {result[:200]}"
+                actual_replayed = tactic_idx
+        else:
+            # Step boundary: try O(1) checkpoint path
+            if self._is_checkpoint_valid(self._active_theorem) and thm.proof_body:
+                # Load checkpoint (at proof end) and backup to target step
+                if await self._load_checkpoint_and_backup(self._active_theorem, tactic_idx):
+                    used_checkpoint = True
+                    actual_replayed = tactic_idx
+
+            if not used_checkpoint:
+                # Build checkpoint: replay all steps, then backup
+                await self.session.send('drop_all();', timeout=5)
+                goal = thm.goal.replace('\n', ' ').strip()
+                gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
+                if _is_hol_error(gt_result):
+                    self._proof_initialized = False
+                    return StateAtResult(
+                        goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
+                        tactics_total=total_tactics, file_hash=self._content_hash,
+                        error=f"Failed to set up goal: {gt_result[:300]}"
+                    )
+                self._proof_initialized = True
+
+                if thm.proof_body and total_tactics > 0:
+                    # Execute all steps as batch for checkpoint building
+                    step_cmds = "".join(step.cmd for step in self._step_plan)
+
+                    if step_cmds.strip():
+                        batch_timeout = max(30, int(self._tactic_timeout * total_tactics)) if self._tactic_timeout else 300
+                        result = await self.session.send(step_cmds, timeout=batch_timeout)
+                        if _is_hol_error(result):
+                            if result.startswith("TIMEOUT"):
+                                error_msg = f"Tactic replay timed out (>{batch_timeout}s)"
+                            else:
+                                error_msg = f"Tactic replay failed: {result[:200]}"
+                        else:
+                            # Save checkpoint at proof end
+                            await self._save_end_of_proof_checkpoint(self._active_theorem, total_tactics)
+                            # Backup to target position
+                            backups_needed = total_tactics - tactic_idx
+                            if backups_needed > 0:
+                                await self.session.send(f'backup_n {backups_needed};', timeout=30)
+                            actual_replayed = tactic_idx
 
         timings['replay'] = time.perf_counter() - t3
         timings['used_checkpoint'] = 1.0 if used_checkpoint else 0.0
