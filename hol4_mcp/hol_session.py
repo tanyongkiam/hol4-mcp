@@ -38,9 +38,10 @@ def strip_ansi(text: str) -> str:
 class HOLSession:
     """Direct HOL subprocess management with clean interrupt support."""
 
-    def __init__(self, workdir: str = ".", strip_ansi: bool = True):
+    def __init__(self, workdir: str = ".", strip_ansi: bool = True, env: dict | None = None):
         self.workdir = Path(workdir)
         self.strip_ansi = strip_ansi
+        self.env = env  # Extra env vars to merge with os.environ
         self.process: Optional[asyncio.subprocess.Process] = None
         self._buffer = b""
 
@@ -48,6 +49,11 @@ class HOLSession:
         """Start HOL subprocess."""
         if self.process and self.process.returncode is None:
             return "HOL already running"
+
+        # Build environment: inherit from os.environ, add any extras
+        proc_env = os.environ.copy()
+        if self.env:
+            proc_env.update(self.env)
 
         self.process = await asyncio.create_subprocess_exec(
             str(HOLDIR / "bin" / "hol"), "--zero",
@@ -59,6 +65,7 @@ class HOLSession:
             # with null-byte framing.
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.workdir,
+            env=proc_env,
             start_new_session=True,  # New process group for clean kill
         )
 

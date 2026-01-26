@@ -30,6 +30,7 @@ class SessionEntry:
     workdir: Path
     cursor: Optional[FileProofCursor] = None
     holmake_env: Optional[dict] = None  # env vars for holmake (auto-captured on success)
+    env: Optional[dict] = None  # env vars passed to HOL process
 
 
 mcp = FastMCP("hol", instructions="""HOL4 theorem prover - proof development workflow:
@@ -97,7 +98,7 @@ def _session_age(name: str) -> str:
 
 
 @mcp.tool()
-async def hol_start(workdir: str, name: str = "default") -> str:
+async def hol_start(workdir: str, name: str = "default", env: dict = None) -> str:
     """Start a HOL4 REPL session.
 
     Idempotent - returns existing session if already running.
@@ -106,6 +107,7 @@ async def hol_start(workdir: str, name: str = "default") -> str:
     Args:
         workdir: Working directory (should contain Holmakefile for dependencies)
         name: Session identifier (e.g., "main")
+        env: Optional environment variables (e.g. {"VFMDIR": "/path/to/vfm"})
 
     Returns: Session status
     """
@@ -123,8 +125,8 @@ async def hol_start(workdir: str, name: str = "default") -> str:
     if not workdir_path.exists():
         return f"ERROR: Working directory does not exist: {workdir}"
 
-    # Create session
-    session = HOLSession(str(workdir_path))
+    # Create session with optional env
+    session = HOLSession(str(workdir_path), env=env)
 
     try:
         result = await session.start()
@@ -135,7 +137,7 @@ async def hol_start(workdir: str, name: str = "default") -> str:
         return f"ERROR: HOL failed to start. Output: {result}"
 
     # Register session
-    _sessions[name] = SessionEntry(session, datetime.now(), workdir_path)
+    _sessions[name] = SessionEntry(session, datetime.now(), workdir_path, env=env)
 
     return f"Session '{name}' started. {result}\nWorkdir: {workdir_path}"
 
@@ -267,8 +269,37 @@ async def hol_restart(session: str) -> str:
         return f"Session '{session}' not found."
 
     workdir = entry.workdir
+    env = entry.env  # Preserve env through restart
     await hol_stop.fn(session)
-    return await hol_start.fn(workdir=str(workdir), name=session)
+    return await hol_start.fn(workdir=str(workdir), name=session, env=env)
+
+
+@mcp.tool()
+async def hol_setenv(session: str, env: dict) -> str:
+    """Set environment variables for a HOL session.
+
+    These are passed to the HOL process and affect Holmakefile INCLUDES expansion.
+    Use before hol_file_init or call hol_restart after to apply.
+
+    Example: hol_setenv("main", {"VFMDIR": "/home/user/verifereum"})
+
+    Args:
+        session: Session name
+        env: Environment variables to set (merged with existing)
+
+    Returns: Confirmation message
+    """
+    entry = _sessions.get(session)
+    if not entry:
+        return f"Session '{session}' not found. Use hol_start first."
+
+    # Merge with existing env
+    if entry.env:
+        entry.env.update(env)
+    else:
+        entry.env = env
+
+    return f"Environment updated for session '{session}': {env}\nUse hol_restart to apply to running session."
 
 
 async def _kill_process_group(proc):

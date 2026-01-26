@@ -53,22 +53,11 @@ def _is_hol_error(output: str) -> bool:
     return False
 
 
-def is_loadable_dep(dep: str) -> bool:
-    """Check if a dependency is loadable (has .ui file in sigobj).
-    
-    holdeptool returns all 'open' statements including build-time deps like
-    HolKernel, Parse, etc. These don't have .ui files in sigobj.
-    Loadable deps (theories, libraries) have corresponding .ui files.
-    """
-    ui_path = HOLDIR / "sigobj" / f"{dep}.ui"
-    return ui_path.exists()
-
-
 async def get_script_dependencies(script_path: Path) -> list[str]:
-    """Get loadable dependencies using holdeptool.exe.
+    """Get dependencies using holdeptool.exe.
 
-    Filters to deps that have .ui files in sigobj (actual loadable modules).
-    Build-time deps (HolKernel, Parse, etc.) are excluded.
+    Returns all deps from holdeptool. Caller should try to load each one
+    and handle "Cannot find file" errors (build-time deps or holmake not run).
     
     Raises FileNotFoundError if holdeptool.exe doesn't exist.
     """
@@ -85,8 +74,7 @@ async def get_script_dependencies(script_path: Path) -> list[str]:
     if proc.returncode != 0:
         raise RuntimeError(f"holdeptool.exe failed: {stderr.decode()}")
 
-    all_deps = [line.strip() for line in stdout.decode().splitlines() if line.strip()]
-    return [dep for dep in all_deps if is_loadable_dep(dep)]
+    return [line.strip() for line in stdout.decode().splitlines() if line.strip()]
 
 
 # =============================================================================
@@ -508,12 +496,17 @@ class FileProofCursor:
         if not self.session.is_running:
             await self.session.start()
 
-        # Load dependencies from holdeptool (pre-filtered to loadable deps only)
+        # Load dependencies from holdeptool
+        # Skip "Cannot find file" errors (build-time deps like HolKernel, or holmake not run)
+        # but report other errors (actual load failures)
         try:
             deps = await get_script_dependencies(self.file)
             for dep in deps:
                 result = await self.session.send(f'load "{dep}";', timeout=60)
                 if _is_hol_error(result):
+                    # "Cannot find file X.ui" means build-time dep or holmake not run - skip
+                    if "Cannot find file" in result:
+                        continue
                     return {
                         "theorems": [],
                         "cheats": [],
