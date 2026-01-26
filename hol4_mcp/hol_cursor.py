@@ -120,8 +120,9 @@ class FileProofCursor:
             session: HOL session to use
             checkpoint_dir: Where to store checkpoints (default: .hol/cursor_checkpoints/)
             mode: "g" for goalstack (default) or "gt" for goaltree
-                  - goalstack: uses g/e(tactic)/b, no proof extraction
-                  - goaltree: uses gt/etq "tactic"/backup, p() extracts proof script
+                  - goalstack: uses g/e(tactic)/b(), no proof extraction
+                  - goaltree: uses gt/e(tactic)/b(), p() extracts proof script
+                  Note: b() and backup() are the same function in HOL
             tactic_timeout: Max seconds per tactic (default 5.0, None=unlimited)
             max_checkpoints: Max theorem checkpoints to keep (default 100, LRU eviction)
         """
@@ -261,6 +262,19 @@ class FileProofCursor:
         safe_name = re.sub(r"[^a-zA-Z0-9_']", "_", theorem_name) or "unnamed"
         return self._checkpoint_dir / f"{safe_name}_{checkpoint_type}.save"
 
+    async def _get_hierarchy_depth(self) -> int:
+        """Get current PolyML SaveState hierarchy length.
+        
+        The hierarchy is a list of parent states. saveChild(path, N) saves as
+        child of entry at index N-1. To save as child of the current state,
+        use N = hierarchy length.
+        """
+        depth_result = await self.session.send(
+            'length (PolyML.SaveState.showHierarchy());', timeout=5
+        )
+        depth_match = re.search(r'val it = (\d+)', depth_result)
+        return int(depth_match.group(1)) if depth_match else 3  # Default for HOL4
+
     async def _save_base_checkpoint(self) -> bool:
         """Save base checkpoint after dependencies loaded.
 
@@ -276,13 +290,7 @@ class FileProofCursor:
         self._base_checkpoint_path = self._checkpoint_dir / "base_deps.save"
         ckpt_path_str = escape_sml_string(str(self._base_checkpoint_path))
 
-        # Get current hierarchy depth (output: "val it = 3: int")
-        depth_result = await self.session.send(
-            'length (PolyML.SaveState.showHierarchy());', timeout=5
-        )
-        depth_match = re.search(r'val it = (\d+)', depth_result)
-        depth = int(depth_match.group(1)) if depth_match else 3  # Default for HOL4
-
+        depth = await self._get_hierarchy_depth()
         # Save child checkpoint at current depth
         result = await self.session.send(
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
@@ -335,6 +343,12 @@ class FileProofCursor:
         The session already has base as parent (from init), context loaded,
         and tactics replayed. Just call saveChild to capture the delta.
 
+        ASSUMPTION: The PolyML state hierarchy (ancestors) must not change between
+        checkpoint save and load. If the hierarchy changes (e.g., HOL is restarted
+        with different heaps), checkpoints become invalid. This is detected by
+        content_hash validation - if the file changes, checkpoints are invalidated.
+        If HOL restarts, a new session starts fresh without cached checkpoints.
+
         Returns True if checkpoint was saved successfully.
         """
         if not self._base_checkpoint_saved:
@@ -344,16 +358,7 @@ class FileProofCursor:
         ckpt_path = self._get_checkpoint_path(theorem_name, "end_of_proof")
         ckpt_path_str = escape_sml_string(str(ckpt_path))
 
-        # Get current hierarchy depth and save as child of last entry
-        # saveChild(path, N) saves as child of entry at index N-1
-        # Hierarchy [s0, numheap, hol.state, base] has length 4
-        # To save child of base (index 3), use depth=4
-        depth_result = await self.session.send(
-            'length (PolyML.SaveState.showHierarchy());', timeout=5
-        )
-        depth_match = re.search(r'val it = (\d+)', depth_result)
-        depth = int(depth_match.group(1)) if depth_match else 4  # Same as hierarchy length
-
+        depth = await self._get_hierarchy_depth()
         # Save checkpoint directly from current state
         result = await self.session.send(
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=30
@@ -495,11 +500,12 @@ class FileProofCursor:
         if not self.session.is_running:
             await self.session.start()
 
-        # Load dependencies (only *Theory and *Lib - filter out build-time deps)
+        # Load dependencies from holdeptool
+        # Note: holdeptool returns all deps including build-time ones (HolKernel, Parse, etc.)
+        # These are already loaded by HOL, so re-loading them is a no-op but safe.
         try:
             deps = await get_script_dependencies(self.file)
-            loadable = [d for d in deps if d.endswith('Theory') or d.endswith('Lib')]
-            for dep in loadable:
+            for dep in deps:
                 result = await self.session.send(f'load "{dep}";', timeout=60)
                 if _is_hol_error(result):
                     return {
@@ -585,23 +591,47 @@ class FileProofCursor:
         
         return {"verified": verified, "total": len(non_cheat_thms), "broken": None}
 
+    async def _load_context_to_line(self, target_line: int, timeout: float = 300) -> str | None:
+        """Load file content up to target_line into HOL session.
+        
+        Tracks what's been loaded to avoid reloading. Only loads the delta.
+        
+        Args:
+            target_line: 1-indexed line to load up to (exclusive)
+            timeout: Timeout for HOL send (default 300s for large files)
+            
+        Returns:
+            Error message if failed, None if success.
+        """
+        if target_line <= self._loaded_to_line:
+            return None  # Already loaded
+            
+        content_lines = self._content.split('\n')
+        # _loaded_to_line=0 means nothing loaded, so start from line 0 (index 0)
+        # _loaded_to_line=N means lines 1..N-1 loaded, so start from index N-1
+        start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
+        to_load = '\n'.join(content_lines[start_idx:target_line - 1])
+        
+        if to_load.strip():
+            result = await self.session.send(to_load, timeout=timeout)
+            if _is_hol_error(result):
+                return f"Failed to load context: {result[:300]}"
+        
+        # Update tracking
+        loaded_content = '\n'.join(content_lines[:target_line - 1])
+        self._loaded_to_line = target_line
+        self._loaded_content_hash = self._compute_hash(loaded_content)
+        return None
+
     async def _verify_single_theorem(self, thm: TheoremInfo) -> dict:
         """Verify a single theorem by replaying tactics. No checkpoint saved.
         
         Returns: {"error": str} if failed, {} if success.
         """
-        # Load context up to theorem start (if not already loaded)
-        if thm.start_line > self._loaded_to_line:
-            content_lines = self._content.split('\n')
-            start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
-            to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
-            if to_load.strip():
-                result = await self.session.send(to_load, timeout=300)
-                if _is_hol_error(result):
-                    return {"error": f"Failed to load context: {result[:300]}"}
-            loaded_content = '\n'.join(content_lines[:thm.start_line - 1])
-            self._loaded_to_line = thm.start_line
-            self._loaded_content_hash = self._compute_hash(loaded_content)
+        # Load context up to theorem start
+        error = await self._load_context_to_line(thm.start_line)
+        if error:
+            return {"error": error}
 
         # Get step plan for this theorem
         if thm.proof_body:
@@ -624,17 +654,18 @@ class FileProofCursor:
         if _is_hol_error(gt_result):
             return {"error": f"Failed to set up goal: {gt_result[:300]}"}
 
-        # Execute all tactics
-        if step_plan:
-            step_cmds = "".join(step.cmd for step in step_plan)
-            if step_cmds.strip():
-                batch_timeout = max(30, int((self._tactic_timeout or 5) * len(step_plan)))
-                result = await self.session.send(step_cmds, timeout=batch_timeout)
-                if _is_hol_error(result):
-                    if result.startswith("TIMEOUT"):
-                        return {"error": f"Tactic replay timed out (>{batch_timeout}s)"}
-                    else:
-                        return {"error": f"Tactic replay failed: {result[:200]}"}
+        # Execute tactics one-by-one with per-tactic timeout
+        # This ensures slow individual tactics are caught (unlike batch execution)
+        per_tactic_timeout = self._tactic_timeout or 5.0
+        for i, step in enumerate(step_plan):
+            if not step.cmd.strip():
+                continue
+            result = await self.session.send(step.cmd, timeout=per_tactic_timeout)
+            if _is_hol_error(result):
+                if result.startswith("TIMEOUT"):
+                    return {"error": f"Tactic {i+1}/{len(step_plan)} timed out (>{per_tactic_timeout}s)"}
+                else:
+                    return {"error": f"Tactic {i+1}/{len(step_plan)} failed: {result[:200]}"}
 
         # Check proof is complete
         goals_output = await self.session.send('goals_json();', timeout=10)
@@ -676,22 +707,10 @@ class FileProofCursor:
         if not thm:
             return {"error": f"Theorem '{name}' not found"}
 
-        # Load context up to theorem start (if not already loaded)
-        if thm.start_line > self._loaded_to_line:
-            content_lines = self._content.split('\n')
-            # _loaded_to_line=0 means nothing loaded, so start from line 0 (index 0)
-            # _loaded_to_line=N means lines 1..N-1 loaded, so start from index N-1
-            start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
-            to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
-            if to_load.strip():
-                result = await self.session.send(to_load, timeout=300)
-                if _is_hol_error(result):
-                    return {"error": f"Failed to load context: {result[:300]}"}
-
-            # Update loaded tracking
-            loaded_content = '\n'.join(content_lines[:thm.start_line - 1])
-            self._loaded_to_line = thm.start_line
-            self._loaded_content_hash = self._compute_hash(loaded_content)
+        # Load context up to theorem start
+        error = await self._load_context_to_line(thm.start_line)
+        if error:
+            return {"error": error}
 
         # Parse step plan from proof body using TacticParse
         if thm.proof_body:
@@ -865,7 +884,10 @@ class FileProofCursor:
             self._proof_initialized = True
 
             if thm.proof_body and total_tactics > 0:
-                # Execute all steps from step_plan (aligned with backup_n)
+                # Execute all steps as batch for checkpoint building (optimized for speed).
+                # Uses batch timeout (tactic_timeout * N), not per-tactic - this is intentional
+                # since checkpoint path is O(1) after first access and we need fast replay.
+                # Verification (init) uses per-tactic timeout to catch slow individual tactics.
                 step_cmds = "".join(step.cmd for step in self._step_plan)
 
                 if step_cmds.strip():
