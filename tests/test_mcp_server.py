@@ -649,8 +649,9 @@ def test_cli_help():
     )
     assert result.returncode == 0
     assert "HOL4 MCP Server" in result.stdout
-    assert "--transport" in result.stdout
-    assert "--port" in result.stdout
+    # CLI uses subcommands - transport/port are in 'serve' subcommand
+    assert "serve" in result.stdout
+    assert "install-pi" in result.stdout
 
 
 def test_cli_main_function():
