@@ -344,13 +344,15 @@ class FileProofCursor:
         ckpt_path = self._get_checkpoint_path(theorem_name, "end_of_proof")
         ckpt_path_str = escape_sml_string(str(ckpt_path))
 
-        # Get current hierarchy depth and save as child
-        # Base is at depth 3, so theorem checkpoint is at depth 4
+        # Get current hierarchy depth and save as child of last entry
+        # saveChild(path, N) saves as child of entry at index N-1
+        # Hierarchy [s0, numheap, hol.state, base] has length 4
+        # To save child of base (index 3), use depth=4
         depth_result = await self.session.send(
             'length (PolyML.SaveState.showHierarchy());', timeout=5
         )
         depth_match = re.search(r'val it = (\d+)', depth_result)
-        depth = (int(depth_match.group(1)) + 1) if depth_match else 4  # Child of current
+        depth = int(depth_match.group(1)) if depth_match else 4  # Same as hierarchy length
 
         # Save checkpoint directly from current state
         result = await self.session.send(
@@ -493,10 +495,11 @@ class FileProofCursor:
         if not self.session.is_running:
             await self.session.start()
 
-        # Load dependencies
+        # Load dependencies (only *Theory and *Lib - filter out build-time deps)
         try:
             deps = await get_script_dependencies(self.file)
-            for dep in deps:
+            loadable = [d for d in deps if d.endswith('Theory') or d.endswith('Lib')]
+            for dep in loadable:
                 result = await self.session.send(f'load "{dep}";', timeout=60)
                 if _is_hol_error(result):
                     return {
