@@ -595,7 +595,8 @@ class FileProofCursor:
                     goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
                     file_hash=self._content_hash, error=enter_result["error"]
                 )
-            changed = True  # Force re-check since we just entered
+            # Note: enter_theorem already parses step_plan, so no need to set changed=True
+            # Checkpoint invalidation only on actual file changes (handled by _reparse_if_changed)
         timings['enter_theorem'] = time.perf_counter() - t1
 
         thm = self._get_theorem(self._active_theorem)
