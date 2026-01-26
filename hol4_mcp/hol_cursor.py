@@ -11,6 +11,7 @@ from .hol_file_parser import (
     TheoremInfo, parse_p_output, parse_theorems,
     build_line_starts, offset_to_line_col, line_col_to_offset, HOLParseError,
     _find_json_line, parse_step_plan_output, StepPlan,
+    parse_prefix_commands_output,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -191,8 +192,11 @@ class FileProofCursor:
         return None
 
     def _reparse_if_changed(self) -> bool:
-        """Re-read and parse file if content changed. Returns True if changed."""
-        content = self.file.read_text()
+        """Re-read and parse file if content changed. Returns True if changed.
+        
+        Raises FileNotFoundError if file was deleted.
+        """
+        content = self.file.read_text()  # Let FileNotFoundError propagate
         content_hash = self._compute_hash(content)
 
         if content_hash == self._content_hash:
@@ -213,7 +217,7 @@ class FileProofCursor:
             # Also reset loaded context tracking - can't trust context after change point
             if first_changed <= self._loaded_to_line:
                 self._loaded_to_line = max(0, first_changed - 1)
-                self._loaded_content_hash = None
+                self._loaded_content_hash = ""  # Empty string = needs recompute
 
         # Clear active theorem if it was renamed/deleted
         if self._active_theorem:
@@ -233,10 +237,9 @@ class FileProofCursor:
         """Get theorem containing the given line number."""
         for thm in self._theorems:
             # Theorem spans from Theorem keyword to QED
-            # proof_start_line is line of Proof keyword
-            # proof_end_line is line of last proof content (before QED)
-            # We consider valid range as: start_line to proof_end_line (inclusive)
-            if thm.start_line <= line <= thm.proof_end_line:
+            # proof_end_line is "line after QED" (exclusive upper bound)
+            # Valid range: start_line <= line < proof_end_line
+            if thm.start_line <= line < thm.proof_end_line:
                 return thm
         return None
 
@@ -273,14 +276,12 @@ class FileProofCursor:
         self._base_checkpoint_path = self._checkpoint_dir / "base_deps.save"
         ckpt_path_str = escape_sml_string(str(self._base_checkpoint_path))
 
-        # Get current hierarchy depth
+        # Get current hierarchy depth (output: "val it = 3: int")
         depth_result = await self.session.send(
             'length (PolyML.SaveState.showHierarchy());', timeout=5
         )
-        try:
-            depth = int(depth_result.strip().split()[-1])
-        except (ValueError, IndexError):
-            depth = 3  # Safe default for HOL4
+        depth_match = re.search(r'val it = (\d+)', depth_result)
+        depth = int(depth_match.group(1)) if depth_match else 3  # Default for HOL4
 
         # Save child checkpoint at current depth
         result = await self.session.send(
@@ -319,6 +320,9 @@ class FileProofCursor:
             return False
         if not ckpt.end_of_proof_path or not ckpt.end_of_proof_path.exists():
             return False
+        # Check content_hash matches current file (checkpoint may be stale after edit)
+        if ckpt.content_hash and ckpt.content_hash != self._content_hash:
+            return False
         return True
 
     async def _save_end_of_proof_checkpoint(self, theorem_name: str, tactics_count: int) -> bool:
@@ -345,10 +349,8 @@ class FileProofCursor:
         depth_result = await self.session.send(
             'length (PolyML.SaveState.showHierarchy());', timeout=5
         )
-        try:
-            depth = int(depth_result.strip().split()[-1]) + 1  # Child of current hierarchy
-        except (ValueError, IndexError):
-            depth = 4  # base_depth (3) + 1
+        depth_match = re.search(r'val it = (\d+)', depth_result)
+        depth = (int(depth_match.group(1)) + 1) if depth_match else 4  # Child of current
 
         # Save checkpoint directly from current state
         result = await self.session.send(
@@ -477,7 +479,13 @@ class FileProofCursor:
               - broken: {name, line, error} if a theorem is broken, else None
               - error: error message if init failed
         """
-        self._reparse_if_changed()
+        try:
+            self._reparse_if_changed()
+        except FileNotFoundError:
+            return {
+                "theorems": [], "cheats": [], "verified": 0, "total_non_cheat": 0,
+                "broken": None, "error": f"File not found: {self.file}"
+            }
 
         if not self._theorems:
             return {"error": "No theorems found in file", "theorems": [], "cheats": []}
@@ -489,7 +497,16 @@ class FileProofCursor:
         try:
             deps = await get_script_dependencies(self.file)
             for dep in deps:
-                await self.session.send(f'load "{dep}";', timeout=60)
+                result = await self.session.send(f'load "{dep}";', timeout=60)
+                if _is_hol_error(result):
+                    return {
+                        "theorems": [],
+                        "cheats": [],
+                        "verified": 0,
+                        "total_non_cheat": 0,
+                        "broken": None,
+                        "error": f"Failed to load dependency {dep}: {result[:200]}",
+                    }
         except FileNotFoundError:
             pass  # holdeptool not available, skip dep loading
 
@@ -647,7 +664,10 @@ class FileProofCursor:
               - has_cheat: whether proof has cheat
               - error: error message if failed
         """
-        self._reparse_if_changed()
+        try:
+            self._reparse_if_changed()
+        except FileNotFoundError:
+            return {"error": f"File not found: {self.file}"}
 
         thm = self._get_theorem(name)
         if not thm:
@@ -714,7 +734,14 @@ class FileProofCursor:
         t0 = time.perf_counter()
 
         # Reparse if file changed
-        changed = self._reparse_if_changed()
+        try:
+            changed = self._reparse_if_changed()
+        except FileNotFoundError:
+            return StateAtResult(
+                goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                file_hash="",
+                error=f"File not found: {self.file}"
+            )
         timings['reparse'] = time.perf_counter() - t0
 
         # Find theorem at position and auto-enter if needed
@@ -923,7 +950,10 @@ class FileProofCursor:
     @property
     def status(self) -> dict:
         """Get cursor status."""
-        self._reparse_if_changed()
+        try:
+            self._reparse_if_changed()
+        except FileNotFoundError:
+            return {"error": f"File not found: {self.file}"}
         stale = self._check_stale_state()
 
         return {
