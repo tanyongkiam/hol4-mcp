@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -95,6 +96,7 @@ class TheoremCheckpoint:
     theorem_name: str
     tactics_count: int            # Number of tactics when checkpoint saved
     end_of_proof_path: Path | None = None   # Checkpoint after all tactics (for state_at)
+    last_accessed: float = field(default_factory=time.time)  # For LRU eviction
 
 
 class FileProofCursor:
@@ -109,7 +111,7 @@ class FileProofCursor:
 
     def __init__(self, source_file: Path, session: HOLSession, *,
                  checkpoint_dir: Path | None = None, mode: str = "g",
-                 tactic_timeout: float = 5.0):
+                 tactic_timeout: float = 5.0, max_checkpoints: int = 100):
         """Initialize file proof cursor.
 
         Args:
@@ -120,6 +122,7 @@ class FileProofCursor:
                   - goalstack: uses g/e(tactic)/b, no proof extraction
                   - goaltree: uses gt/etq "tactic"/backup, p() extracts proof script
             tactic_timeout: Max seconds per tactic (default 5.0, None=unlimited)
+            max_checkpoints: Max theorem checkpoints to keep (default 100, LRU eviction)
         """
         self.file = source_file
         self.session = session
@@ -131,6 +134,9 @@ class FileProofCursor:
         
         # Tactic timeout for build discipline
         self._tactic_timeout = tactic_timeout
+        
+        # Checkpoint limit for disk space management (LRU eviction)
+        self._max_checkpoints = max_checkpoints
 
         # Checkpoint directory: .hol/cursor_checkpoints/ (alongside holmake artifacts)
         if checkpoint_dir is None:
@@ -358,7 +364,10 @@ class FileProofCursor:
             theorem_name=theorem_name,
             tactics_count=tactics_count,
             end_of_proof_path=ckpt_path,
+            last_accessed=time.time(),
         )
+        # Evict old checkpoints if over limit
+        self._evict_lru_checkpoints()
         return True
 
     async def _load_checkpoint_and_backup(self, theorem_name: str, target_tactic_idx: int) -> bool:
@@ -376,6 +385,9 @@ class FileProofCursor:
         ckpt = self._checkpoints.get(theorem_name)
         if not ckpt or not self._is_checkpoint_valid(theorem_name):
             return False
+
+        # Update access time for LRU
+        ckpt.last_accessed = time.time()
 
         # Load theorem checkpoint - Poly/ML auto-loads parent chain (base)
         ckpt_path_str = escape_sml_string(str(ckpt.end_of_proof_path))
@@ -434,6 +446,26 @@ class FileProofCursor:
             # (i.e. change is before theorem or inside theorem)
             if thm.proof_end_line >= start_line:
                 self._invalidate_checkpoint(thm.name)
+
+    def _evict_lru_checkpoints(self) -> None:
+        """Evict oldest checkpoints if over limit.
+        
+        Uses last_accessed timestamp for LRU ordering.
+        Keeps at most _max_checkpoints theorem checkpoints.
+        """
+        if len(self._checkpoints) <= self._max_checkpoints:
+            return
+        
+        # Sort by last_accessed (oldest first)
+        sorted_names = sorted(
+            self._checkpoints.keys(),
+            key=lambda n: self._checkpoints[n].last_accessed
+        )
+        
+        # Evict oldest until under limit
+        to_evict = len(self._checkpoints) - self._max_checkpoints
+        for name in sorted_names[:to_evict]:
+            self._invalidate_checkpoint(name)
 
     async def init(self) -> dict:
         """Initialize cursor - parse file, load deps, verify theorems.
