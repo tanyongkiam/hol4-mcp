@@ -418,7 +418,17 @@ class FileProofCursor:
 
         When content changes at line N, all theorems starting at N or later,
         OR containing line N, have invalid checkpoints.
+        Also invalidates checkpoints for deleted theorems (not in new parse).
         """
+        # Get names of theorems in new parse
+        current_thm_names = {thm.name for thm in self._theorems}
+        
+        # Invalidate checkpoints for theorems that no longer exist
+        for name in list(self._checkpoints.keys()):
+            if name not in current_thm_names:
+                self._invalidate_checkpoint(name)
+        
+        # Invalidate checkpoints for theorems at or after change point
         for thm in self._theorems:
             # Invalidate if theorem ends at or after the change point
             # (i.e. change is before theorem or inside theorem)
@@ -743,8 +753,8 @@ class FileProofCursor:
         # Convert (line, col) to proof body offset
         if line == qed_line:
             # On QED line: we want ALL tactics executed
-            # Use a large offset to ensure all step.end comparisons pass
-            proof_body_offset = float('inf')
+            # Use end of proof body
+            proof_body_offset = len(thm.proof_body) if thm.proof_body else 0
         else:
             file_offset = line_col_to_offset(line, col, self._line_starts)
             proof_body_offset = max(0, file_offset - thm.proof_body_offset)
