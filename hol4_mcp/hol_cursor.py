@@ -79,6 +79,33 @@ def _is_fatal_hol_error(output: str) -> bool:
     return False
 
 
+def _format_context_error(output: str) -> str:
+    """Format a context loading error with actionable suggestions.
+    
+    Detects common patterns and provides helpful messages:
+    - Missing Structure/signature -> suggest Holmake
+    - Timeout -> suggest simplifying or checking loops
+    """
+    # Missing structure: "Structure (X) has not been declared"
+    match = re.search(r'Structure \((\w+)\) has not been declared', output)
+    if match:
+        struct = match.group(1)
+        return f"Missing dependency: {struct}\n  Hint: run 'Holmake' to build dependencies"
+    
+    # Missing signature: "Signature (X) has not been declared"
+    match = re.search(r'Signature \((\w+)\) has not been declared', output)
+    if match:
+        sig = match.group(1)
+        return f"Missing dependency: {sig}\n  Hint: run 'Holmake' to build dependencies"
+    
+    # Timeout
+    if output.startswith("TIMEOUT"):
+        return "Timeout loading context\n  Hint: check for infinite loops or increase timeout"
+    
+    # Generic: truncate raw output
+    return output[:300]
+
+
 async def get_script_dependencies(script_path: Path) -> list[str]:
     """Get dependencies using holdeptool.exe.
 
@@ -682,7 +709,7 @@ class FileProofCursor:
             if to_load.strip():
                 result = await self.session.send(to_load, timeout=timeout)
                 if check(result):
-                    return f"Failed to load context: {result[:300]}"
+                    return f"Failed to load context: {_format_context_error(result)}"
         else:
             # Theorems in range - load piece by piece to isolate failures
             current_line = self._loaded_to_line
@@ -695,14 +722,14 @@ class FileProofCursor:
                     if pre_content.strip():
                         result = await self.session.send(pre_content, timeout=timeout)
                         if check(result):
-                            return f"Failed to load context: {result[:300]}"
+                            return f"Failed to load context: {_format_context_error(result)}"
                 
                 # Load the theorem itself (may fail if proof is broken, that's OK in lenient mode)
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
                 if thm_content.strip():
                     result = await self.session.send(thm_content, timeout=timeout)
                     if check(result):
-                        return f"Failed to load context: {result[:300]}"
+                        return f"Failed to load context: {_format_context_error(result)}"
                 
                 current_line = thm.proof_end_line + 1
             
@@ -713,7 +740,7 @@ class FileProofCursor:
                 if remaining.strip():
                     result = await self.session.send(remaining, timeout=timeout)
                     if check(result):
-                        return f"Failed to load context: {result[:300]}"
+                        return f"Failed to load context: {_format_context_error(result)}"
         
         # Update tracking
         loaded_content = '\n'.join(content_lines[:target_line - 1])
