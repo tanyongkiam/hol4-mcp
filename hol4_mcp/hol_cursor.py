@@ -251,6 +251,10 @@ class FileProofCursor:
         self._base_checkpoint_path: Path | None = None
         self._base_checkpoint_saved: bool = False
 
+        # Proof timing cache: theorem_name -> list[TraceEntry]
+        # Invalidated when file content changes
+        self._proof_traces: dict[str, list[TraceEntry]] = {}
+
     def _compute_hash(self, content: str) -> str:
         """Compute SHA256 hash of content."""
         return hashlib.sha256(content.encode()).hexdigest()
@@ -290,9 +294,9 @@ class FileProofCursor:
         self._line_starts = build_line_starts(content)
         self._theorems = parse_theorems(content)
 
-        # Invalidate checkpoints for theorems at or after the change
+        # Invalidate checkpoints and traces for theorems at or after the change
         if first_changed is not None:
-            self._invalidate_checkpoints_from(first_changed)
+            self._invalidate_from_line(first_changed)
             # Also reset loaded context tracking - can't trust context after change point
             if first_changed <= self._loaded_to_line:
                 self._loaded_to_line = max(0, first_changed - 1)
@@ -510,27 +514,29 @@ class FileProofCursor:
         for name in list(self._checkpoints.keys()):
             self._invalidate_checkpoint(name)
 
-    def _invalidate_checkpoints_from(self, start_line: int) -> None:
-        """Invalidate checkpoints for theorems at or after start_line.
+    def _invalidate_from_line(self, start_line: int) -> None:
+        """Invalidate checkpoints and traces for theorems at or after start_line.
 
         When content changes at line N, all theorems starting at N or later,
-        OR containing line N, have invalid checkpoints.
-        Also invalidates checkpoints for deleted theorems (not in new parse).
+        OR containing line N, have invalid checkpoints/traces.
+        Also invalidates for deleted theorems (not in new parse).
         """
-        # Get names of theorems in new parse
         current_thm_names = {thm.name for thm in self._theorems}
         
-        # Invalidate checkpoints for theorems that no longer exist
+        # Invalidate checkpoints/traces for theorems that no longer exist
         for name in list(self._checkpoints.keys()):
             if name not in current_thm_names:
                 self._invalidate_checkpoint(name)
+        for name in list(self._proof_traces.keys()):
+            if name not in current_thm_names:
+                del self._proof_traces[name]
         
-        # Invalidate checkpoints for theorems at or after change point
+        # Invalidate checkpoints/traces for theorems at or after change point
         for thm in self._theorems:
-            # Invalidate if theorem ends at or after the change point
-            # (i.e. change is before theorem or inside theorem)
             if thm.proof_end_line >= start_line:
                 self._invalidate_checkpoint(thm.name)
+                if thm.name in self._proof_traces:
+                    del self._proof_traces[thm.name]
 
     def _evict_lru_checkpoints(self) -> None:
         """Evict oldest checkpoints if over limit.
@@ -1104,15 +1110,20 @@ class FileProofCursor:
             goals_after=data.get('goals_after', 0),
         )
 
-    async def execute_proof_traced(self, theorem_name: str) -> list[TraceEntry]:
+    async def execute_proof_traced(self, theorem_name: str, use_cache: bool = True) -> list[TraceEntry]:
         """Execute a proof and return timing trace for each tactic.
 
         Args:
             theorem_name: Name of theorem to trace
+            use_cache: If True, return cached trace if available (default True)
 
         Returns:
             List of TraceEntry objects for each tactic
         """
+        # Check cache first
+        if use_cache and theorem_name in self._proof_traces:
+            return self._proof_traces[theorem_name]
+
         # Ensure theorem is active
         if self._active_theorem != theorem_name:
             enter_result = await self.enter_theorem(theorem_name)
@@ -1138,4 +1149,6 @@ class FileProofCursor:
                 if entry.error:
                     break
 
+        # Cache the result
+        self._proof_traces[theorem_name] = trace
         return trace
