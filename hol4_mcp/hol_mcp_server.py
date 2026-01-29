@@ -239,8 +239,10 @@ async def hol_interrupt(session: str) -> str:
 
     s.interrupt()
 
-    # Try to read any output
-    await asyncio.sleep(0.5)
+    # Flush interrupt message by sending dummy command
+    # HOL queues "Compilation interrupted" which pollutes next send() otherwise
+    await asyncio.sleep(0.1)
+    await s.send(";", timeout=1)
 
     return f"Sent SIGINT to session '{session}'. The tactic should be interrupted."
 
