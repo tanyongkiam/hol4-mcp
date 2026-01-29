@@ -701,7 +701,7 @@ class FileProofCursor:
                 self._loaded_to_line = thm.start_line
             
             # Load the theorem (header through QED)
-            thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+            thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
             if thm_content.strip():
                 # Ignore errors - proof failures are expected for broken cheat theorems
                 await self.session.send(thm_content, timeout=60)
@@ -768,7 +768,7 @@ class FileProofCursor:
                             return f"Failed to load context: {_format_context_error(result)}"
                 
                 # Load the theorem itself (may fail if proof is broken, that's OK in lenient mode)
-                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     result = await self.session.send(thm_content, timeout=timeout)
                     if check(result):
@@ -1244,11 +1244,11 @@ class FileProofCursor:
 
             if thm.has_cheat:
                 # Load cheat theorem as-is (stores it with cheat)
-                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     await self.session.send(thm_content, timeout=60)
                 results[thm.name] = []
-                current_line = thm.proof_end_line
+                current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
                 continue
 
             # Parse step plan
@@ -1266,11 +1266,11 @@ class FileProofCursor:
 
             if not step_plan:
                 # No tactics - load theorem as-is
-                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line])
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     await self.session.send(thm_content, timeout=60)
                 results[thm.name] = []
-                current_line = thm.proof_end_line
+                current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
                 continue
 
             # Set up goal
@@ -1290,13 +1290,15 @@ class FileProofCursor:
             results[thm.name] = trace
 
             # Store the theorem (QED) so later proofs can use it
-            final_goals = trace[-1].goals_after if trace else -1
-            if final_goals == 0:
+            # Only if proof completed successfully (no error AND no remaining goals)
+            final_entry = trace[-1] if trace else None
+            proof_ok = final_entry and final_entry.goals_after == 0 and not final_entry.error
+            if proof_ok:
                 await self.session.send('QED;', timeout=30)
             else:
                 # Proof incomplete - drop and skip storing
                 await self.session.send('drop_all();', timeout=5)
 
-            current_line = thm.proof_end_line
+            current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
 
         return results
