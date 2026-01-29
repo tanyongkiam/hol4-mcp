@@ -699,6 +699,24 @@ async def hol_state_at(
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
     result = await cursor.state_at(line, col)
+    active_theorem = cursor._active_theorem
+    thm = cursor._get_theorem(active_theorem) if active_theorem else None
+
+    # Helper to convert tactic index to line:col
+    def tactic_to_loc(idx):
+        if not thm or not thm.proof_body or idx <= 0:
+            return None
+        if idx > len(cursor._step_plan):
+            idx = len(cursor._step_plan)
+        if idx > 0:
+            step = cursor._step_plan[idx - 1]
+            # Find line and column
+            before = thm.proof_body[:step.end]
+            line_num = thm.proof_start_line + before.count('\n')
+            last_nl = before.rfind('\n')
+            col_num = step.end - last_nl if last_nl >= 0 else step.end + 1
+            return (line_num, col_num)
+        return (thm.proof_start_line, 1)
 
     lines = []
     
@@ -715,15 +733,22 @@ async def hol_state_at(
         lines.append(f"ERROR: {result.error}")
         return "\n".join(lines)
     
+    # Show theorem name (useful for hol_check_proof after edits)
+    if active_theorem:
+        lines.append(f"Theorem: {active_theorem}")
+    
     # Show position info - clarify if we couldn't reach requested position
     if result.error and result.tactics_replayed < result.tactic_idx:
-        lines.append(f"Requested: Tactic {result.tactic_idx}/{result.tactics_total}")
-        lines.append(f"Stuck at: Tactic {result.tactics_replayed}")
+        loc = tactic_to_loc(result.tactics_replayed)
+        loc_str = f"line {loc[0]} col {loc[1]}" if loc else ""
+        lines.append(f"Stuck at {loc_str} (Tactic {result.tactics_replayed}/{result.tactics_total})")
         lines.append(f"\nERROR: {result.error}")
         lines.append("")
-        lines.append(f"=== Goals (after tactic {result.tactics_replayed}) ===")
+        lines.append("=== Goals ===")
     else:
-        lines.append(f"Tactic {result.tactic_idx}/{result.tactics_total}")
+        loc = tactic_to_loc(result.tactic_idx)
+        loc_str = f"Line {loc[0]} col {loc[1]}, " if loc else ""
+        lines.append(f"{loc_str}Tactic {result.tactic_idx}/{result.tactics_total}")
         # Don't show "no goals" as error when proof is complete
         if result.error and not is_proof_complete:
             lines.append(f"\nERROR: {result.error}")
@@ -751,6 +776,120 @@ async def hol_state_at(
         lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
                      f"checkpoint={'yes' if t.get('used_checkpoint') else 'no'}]")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hol_check_proof(
+    session: str,
+    theorem: str,
+    file: str = None,
+    workdir: str = None,
+) -> str:
+    """Check if a theorem's proof completes after editing.
+
+    Use this after editing a proof to see if it works now. More reliable than
+    hol_state_at with line numbers which may be stale after edits.
+
+    Args:
+        session: Session name
+        theorem: Theorem name to check
+        file: Path to .sml file (auto-inits cursor if no cursor exists)
+        workdir: Working directory for HOL (used with file)
+
+    Returns: Whether proof completes, goals at failure point, line numbers
+    """
+    cursor = _get_cursor(session)
+
+    # Auto-init if file provided
+    if file:
+        file_path = Path(file).resolve()
+        if not cursor or Path(cursor.file).resolve() != file_path:
+            init_result = await _init_file_cursor(
+                file=file, session=session, workdir=workdir
+            )
+            if init_result.startswith("ERROR"):
+                return init_result
+            cursor = _get_cursor(session)
+
+    if not cursor:
+        return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
+
+    # Re-parse file to pick up edits
+    cursor._reparse_if_changed()
+
+    # Enter theorem and get step plan
+    enter_result = await cursor.enter_theorem(theorem)
+    if "error" in enter_result:
+        return f"ERROR: {enter_result['error']}"
+
+    thm = cursor._get_theorem(theorem)
+    if not thm:
+        return f"ERROR: Theorem '{theorem}' not found"
+
+    lines = [
+        f"Theorem: {theorem}",
+        f"Lines: {thm.start_line}-{thm.proof_end_line - 1}",
+        "",
+    ]
+
+    if thm.has_cheat:
+        lines.append("Status: CHEAT (not verified)")
+        return "\n".join(lines)
+
+    # Execute proof
+    trace = await cursor.execute_proof_traced(theorem, use_cache=False)
+    
+    if not trace:
+        lines.append("Status: NO TACTICS (trivial or unparseable)")
+        return "\n".join(lines)
+
+    # Find failure point and compute line number
+    failed_idx = None
+    for i, entry in enumerate(trace):
+        if entry.error or (i == len(trace) - 1 and entry.goals_after != 0):
+            failed_idx = i
+            break
+
+    # Compute line number of failing tactic from step plan offset
+    def tactic_line(idx):
+        if idx is None or idx >= len(cursor._step_plan):
+            return thm.proof_start_line  # fallback
+        step = cursor._step_plan[idx]
+        if thm.proof_body:
+            newlines = thm.proof_body[:step.end].count('\n')
+            return thm.proof_start_line + newlines
+        return thm.proof_start_line
+
+    final = trace[-1]
+    
+    if final.error:
+        lines.append(f"Status: FAILED at line {tactic_line(failed_idx)}")
+        lines.append(f"Error: {final.error}")
+    elif final.goals_after == 0:
+        total_ms = sum(e.real_ms for e in trace)
+        lines.append(f"Status: OK ({total_ms}ms)")
+        return "\n".join(lines)
+    else:
+        lines.append(f"Status: INCOMPLETE at line {tactic_line(len(trace) - 1)}")
+
+    # Get goals at failure point
+    lines.append("")
+    goals_output = await cursor.session.send('goals_json();', timeout=10)
+    try:
+        goals = cursor._parse_goals_json(goals_output)
+        lines.append(f"=== Goals ({len(goals)}) ===")
+        for i, g in enumerate(goals):
+            if i > 0:
+                lines.append("")
+            if g.get('asms'):
+                for asm in g['asms']:
+                    lines.append(f"  {asm}")
+                lines.append("  " + "-" * 40)
+            lines.append(f"  {g['goal']}")
+    except:
+        lines.append(f"=== Goals ({final.goals_after}) ===")
 
     return "\n".join(lines)
 
