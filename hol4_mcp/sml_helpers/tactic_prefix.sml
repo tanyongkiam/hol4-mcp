@@ -11,8 +11,9 @@
      => {"ok":[13,23,31]}
 *)
 
-(* Load TacticParse *)
+(* Load dependencies *)
 load "TacticParse";
+load "smlExecute";
 
 (* JSON helpers *)
 fun json_escape_char c =
@@ -97,14 +98,16 @@ fun tactic_steps proofBody =
           | go (TacticParse.LThenLT ls) acc = foldl (fn (x, a) => go x a) acc ls
           | go (TacticParse.LThen (e, ls)) acc = foldl (fn (x, a) => go x a) (go e acc) ls
           | go (TacticParse.LThen1 e) acc = go e acc
+          | go (TacticParse.LTacsToLT e) acc = go e acc
+          | go (TacticParse.LNullOk e) acc = go e acc
+          | go (TacticParse.LFirstLT e) acc = go e acc
           | go (TacticParse.LAllGoals e) acc = go e acc
           | go (TacticParse.LNthGoal (e, _)) acc = go e acc
           | go (TacticParse.LLastGoal e) acc = go e acc
           | go (TacticParse.LHeadGoal e) acc = go e acc
-          | go (TacticParse.LNullOk e) acc = go e acc
-          | go (TacticParse.LTry e) acc = go e acc
-          | go (TacticParse.LRepeat e) acc = go e acc
-          | go (TacticParse.LFirstLT e) acc = go e acc
+          | go (TacticParse.LSplit (sp, e1, e2)) acc = go e1 (go e2 acc)
+          | go (TacticParse.LSelectThen (e1, e2)) acc = go e1 (go e2 acc)
+          | go TacticParse.LReverse acc = acc
           | go _ acc = acc
         val (minL, maxR) = go e (String.size proofBody, 0)
       in
@@ -459,5 +462,34 @@ fun step_plan_json proofBody =
     val stepsJson = "[" ^ String.concatWith "," (map stepToJson finalSteps) ^ "]"
   in
     print (json_ok stepsJson ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* =============================================================================
+ * Proof Timing
+ * =============================================================================
+ * Execute a tactic command and return timing as JSON. Stateless.
+ *)
+
+(* timed_step_json: Execute command, return timing with goal counts.
+   Output: {"ok":{"real_ms":N,"usr_ms":N,"sys_ms":N,"goals_before":N,"goals_after":N}} *)
+fun timed_step_json cmd =
+  let
+    val goals_before = length (top_goals()) handle _ => 0
+    val start_real = Timer.startRealTimer()
+    val start_cpu = Timer.startCPUTimer()
+    val _ = smlExecute.quse_string cmd
+    val real_ms = Time.toMilliseconds (Timer.checkRealTimer start_real)
+    val cpu = Timer.checkCPUTimer start_cpu
+    val usr_ms = Time.toMilliseconds (#usr cpu)
+    val sys_ms = Time.toMilliseconds (#sys cpu)
+    val goals_after = length (top_goals()) handle _ => 0
+  in
+    print (json_ok (
+      "{\"real_ms\":" ^ LargeInt.toString real_ms ^
+      ",\"usr_ms\":" ^ LargeInt.toString usr_ms ^
+      ",\"sys_ms\":" ^ LargeInt.toString sys_ms ^
+      ",\"goals_before\":" ^ Int.toString goals_before ^
+      ",\"goals_after\":" ^ Int.toString goals_after ^ "}") ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");

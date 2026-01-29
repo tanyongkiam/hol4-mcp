@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -14,6 +15,22 @@ from .hol_file_parser import (
     parse_prefix_commands_output,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
+
+
+def _find_json_line(output: str, prefix: str = "") -> dict:
+    """Find and parse a JSON line from HOL output.
+
+    Looks for lines starting with {"ok":...} or {"err":...}.
+    If prefix is provided, only looks for lines after that prefix.
+    """
+    for line in output.split('\n'):
+        line = line.strip()
+        if line.startswith('{"ok":') or line.startswith('{"err":'):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return {}
 
 
 def _is_hol_error(output: str) -> bool:
@@ -144,6 +161,18 @@ class StateAtResult:
     file_hash: str            # Content hash when this state was computed
     error: str | None = None  # Error message if replay failed
     timings: dict[str, float] | None = None  # Timing breakdown (ms)
+
+
+@dataclass
+class TraceEntry:
+    """Single entry in a proof timing trace."""
+    cmd: str                  # Command that was executed
+    real_ms: int             # Real time in milliseconds
+    usr_ms: int              # User CPU time in milliseconds
+    sys_ms: int              # System CPU time in milliseconds
+    goals_before: int        # Number of goals before execution
+    goals_after: int         # Number of goals after execution
+    error: str | None = None  # Error message if tactic failed
 
 
 @dataclass
@@ -524,23 +553,22 @@ class FileProofCursor:
             self._invalidate_checkpoint(name)
 
     async def init(self) -> dict:
-        """Initialize cursor - parse file, load deps, verify theorems.
+        """Initialize cursor - parse file and load deps.
+
+        Does NOT verify theorems - that happens lazily via state_at/trace_proof.
 
         Returns:
             dict with:
               - theorems: list of {name, line, has_cheat}
               - cheats: list of cheat locations
-              - verified: number of verified non-cheat theorems
-              - total_non_cheat: total non-cheat theorems
-              - broken: {name, line, error} if a theorem is broken, else None
               - error: error message if init failed
         """
         try:
             self._reparse_if_changed()
         except FileNotFoundError:
             return {
-                "theorems": [], "cheats": [], "verified": 0, "total_non_cheat": 0,
-                "broken": None, "error": f"File not found: {self.file}"
+                "theorems": [], "cheats": [],
+                "error": f"File not found: {self.file}"
             }
 
         if not self._theorems:
@@ -563,9 +591,6 @@ class FileProofCursor:
                     return {
                         "theorems": [],
                         "cheats": [],
-                        "verified": 0,
-                        "total_non_cheat": 0,
-                        "broken": None,
                         "error": f"Failed to load dependency {dep}: {result[:200]}",
                     }
         except FileNotFoundError:
@@ -575,67 +600,26 @@ class FileProofCursor:
             {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
             for t in self._theorems
         ]
-        # Return cheat info with line/col for direct use with state_at
         cheats = [
             {
                 "theorem": t.name,
-                "line": t.proof_start_line,  # Line of first proof content
+                "line": t.proof_start_line,
                 "col": 1,
             }
             for t in self._theorems if t.has_cheat
         ]
 
-        # Verify all non-cheat theorems (stop on first failure)
-        verify_result = await self._verify_all_theorems()
-
-        # Load remaining file content theorem-by-theorem
-        # This handles broken cheat proofs gracefully - each failure is isolated
-        # so definitions/theorems after a broken proof are still processed
+        # Load file content (definitions, theorems) into session
         await self._load_remaining_content()
 
-        # Save base checkpoint AFTER all content loaded
-        # This makes theorem checkpoints ~1MB (just goal state) instead of ~14MB
-        await self.session.send('drop_all();', timeout=5)  # Clean proof state
+        # Save base checkpoint for fast theorem navigation
+        await self.session.send('drop_all();', timeout=5)
         await self._save_base_checkpoint()
         
         return {
             "theorems": thm_list,
             "cheats": cheats,
-            "verified": verify_result.get("verified", 0),
-            "total_non_cheat": verify_result.get("total", 0),
-            "broken": verify_result.get("broken"),  # None if all pass
         }
-
-    async def _verify_all_theorems(self) -> dict:
-        """Verify all non-cheat theorems by replaying their tactics.
-        
-        Stops on first failure. Does NOT save checkpoints (that's expensive
-        and only needed for interactive navigation).
-        
-        Returns:
-            dict with:
-              - verified: number of successfully verified theorems
-              - total: total non-cheat theorems
-              - broken: {name, line, error} if a theorem is broken, else None
-        """
-        non_cheat_thms = [t for t in self._theorems if not t.has_cheat]
-        verified = 0
-        
-        for thm in non_cheat_thms:
-            result = await self._verify_single_theorem(thm)
-            if result.get("error"):
-                return {
-                    "verified": verified,
-                    "total": len(non_cheat_thms),
-                    "broken": {
-                        "name": thm.name,
-                        "line": thm.start_line,
-                        "error": result["error"],
-                    }
-                }
-            verified += 1
-        
-        return {"verified": verified, "total": len(non_cheat_thms), "broken": None}
 
     async def _load_remaining_content(self) -> None:
         """Load remaining file content after verification, theorem by theorem.
@@ -747,64 +731,6 @@ class FileProofCursor:
         self._loaded_to_line = target_line
         self._loaded_content_hash = self._compute_hash(loaded_content)
         return None
-
-    async def _verify_single_theorem(self, thm: TheoremInfo) -> dict:
-        """Verify a single theorem by replaying tactics. No checkpoint saved.
-        
-        Returns: {"error": str} if failed, {} if success.
-        """
-        # Load context up to theorem start
-        error = await self._load_context_to_line(thm.start_line)
-        if error:
-            return {"error": error}
-
-        # Get step plan for this theorem
-        if thm.proof_body:
-            escaped_body = escape_sml_string(thm.proof_body)
-            step_result = await self.session.send(
-                f'step_plan_json "{escaped_body}";', timeout=30
-            )
-            try:
-                step_plan = parse_step_plan_output(step_result)
-            except HOLParseError as e:
-                return {"error": f"Failed to parse step plan: {e}"}
-        else:
-            step_plan = []
-
-        # Set up goal
-        await self.session.send('drop_all();', timeout=5)
-        goal = thm.goal.replace('\n', ' ').strip()
-        gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
-        if _is_hol_error(gt_result):
-            return {"error": f"Failed to set up goal: {gt_result[:300]}"}
-
-        # Execute tactics one-by-one with per-tactic timeout
-        # This ensures slow individual tactics are caught (unlike batch execution)
-        per_tactic_timeout = self._tactic_timeout or 5.0
-        for i, step in enumerate(step_plan):
-            if not step.cmd.strip():
-                continue
-            result = await self.session.send(step.cmd, timeout=per_tactic_timeout)
-            if _is_hol_error(result):
-                if result.startswith("TIMEOUT"):
-                    return {"error": f"Tactic {i+1}/{len(step_plan)} timed out (>{per_tactic_timeout}s)"}
-                else:
-                    return {"error": f"Tactic {i+1}/{len(step_plan)} failed: {result[:200]}"}
-
-        # Check proof is complete
-        goals_output = await self.session.send('goals_json();', timeout=10)
-        try:
-            goals = self._parse_goals_json(goals_output)
-        except HOLParseError as e:
-            # "no goals" error at end of proof is success
-            if "no goals" in str(e).lower():
-                return {}
-            return {"error": str(e)}
-
-        if goals:
-            return {"error": f"Proof incomplete: {len(goals)} goals remaining"}
-
-        return {}
 
     async def enter_theorem(self, name: str) -> dict:
         """Enter a theorem for proof state inspection.
@@ -1142,3 +1068,74 @@ class FileProofCursor:
                 for t in self._theorems if t.has_cheat and t.name not in self._completed
             ],
         }
+
+    # =========================================================================
+    # Proof Timing
+    # =========================================================================
+
+    async def _timed_step(self, cmd: str) -> TraceEntry:
+        """Execute a command and return timing. Internal helper."""
+        timeout = self._tactic_timeout or 60
+        escaped_cmd = escape_sml_string(cmd)
+        output = await self.session.send(
+            f'timed_step_json "{escaped_cmd}";', timeout=timeout
+        )
+        
+        # Check for timeout - report actual timeout duration
+        if output.startswith("TIMEOUT"):
+            return TraceEntry(cmd=cmd, real_ms=int(timeout * 1000), usr_ms=0, sys_ms=0,
+                            goals_before=0, goals_after=0, error="TIMEOUT")
+        
+        result = _find_json_line(output)
+        if 'err' in result:
+            return TraceEntry(cmd=cmd, real_ms=0, usr_ms=0, sys_ms=0,
+                            goals_before=0, goals_after=0, error=result['err'])
+        if 'ok' not in result:
+            return TraceEntry(cmd=cmd, real_ms=0, usr_ms=0, sys_ms=0,
+                            goals_before=0, goals_after=0, error="No response")
+        
+        data = result['ok']
+        return TraceEntry(
+            cmd=cmd,
+            real_ms=data.get('real_ms', 0),
+            usr_ms=data.get('usr_ms', 0),
+            sys_ms=data.get('sys_ms', 0),
+            goals_before=data.get('goals_before', 0),
+            goals_after=data.get('goals_after', 0),
+        )
+
+    async def execute_proof_traced(self, theorem_name: str) -> list[TraceEntry]:
+        """Execute a proof and return timing trace for each tactic.
+
+        Args:
+            theorem_name: Name of theorem to trace
+
+        Returns:
+            List of TraceEntry objects for each tactic
+        """
+        # Ensure theorem is active
+        if self._active_theorem != theorem_name:
+            enter_result = await self.enter_theorem(theorem_name)
+            if "error" in enter_result:
+                return []
+
+        thm = self._get_theorem(theorem_name)
+        if not thm:
+            return []
+
+        # Set up goal
+        await self.session.send('drop_all();', timeout=5)
+        goal = thm.goal.replace('\n', ' ').strip()
+        await self.session.send(f'g `{goal}`;', timeout=30)
+
+        # Execute each step with timing
+        trace = []
+        for step in self._step_plan:
+            if step.cmd.strip():
+                entry = await self._timed_step(step.cmd)
+                trace.append(entry)
+                # Stop on error - subsequent tactics won't work
+                if entry.error:
+                    break
+
+        return trace

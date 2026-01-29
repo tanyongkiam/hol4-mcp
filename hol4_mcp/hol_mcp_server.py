@@ -36,11 +36,10 @@ class SessionEntry:
 
 mcp = FastMCP("hol", instructions="""HOL4 theorem prover - proof development workflow:
 
-1. hol_file_init: Open a *Script.sml file (loads dependencies)
-2. hol_state_at: Check proof state at cursor position (auto-detects file changes)
-3. Edit file directly, then hol_state_at to see new goals
-4. Repeat until proof complete
-5. holmake: Only at the end to verify the build
+1. hol_state_at: Check proof state at cursor position (pass file= to auto-init)
+2. Edit file directly, then hol_state_at to see new goals
+3. Repeat until proof complete
+4. holmake: Only at the end to verify the build
 
 Do NOT:
 - Call hol_restart after file edits (state_at auto-detects changes)
@@ -103,7 +102,7 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None) -> st
     """Start a HOL4 REPL session.
 
     Idempotent - returns existing session if already running.
-    Usually called automatically by hol_file_init or hol_state_at.
+    Usually called automatically by hol_state_at (via file= parameter).
 
     Args:
         workdir: Working directory (should contain Holmakefile for dependencies)
@@ -275,7 +274,7 @@ async def hol_restart(session: str) -> str:
     Args:
         session: Session name to restart
 
-    Returns: Same as hol_start (cursor is cleared, use hol_file_init to re-init)
+    Returns: Same as hol_start (cursor is cleared, use hol_state_at file= to re-init)
     """
     entry = _sessions.get(session)
     if not entry:
@@ -292,7 +291,7 @@ async def hol_setenv(session: str, env: dict) -> str:
     """Set environment variables for a HOL session.
 
     These are passed to the HOL process and affect Holmakefile INCLUDES expansion.
-    Use before hol_file_init or call hol_restart after to apply.
+    Use before hol_state_at or call hol_restart after to apply.
 
     Example: hol_setenv("main", {"VFMDIR": "/home/user/verifereum"})
 
@@ -574,14 +573,13 @@ async def hol_logs(workdir: str) -> str:
 # =============================================================================
 
 
-@mcp.tool()
-async def hol_file_init(
+async def _init_file_cursor(
     file: str,
     session: str = "default",
     workdir: str = None,
     tactic_timeout: float = 5.0,
 ) -> str:
-    """Initialize cursor for a HOL4 script file.
+    """Initialize cursor for a HOL4 script file (internal helper).
 
     Parses file for theorems and their proofs. Auto-starts HOL session if needed.
     After init, use hol_state_at to navigate to specific positions and see goals.
@@ -648,16 +646,6 @@ async def hol_file_init(
         f"Theorems: {len(result['theorems'])} ({len(result['cheats'])} cheats)",
     ]
 
-    # Show verification status
-    broken = result.get('broken')
-    if broken:
-        lines.append(f"Verified: {result['verified']}/{result['total_non_cheat']} non-cheat theorems")
-        lines.append("")
-        lines.append(f"BROKEN: {broken['name']} (line {broken['line']})")
-        lines.append(f"  {broken['error']}")
-    else:
-        lines.append(f"Verified: {result['verified']}/{result['total_non_cheat']} non-cheat theorems ✓")
-
     if result['cheats']:
         lines.append("")
         lines.append("Cheats to fix:")
@@ -687,7 +675,7 @@ async def hol_state_at(
         session: Session name
         line: 1-indexed line number (position in the proof)
         col: 1-indexed column number (default 1)
-        file: Path to .sml file (auto-calls hol_file_init if no cursor exists)
+        file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
 
     Returns: Tactic position (N/M), goals at that position, errors if any
@@ -698,7 +686,7 @@ async def hol_state_at(
     if file:
         file_path = Path(file).resolve()
         if not cursor or Path(cursor.file).resolve() != file_path:
-            init_result = await hol_file_init.fn(
+            init_result = await _init_file_cursor(
                 file=file, session=session, workdir=workdir
             )
             if init_result.startswith("ERROR"):
@@ -706,7 +694,7 @@ async def hol_state_at(
             cursor = _get_cursor(session)
 
     if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first, or pass file= to auto-init."
+        return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
     result = await cursor.state_at(line, col)
 
@@ -763,17 +751,31 @@ async def hol_state_at(
 
 
 @mcp.tool()
-async def hol_file_status(session: str) -> str:
+async def hol_file_status(session: str, file: str = None, workdir: str = None) -> str:
     """Get current cursor position and file status.
 
     Args:
         session: Session name
+        file: Path to .sml file (auto-inits cursor if no cursor exists)
+        workdir: Working directory for HOL (used with file)
 
     Returns: File info, active theorem, theorems with cheats, completion status
     """
     cursor = _get_cursor(session)
+
+    # Auto-init if file provided and no cursor (or different file)
+    if file:
+        file_path = Path(file).resolve()
+        if not cursor or Path(cursor.file).resolve() != file_path:
+            init_result = await _init_file_cursor(
+                file=file, session=session, workdir=workdir
+            )
+            if init_result.startswith("ERROR"):
+                return init_result
+            cursor = _get_cursor(session)
+
     if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Use hol_file_init first, or pass file= to auto-init."
+        return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
     status = cursor.status
 
@@ -805,6 +807,74 @@ async def hol_file_status(session: str) -> str:
         for c in status['cheats']:
             marker = " <--" if c['theorem'] == status['active_theorem'] else ""
             lines.append(f"  {c['theorem']} (line {c['line']}){marker}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Proof Timing Trace Tools
+# =============================================================================
+
+
+@mcp.tool()
+async def hol_trace_proof(
+    session: str,
+    theorem: str,
+    file: str = None,
+    workdir: str = None,
+) -> str:
+    """Execute a proof and return full timing trace.
+
+    Executes all tactics for the given theorem and records timing
+    for each step.
+
+    Args:
+        session: Session name
+        theorem: Theorem name to trace
+        file: Path to .sml file (auto-inits cursor if no cursor exists)
+        workdir: Working directory for HOL (used with file)
+
+    Returns: Full trace with timing for each tactic
+    """
+    cursor = _get_cursor(session)
+
+    # Auto-init if file provided and no cursor (or different file)
+    if file:
+        file_path = Path(file).resolve()
+        if not cursor or Path(cursor.file).resolve() != file_path:
+            init_result = await _init_file_cursor(
+                file=file, session=session, workdir=workdir
+            )
+            if init_result.startswith("ERROR"):
+                return init_result
+            cursor = _get_cursor(session)
+
+    if not cursor:
+        return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
+
+    trace = await cursor.execute_proof_traced(theorem)
+
+    if not trace:
+        return f"No trace data. Theorem '{theorem}' may not exist or has no tactics."
+
+    lines = [f"Proof trace for {theorem}: {len(trace)} steps", ""]
+
+    total_real = 0
+    has_error = False
+    for i, entry in enumerate(trace, 1):
+        total_real += entry.real_ms
+        lines.append(f"Step {i}: {entry.cmd[:60]}{'...' if len(entry.cmd) > 60 else ''}")
+        if entry.error:
+            lines.append(f"  ERROR: {entry.error}")
+            has_error = True
+        else:
+            lines.append(f"  Real: {entry.real_ms}ms, User: {entry.usr_ms}ms, Sys: {entry.sys_ms}ms")
+            lines.append(f"  Goals: {entry.goals_before} -> {entry.goals_after}")
+        lines.append("")
+
+    lines.append(f"Total real time: {total_real}ms")
+    if has_error:
+        lines.append("WARNING: Trace incomplete due to error")
 
     return "\n".join(lines)
 

@@ -16,7 +16,7 @@ from hol4_mcp.hol_mcp_server import (
     hol_log as _hol_log,
     hol_logs as _hol_logs,
     holmake as _holmake,
-    hol_file_init as _hol_file_init,
+    _init_file_cursor,  # Internal helper (not MCP tool)
     hol_state_at as _hol_state_at,
     hol_file_status as _hol_file_status,
     _kill_process_group,
@@ -30,7 +30,7 @@ hol_stop = _hol_stop.fn
 hol_log = _hol_log.fn
 hol_logs = _hol_logs.fn
 holmake = _holmake.fn
-hol_file_init = _hol_file_init.fn
+hol_file_init = _init_file_cursor  # Direct function, not .fn
 hol_state_at = _hol_state_at.fn
 hol_file_status = _hol_file_status.fn
 
@@ -214,7 +214,6 @@ async def test_file_init_lists_theorems(tmp_path):
         result = await hol_file_init(file=str(test_file), session="file_init_test")
         assert "Theorems:" in result
         assert "cheats" in result.lower()
-        assert "Verified:" in result
         # Should list cheats to fix
         assert "needs_proof" in result
         assert "partial_proof" in result
@@ -398,9 +397,8 @@ async def test_file_init_auto_starts_session(tmp_path):
         # hol_file_init should auto-start session
         result = await hol_file_init(file=str(test_file), session=session_name)
 
-        # Should succeed and show verification status
+        # Should succeed and show theorem count
         assert "Theorems:" in result
-        assert "Verified:" in result
 
         # Verify session is now running
         sessions_result = await hol_sessions()
