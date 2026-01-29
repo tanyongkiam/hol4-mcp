@@ -800,7 +800,7 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None, t
                 cheated.append(thm['name'])
                 timing_lines.append(f"  {thm['name']}: (cheat)")
             else:
-                trace = await cursor.execute_proof_traced(thm['name'])
+                trace = await cursor.execute_proof_traced(thm['name'], clean=True)
                 if trace:
                     thm_ms = sum(e.real_ms for e in trace)
                     total_ms += thm_ms
@@ -851,6 +851,12 @@ async def hol_file_status(session: str, file: str = None, workdir: str = None, t
         lines.append("Proof times:")
         lines.extend(timing_lines)
         lines.append(f"Total: {total_ms}ms")
+
+        # Warn about potential holmake divergence
+        if len(verified) == total - len(cheated) and len(cheated) == 0:
+            lines.append("")
+            lines.append("NOTE: Run 'holmake' to confirm batch build succeeds.")
+            lines.append("      Session may have stale theory deps from prior builds.")
     else:
         # Static analysis only (fast but unreliable)
         complete_in_file = [t['name'] for t in status['theorems'] if not t['has_cheat']]

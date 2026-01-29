@@ -251,6 +251,11 @@ class FileProofCursor:
         self._base_checkpoint_path: Path | None = None
         self._base_checkpoint_saved: bool = False
 
+        # Deps-only checkpoint (saved after deps but before file content)
+        # Used for clean verification of proofs
+        self._deps_checkpoint_path: Path | None = None
+        self._deps_checkpoint_saved: bool = False
+
         # Proof timing cache: theorem_name -> list[TraceEntry]
         # Invalidated when file content changes
         self._proof_traces: dict[str, list[TraceEntry]] = {}
@@ -381,6 +386,51 @@ class FileProofCursor:
             return False
 
         self._base_checkpoint_saved = True
+        return True
+
+    async def _save_deps_checkpoint(self) -> bool:
+        """Save deps-only checkpoint (before any file content).
+
+        This captures HOL state with only dependencies loaded, used for
+        clean verification of proofs without accumulated session state.
+
+        Returns True if saved successfully.
+        """
+        if self._deps_checkpoint_saved:
+            return True
+
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self._deps_checkpoint_path = self._checkpoint_dir / "deps_only.save"
+        ckpt_path_str = escape_sml_string(str(self._deps_checkpoint_path))
+
+        depth = await self._get_hierarchy_depth()
+        result = await self.session.send(
+            f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
+        )
+        if _is_hol_error(result):
+            return False
+
+        self._deps_checkpoint_saved = True
+        return True
+
+    async def _restore_to_deps(self) -> bool:
+        """Restore session to deps-only state (no file content).
+
+        Returns True if restored successfully.
+        """
+        if not self._deps_checkpoint_path or not self._deps_checkpoint_path.exists():
+            return False
+
+        ckpt_path_str = escape_sml_string(str(self._deps_checkpoint_path))
+        result = await self.session.send(
+            f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
+        )
+        if _is_hol_error(result):
+            return False
+
+        # Reset loaded state - no file content after restore
+        self._loaded_to_line = 0
+        self._loaded_content_hash = ""
         return True
 
     async def _load_base_checkpoint(self) -> bool:
@@ -614,6 +664,9 @@ class FileProofCursor:
             }
             for t in self._theorems if t.has_cheat
         ]
+
+        # Save deps-only checkpoint for clean verification
+        await self._save_deps_checkpoint()
 
         # Load file content (definitions, theorems) into session
         await self._load_remaining_content()
@@ -1110,29 +1163,39 @@ class FileProofCursor:
             goals_after=data.get('goals_after', 0),
         )
 
-    async def execute_proof_traced(self, theorem_name: str, use_cache: bool = True) -> list[TraceEntry]:
+    async def execute_proof_traced(self, theorem_name: str, use_cache: bool = True,
+                                    clean: bool = False) -> list[TraceEntry]:
         """Execute a proof and return timing trace for each tactic.
 
         Args:
             theorem_name: Name of theorem to trace
             use_cache: If True, return cached trace if available (default True)
+            clean: If True, restore to deps-only checkpoint before loading context.
+                   This ensures verification matches holmake behavior.
 
         Returns:
             List of TraceEntry objects for each tactic
         """
-        # Check cache first
-        if use_cache and theorem_name in self._proof_traces:
+        # Check cache first (only if not forcing clean verification)
+        if use_cache and not clean and theorem_name in self._proof_traces:
             return self._proof_traces[theorem_name]
-
-        # Ensure theorem is active
-        if self._active_theorem != theorem_name:
-            enter_result = await self.enter_theorem(theorem_name)
-            if "error" in enter_result:
-                return []
 
         thm = self._get_theorem(theorem_name)
         if not thm:
             return []
+
+        # For clean verification, restore to deps-only state first
+        if clean and self._deps_checkpoint_saved:
+            restored = await self._restore_to_deps()
+            if not restored:
+                # Fall back to normal behavior if restore fails
+                pass
+
+        # Ensure theorem is active (loads context up to theorem)
+        if self._active_theorem != theorem_name or clean:
+            enter_result = await self.enter_theorem(theorem_name)
+            if "error" in enter_result:
+                return []
 
         # Set up goal
         await self.session.send('drop_all();', timeout=5)
@@ -1149,6 +1212,7 @@ class FileProofCursor:
                 if entry.error:
                     break
 
-        # Cache the result
-        self._proof_traces[theorem_name] = trace
+        # Cache the result (only for non-clean runs to avoid polluting cache)
+        if not clean:
+            self._proof_traces[theorem_name] = trace
         return trace
