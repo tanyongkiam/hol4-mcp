@@ -1177,10 +1177,10 @@ def main():
         logging.getLogger("mcp").setLevel(logging.DEBUG)
 
     if args.transport == "stdio":
-        mcp.run()
+        mcp.run(show_banner=False)
     else:
         print(f"HOL MCP server starting on {args.host}:{args.port} ({args.transport})", file=sys.stderr)
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
+        mcp.run(transport=args.transport, host=args.host, port=args.port, show_banner=False)
 
 
 if __name__ == "__main__":
