@@ -244,7 +244,7 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
         Type.Literal("restart"),
       ], { description: "Action: 'list', 'call', 'interrupt', or 'restart'" }),
       tool_name: Type.Optional(Type.String({ description: "Tool name (required for 'call')" })),
-      args: Type.Optional(Type.Any({ description: "Tool arguments as object (for 'call')" })),
+      args: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Tool arguments as object (for 'call')" })),
     }),
 
     async execute(toolCallId, params, onUpdate, ctx, signal) {
