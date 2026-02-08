@@ -11,7 +11,7 @@ from pathlib import Path
 from .hol_file_parser import (
     TheoremInfo, parse_theorems,
     build_line_starts, line_col_to_offset, HOLParseError,
-    _find_json_line, parse_step_plan_output, StepPlan,
+    parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
@@ -254,9 +254,6 @@ class FileProofCursor:
         self._loaded_to_line: int = 0
         self._loaded_content_hash: str = ""  # Hash of content up to _loaded_to_line
 
-        # Completed theorems this session
-        self._completed: set[str] = set()
-
         # Checkpoint cache: theorem_name -> TheoremCheckpoint
         self._checkpoints: dict[str, TheoremCheckpoint] = {}
 
@@ -447,26 +444,6 @@ class FileProofCursor:
         self._loaded_content_hash = ""
         return True
 
-    async def _load_base_checkpoint(self) -> bool:
-        """Load the base checkpoint to establish correct parent for theorem checkpoints.
-
-        Returns True if loaded successfully.
-        """
-        if not self._base_checkpoint_path or not self._base_checkpoint_path.exists():
-            return False
-
-        ckpt_path_str = escape_sml_string(str(self._base_checkpoint_path))
-        result = await self.session.send(
-            f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
-        )
-        if not _is_hol_error(result):
-            # Base has all file content, mark as fully loaded
-            last_thm = self._theorems[-1] if self._theorems else None
-            self._loaded_to_line = last_thm.proof_end_line if last_thm else 0
-            self._loaded_content_hash = self._content_hash
-            return True
-        return False
-
     def _is_checkpoint_valid(self, theorem_name: str) -> bool:
         """Check if cached checkpoint exists and file is present."""
         ckpt = self._checkpoints.get(theorem_name)
@@ -548,6 +525,13 @@ class FileProofCursor:
             f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
         )
         if _is_hol_error(result):
+            # loadState failure may leave PolyML in corrupted state.
+            # Invalidate this checkpoint and reset tracking so the caller's
+            # fallback path (full replay) can restart cleanly.
+            self._invalidate_checkpoint(theorem_name)
+            self._loaded_to_line = 0
+            self._loaded_content_hash = ""
+            self._proof_initialized = False
             return False
         
         # Checkpoint (child of base) has all file content, mark as fully loaded
@@ -735,6 +719,9 @@ class FileProofCursor:
                     await self.session.send(trailing, timeout=60)
                 self._loaded_to_line = total_lines + 1
 
+        # Track content hash so _check_stale_state works correctly
+        self._loaded_content_hash = self._content_hash
+
     async def _load_context_to_line(self, target_line: int, timeout: float = 300, strict: bool = False) -> str | None:
         """Load file content up to target_line into HOL session.
         
@@ -879,7 +866,6 @@ class FileProofCursor:
         Returns:
             StateAtResult with goals, tactic index, etc.
         """
-        import time
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
 
@@ -1136,51 +1122,20 @@ class FileProofCursor:
             "active_tactics": len(self._step_plan),
             "loaded_to_line": self._loaded_to_line,
             "stale": stale,
-            "completed": list(self._completed),
+            "completed": [],
             "theorems": [
                 {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
                 for t in self._theorems
             ],
             "cheats": [
                 {"theorem": t.name, "line": t.proof_start_line, "col": 1}
-                for t in self._theorems if t.has_cheat and t.name not in self._completed
+                for t in self._theorems if t.has_cheat
             ],
         }
 
     # =========================================================================
     # Proof Timing
     # =========================================================================
-
-    async def _timed_step(self, cmd: str) -> TraceEntry:
-        """Execute a single tactic with timing. Supports per-tactic timeout."""
-        timeout = self._tactic_timeout or 60
-        escaped_cmd = escape_sml_string(cmd)
-        output = await self.session.send(
-            f'timed_step_json "{escaped_cmd}";', timeout=timeout
-        )
-
-        # Check for timeout - report actual timeout duration
-        if output.startswith("TIMEOUT"):
-            return TraceEntry(cmd=cmd, real_ms=int(timeout * 1000), usr_ms=0, sys_ms=0,
-                            goals_before=0, goals_after=0, error="TIMEOUT")
-
-        result = _find_json_line(output)
-        if 'err' in result:
-            return TraceEntry(cmd=cmd, real_ms=0, usr_ms=0, sys_ms=0,
-                            goals_before=0, goals_after=0, error=result['err'])
-        if 'ok' not in result:
-            return TraceEntry(cmd=cmd, real_ms=0, usr_ms=0, sys_ms=0,
-                            goals_before=0, goals_after=0, error="No response")
-
-        data = result['ok']
-        return TraceEntry(
-            cmd=cmd,
-            real_ms=data.get('real_ms', 0),
-            usr_ms=data.get('usr_ms', 0),
-            sys_ms=data.get('sys_ms', 0),
-            goals_before=data.get('goals_before', 0),
-            goals_after=data.get('goals_after', 0),
-        )
 
     async def execute_proof_traced(self, theorem_name: str) -> list[TraceEntry]:
         """Execute a proof and return timing trace for each tactic.
@@ -1360,7 +1315,22 @@ class FileProofCursor:
                     goals_before=0, goals_after=0, error=parsed['err']
                 ))
 
+            # verify_theorem_json uses save_thm() which doesn't register
+            # attributes like [simp], [compute]. Re-send the full block
+            # so HOL processes attributes correctly for subsequent theorems.
+            if thm.attributes and trace and not any(e.error for e in trace):
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
+                if thm_content.strip():
+                    await self.session.send(thm_content, timeout=60)
+
             results[thm.name] = trace
             current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
+
+        # Update loaded state tracking so subsequent state_at doesn't
+        # re-send all content (which would cause duplicate definition errors)
+        last_thm = self._theorems[-1] if self._theorems else None
+        if last_thm:
+            self._loaded_to_line = last_thm.proof_end_line
+            self._loaded_content_hash = self._content_hash
 
         return results
