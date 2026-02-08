@@ -247,7 +247,7 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
       args: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Tool arguments as object (for 'call')" })),
     }),
 
-    async execute(toolCallId, params, onUpdate, ctx, signal) {
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       try {
         // Handle restart action - doesn't need existing client
         if (params.action === "restart") {
