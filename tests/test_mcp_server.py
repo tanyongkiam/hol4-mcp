@@ -19,6 +19,7 @@ from hol4_mcp.hol_mcp_server import (
     _init_file_cursor,  # Internal helper (not MCP tool)
     hol_state_at as _hol_state_at,
     hol_file_status as _hol_file_status,
+    hol_check_proof as _hol_check_proof,
     _kill_process_group,
 )
 
@@ -32,6 +33,7 @@ hol_logs = _hol_logs.fn
 holmake = _holmake.fn
 hol_file_init = _init_file_cursor  # Direct function, not .fn
 hol_state_at = _hol_state_at.fn
+hol_check_proof = _hol_check_proof.fn
 hol_file_status = _hol_file_status.fn
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -502,6 +504,203 @@ val _ = export_theory();
         assert "Goals remaining:" in result2 or "goals" in result2.lower()
     finally:
         await hol_stop(session="then_test")
+
+
+# =============================================================================
+# by / sg Integration Tests
+# =============================================================================
+
+# Test script with `by` and `sg` proofs (written inline since fixtures are shared)
+BY_SG_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "bysg";
+
+(* `by` in a >> chain: 3 steps *)
+Theorem by_in_chain:
+  (P ==> Q) ==> P ==> Q /\\ T
+Proof
+  rpt strip_tac >>
+  `Q` by (res_tac >> first_assum ACCEPT_TAC) >>
+  simp[]
+QED
+
+(* `sg` with >- in a >> chain: 2 steps *)
+Theorem sg_test:
+  (P ==> Q) ==> P ==> Q /\\ T
+Proof
+  rpt strip_tac >>
+  sg `Q` >-
+    (res_tac >> first_assum ACCEPT_TAC) >>
+  simp[]
+QED
+
+(* Top-level `by`: 1 atomic step *)
+Theorem by_toplevel:
+  T /\\ T
+Proof
+  `T` by simp[] >> simp[]
+QED
+
+val _ = export_theory();
+'''
+
+
+async def test_state_at_by_in_chain(tmp_path):
+    """Test hol_state_at navigates through a proof with `by` in a >> chain.
+
+    `by` creates a ThenLT wrapped in a Group, so step_plan gives 3 steps:
+    rpt strip_tac, `Q` by (...), simp[].
+    """
+    test_file = tmp_path / "bysgScript.sml"
+    test_file.write_text(BY_SG_SCRIPT)
+    session = "by_chain_test"
+
+    try:
+        result = await hol_file_init(file=str(test_file), session=session)
+        assert "Theorems: 3" in result
+
+        # Line 9: rpt strip_tac (before `by` clause)
+        r = await hol_state_at(session=session, line=9, col=3)
+        assert "Tactic" in r
+        assert "ERROR" not in r
+
+        # Line 10: `Q` by (...) — at the by clause
+        r = await hol_state_at(session=session, line=10, col=3)
+        assert "Tactic" in r
+        assert "ERROR" not in r
+        # Should show goals (some remain since simp[] hasn't run yet)
+        assert "Goals" in r
+
+        # Line 11: simp[] — after by clause
+        r = await hol_state_at(session=session, line=11, col=3)
+        assert "Tactic" in r
+        assert "ERROR" not in r
+
+        # QED line (line 12): proof complete
+        r = await hol_state_at(session=session, line=12, col=1)
+        assert "proof complete" in r.lower()
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_state_at_sg_with_subgoal_tactic(tmp_path):
+    """Test hol_state_at navigates through a proof with `sg` and >-.
+
+    `sg` + >- creates a ThenLT at top of the >> chain, so step_plan gives 2 steps:
+    (rpt strip_tac >> sg `Q` >- ...), simp[].
+    """
+    test_file = tmp_path / "bysgScript.sml"
+    test_file.write_text(BY_SG_SCRIPT)
+    session = "sg_test"
+
+    try:
+        result = await hol_file_init(file=str(test_file), session=session)
+        assert "Theorems: 3" in result
+
+        # Line 18: rpt strip_tac (start of proof body)
+        r = await hol_state_at(session=session, line=18, col=3)
+        assert "Tactic" in r
+        assert "ERROR" not in r
+
+        # Line 21: simp[] — after the sg block
+        r = await hol_state_at(session=session, line=21, col=3)
+        assert "Tactic" in r
+        assert "ERROR" not in r
+
+        # QED line (line 22): proof complete
+        r = await hol_state_at(session=session, line=22, col=1)
+        assert "proof complete" in r.lower()
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_state_at_by_toplevel(tmp_path):
+    """Test hol_state_at with top-level `by` (entire proof is 1 atomic step).
+
+    Prefix path provides fine-grained navigation within the single step.
+    """
+    test_file = tmp_path / "bysgScript.sml"
+    test_file.write_text(BY_SG_SCRIPT)
+    session = "by_top_test"
+
+    try:
+        result = await hol_file_init(file=str(test_file), session=session)
+        assert "Theorems: 3" in result
+
+        # Line 28: `T` by simp[] >> simp[] — the entire proof body
+        r = await hol_state_at(session=session, line=28, col=1)
+        assert "Tactic" in r
+        assert "ERROR" not in r
+
+        # QED line (line 29): proof complete
+        r = await hol_state_at(session=session, line=29, col=1)
+        assert "proof complete" in r.lower()
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_check_proof_by_sg_theorems(tmp_path):
+    """Test hol_check_proof works for theorems using `by` and `sg`."""
+    test_file = tmp_path / "bysgScript.sml"
+    test_file.write_text(BY_SG_SCRIPT)
+    session = "check_by_test"
+
+    try:
+        for thm_name in ["by_in_chain", "sg_test", "by_toplevel"]:
+            r = await hol_check_proof(
+                theorem=thm_name, file=str(test_file), session=session
+            )
+            assert "OK" in r, f"{thm_name} should pass: {r}"
+            assert "FAILED" not in r, f"{thm_name} should not fail: {r}"
+    finally:
+        await hol_stop(session=session)
+
+
+# Test script with a broken proof that has ThenLT at top level (1 step)
+# rpt strip_tac >> conj_tac >- ... >- FAIL_TAC produces 1 atomic step
+BROKEN_THENLT_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "broken";
+
+(* ThenLT at top → 1 step, second >- arm fails *)
+Theorem broken_thenlt:
+  (A:bool) /\\ B ==> B /\\ A
+Proof
+  rpt strip_tac >> conj_tac >-
+    (first_assum ACCEPT_TAC) >-
+    FAIL_TAC "intentional failure"
+QED
+
+val _ = export_theory();
+'''
+
+
+async def test_check_proof_substeps_for_big_step(tmp_path):
+    """Test hol_check_proof shows substep positions for big atomic steps.
+
+    The proof uses >- (ThenLT) at top level, so step_plan gives 1 step.
+    The tactic text exceeds 80 chars, triggering substep decomposition.
+    Output should list individual substep positions for navigation.
+    """
+    test_file = tmp_path / "brokenScript.sml"
+    test_file.write_text(BROKEN_THENLT_SCRIPT)
+    session = "narrow_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="broken_thenlt", file=str(test_file), session=session
+        )
+        # Should be INCOMPLETE (>- catches tactic failure, leaves goals)
+        assert "INCOMPLETE" in r or "FAILED" in r, f"Should not succeed: {r}"
+        # Should show substeps for the big atomic step
+        assert "Sub-steps" in r, f"Should show substep info: {r}"
+        # Should list individual tactics with line numbers
+        assert "strip_tac" in r
+        assert "EVAL_TAC" in r or "FAIL_TAC" in r
+    finally:
+        await hol_stop(session=session)
 
 
 # =============================================================================
