@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 
 from hol4_mcp.hol_file_parser import (
-    parse_theorems, parse_file, splice_into_theorem, parse_p_output,
+    parse_theorems, parse_file, parse_p_output,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -118,25 +118,46 @@ QED
     assert thms[1].start_line == 18
 
 
-def test_splice_into_theorem():
-    """Test splicing proof into theorem."""
-    content = '''Theorem foo:
-  !x. P x
+def test_parse_definition_termination():
+    """Definition with Termination...End should be parsed as a theorem."""
+    content = r'''
+Definition factc_def:
+  factc n =
+    cv_if (cv_lt n (Num 1))
+          (Num 1)
+          (cv_mul n (factc (cv_sub n (Num 1))))
+Termination
+  WF_REL_TAC `measure cv_size`
+  \\ Cases \\ simp [CaseEq "bool", c2b_def]
+End
+
+Theorem factc_is_fact:
+  !n. factc (Num n) = Num (FACT n)
 Proof
-  cheat
+  Induct \\ once_rewrite_tac [factc_def, FACT] \\ simp [c2b_def]
 QED
 
-Theorem bar:
-  A
-Proof
-  simp[]
-QED
+Definition simple_def:
+  simple x = x + 1
+End
 '''
-    new = splice_into_theorem(content, 'foo', 'Induct_on `x` \\\\ gvs[]')
+    thms = parse_theorems(content)
+    names = [t.name for t in thms]
+    # simple_def has no Termination block, should be skipped
+    assert names == ["factc_def", "factc_is_fact"]
 
-    assert 'Induct_on `x`' in new
-    assert 'cheat' not in new.split('Theorem bar')[0]
-    assert 'simp[]' in new
+    defn = thms[0]
+    assert defn.kind == "Definition"
+    assert "WF_REL_TAC" in defn.proof_body
+    assert defn.has_cheat == False
+    assert defn.start_line == 2
+
+    thm = thms[1]
+    assert thm.kind == "Theorem"
+    assert thm.name == "factc_is_fact"
+
+
+
 
 
 def test_parse_p_output():
@@ -152,11 +173,6 @@ val it = () : unit
 gvs[] \\
 simp[foo_def]'''
 
-
-def test_splice_into_theorem_not_found():
-    content = 'Theorem foo:\n  P\nProof\n  cheat\nQED\n'
-    with pytest.raises(ValueError, match="not found"):
-        splice_into_theorem(content, 'nonexistent', 'simp[]')
 
 
 def test_parse_p_output_empty():

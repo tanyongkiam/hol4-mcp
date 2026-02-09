@@ -196,7 +196,7 @@ def make_tactic_spans(
 class TheoremInfo:
     """Information about a theorem in a HOL script file."""
     name: str
-    kind: str  # "Theorem" or "Triviality"
+    kind: str  # "Theorem", "Triviality", or "Definition"
     goal: str  # The statement to prove
     start_line: int  # Line of "Theorem name:"
     proof_start_line: int  # Line after "Proof" (first line of proof body)
@@ -316,6 +316,64 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
             attributes=attributes,
         ))
 
+    # Second pass: Definition ... Termination ... End (recursive function proofs)
+    def_pattern = re.compile(
+        r'^(Definition)\s+(\w+)(?:\s*\[([^\]]*)\])?\s*:',
+        re.MULTILINE
+    )
+
+    for match in def_pattern.finditer(stripped):
+        kind = match.group(1)
+        name = match.group(2)
+        attrs_str = match.group(3)
+        attributes = [a.strip() for a in attrs_str.split(',')] if attrs_str else []
+
+        start_pos = match.start()
+        start_line = content[:start_pos].count('\n') + 1
+
+        rest_stripped = stripped[match.end():]
+        rest = content[match.end():]
+
+        term_match = re.search(r'^\s*Termination\s*$', rest_stripped, re.MULTILINE)
+        if not term_match:
+            continue  # No Termination block — plain definition, skip
+
+        end_match = re.search(r'^\s*End\s*$', rest_stripped[term_match.end():], re.MULTILINE)
+        if not end_match:
+            continue
+
+        # Goal is the function body between Definition header and Termination
+        goal = rest[:term_match.start()].strip()
+
+        # proof_start_line = line after "Termination"
+        proof_start_line = start_line + rest[:term_match.start()].count('\n') + 1
+        # proof_end_line = line of "End" (relative to after Termination)
+        proof_end_line = start_line + rest[:term_match.end() + end_match.start()].count('\n') + 1
+
+        proof_body_raw = rest[term_match.end():term_match.end() + end_match.start()]
+        proof_body_stripped = proof_body_raw.strip()
+        leading_ws = len(proof_body_raw) - len(proof_body_raw.lstrip())
+        proof_body_offset = match.end() + term_match.end() + leading_ws
+
+        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
+
+        theorems.append(TheoremInfo(
+            name=name,
+            kind=kind,
+            goal=goal,
+            start_line=start_line,
+            proof_start_line=proof_start_line,
+            proof_end_line=proof_end_line,
+            has_cheat=has_cheat,
+            proof_body=proof_body_stripped,
+            proof_body_offset=proof_body_offset,
+            attributes=attributes,
+        ))
+
+    # Sort by file position (theorems and definitions interleaved)
+    theorems.sort(key=lambda t: t.start_line)
+
     return theorems
 
 
@@ -324,42 +382,6 @@ def parse_file(path: Path) -> list[TheoremInfo]:
     content = path.read_text()
     return parse_theorems(content)
 
-
-def splice_into_theorem(content: str, name: str, tactics: str) -> str:
-    """Replace Proof...QED block for named theorem with new tactics.
-
-    Raises:
-        ValueError: If theorem not found in content.
-    """
-    # Match Theorem/Triviality name[...]: ... Proof ... QED
-    pattern = rf'''
-        ((?:Theorem|Triviality)\s+{re.escape(name)}
-         (?:\s*\[[^\]]*\])?    # optional attributes
-         \s*:\s*
-         .*?                   # goal (non-greedy)
-         \n\s*Proof\s*\n)      # Proof line
-        (.*?)                  # old tactics
-        (\n\s*QED)             # QED line
-    '''
-
-    def replacer(m):
-        header = m.group(1)
-        footer = m.group(3)
-        indented = _indent(tactics, "  ")
-        return f"{header}{indented}{footer}"
-
-    new_content = re.sub(pattern, replacer, content, flags=re.DOTALL | re.VERBOSE)
-    if new_content == content:
-        raise ValueError(f"Theorem '{name}' not found")
-    return new_content
-
-
-def _indent(text: str, prefix: str) -> str:
-    """Indent non-empty lines."""
-    return '\n'.join(
-        prefix + line if line.strip() else line
-        for line in text.split('\n')
-    )
 
 
 def parse_p_output(output: str) -> str | None:
