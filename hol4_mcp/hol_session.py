@@ -44,6 +44,7 @@ class HOLSession:
         self.env = env  # Extra env vars to merge with os.environ
         self.process: Optional[asyncio.subprocess.Process] = None
         self._buffer = b""
+        self._lock = asyncio.Lock()  # Serialize send() to prevent concurrent stdout reads
 
     async def start(self) -> str:
         """Start HOL subprocess."""
@@ -112,19 +113,20 @@ class HOLSession:
         if not self.process or self.process.returncode is not None:
             return "ERROR: HOL not running"
 
-        await self._drain_pipe()
-        await self._write_command(sml_code)
+        async with self._lock:
+            await self._drain_pipe()
+            await self._write_command(sml_code)
 
-        try:
-            return await self._read_response(timeout=timeout)
-        except asyncio.TimeoutError:
-            self.interrupt()
             try:
-                remaining = await self._read_response(timeout=5)
+                return await self._read_response(timeout=timeout)
             except asyncio.TimeoutError:
-                remaining = ""
-            msg = f"TIMEOUT after {timeout}s - sent interrupt."
-            return f"{msg}\n{remaining}" if remaining else msg
+                self.interrupt()
+                try:
+                    remaining = await self._read_response(timeout=5)
+                except asyncio.TimeoutError:
+                    remaining = ""
+                msg = f"TIMEOUT after {timeout}s - sent interrupt."
+                return f"{msg}\n{remaining}" if remaining else msg
 
     async def _read_response(self, timeout: float) -> str:
         """Read until null terminator, return all segments joined."""
