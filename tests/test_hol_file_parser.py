@@ -76,6 +76,48 @@ def test_parse_fixture_file():
     assert thms[4].kind == "Triviality"
 
 
+def test_parse_theorems_in_comments_ignored():
+    """Theorems inside comments (including nested) should be stripped."""
+    content = r'''
+(* Commented-out theorem:
+Theorem ghost:
+  T
+Proof
+  cheat
+QED
+*)
+
+Theorem real_one:
+  !x. x = x
+Proof
+  rw[]
+QED
+
+(* Nested comment: (* Theorem ghost2: T Proof cheat QED *) still comment *)
+
+Theorem real_two:
+  !y. y = y
+Proof
+  rw[]
+QED
+
+(*
+Theorem ghost3:
+  F
+Proof
+  (* nested (* deep *) comment *)
+  cheat
+QED
+*)
+'''
+    thms = parse_theorems(content)
+    names = [t.name for t in thms]
+    assert names == ["real_one", "real_two"]
+    # Line numbers should be correct despite comment stripping
+    assert thms[0].start_line == 10
+    assert thms[1].start_line == 18
+
+
 def test_splice_into_theorem():
     """Test splicing proof into theorem."""
     content = '''Theorem foo:

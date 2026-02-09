@@ -212,10 +212,46 @@ class TheoremInfo:
         return self.proof_end_line - 2
 
 
+def _strip_comments(content: str) -> str:
+    """Replace SML comments (* ... *) with spaces, preserving newlines.
+
+    Handles nested comments. Preserves character offsets so that line/col
+    calculations on the result match the original content.
+    """
+    result = list(content)
+    i = 0
+    n = len(content)
+    while i < n - 1:
+        if content[i] == '(' and content[i + 1] == '*':
+            # Found comment start - track nesting
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if j < n - 1 and content[j] == '(' and content[j + 1] == '*':
+                    depth += 1
+                    j += 2
+                elif j < n - 1 and content[j] == '*' and content[j + 1] == ')':
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            # Blank out i..j, keeping newlines
+            for k in range(i, j):
+                if result[k] != '\n':
+                    result[k] = ' '
+            i = j
+        else:
+            i += 1
+    return ''.join(result)
+
+
 def parse_theorems(content: str) -> list[TheoremInfo]:
     """Parse .sml file content, return all theorems in order."""
     theorems = []
     lines = content.split('\n')
+
+    # Strip comments so we don't match theorems inside (* ... *)
+    stripped = _strip_comments(content)
 
     # Pattern for Theorem/Triviality with optional attributes
     # Matches: Theorem name:, Theorem name[simp]:, Triviality foo[local,simp]:
@@ -224,7 +260,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         re.MULTILINE
     )
 
-    for match in header_pattern.finditer(content):
+    for match in header_pattern.finditer(stripped):
         kind = match.group(1)
         name = match.group(2)
         attrs_str = match.group(3)
@@ -234,18 +270,19 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         start_pos = match.start()
         start_line = content[:start_pos].count('\n') + 1
 
-        # Find Proof and QED after this point
+        # Find Proof and QED after this point (in stripped to skip commented-out ones)
+        rest_stripped = stripped[match.end():]
         rest = content[match.end():]
 
-        proof_match = re.search(r'^\s*Proof\s*$', rest, re.MULTILINE)
+        proof_match = re.search(r'^\s*Proof\s*$', rest_stripped, re.MULTILINE)
         if not proof_match:
             continue
 
-        qed_match = re.search(r'^\s*QED\s*$', rest, re.MULTILINE)
+        qed_match = re.search(r'^\s*QED\s*$', rest_stripped, re.MULTILINE)
         if not qed_match:
             continue
 
-        # Extract goal (between : and Proof)
+        # Extract goal (between : and Proof) from original content
         goal = rest[:proof_match.start()].strip()
 
         # Calculate line numbers
