@@ -497,6 +497,61 @@ async def test_state_at_after_file_edit(tmp_path):
         await hol_stop(session="edit_test")
 
 
+async def test_state_at_reinitializes_on_prelude_change(tmp_path):
+    """Changing open/Theory/Ancestors prelude must invalidate cached context.
+
+    Regression: prelude edits were reparsed but HOL session context stayed stale,
+    so removed opens still appeared to work.
+    """
+    with_open = '''\
+open HolKernel Parse boolLib bossLib;
+open arithmeticTheory;
+
+val _ = new_theory "cachetest";
+
+Theorem t:
+  !n:num. n + 1 = SUC n
+Proof
+  simp[ADD1]
+QED
+
+val _ = export_theory();
+'''
+    without_open = with_open.replace("open arithmeticTheory;\n", "")
+
+    test_file = tmp_path / "cacheScript.sml"
+    test_file.write_text(with_open)
+    session = "prelude_inval_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # Baseline: with arithmeticTheory open, proof replays to completion.
+        qed_line_with_open = next(
+            i + 1 for i, line in enumerate(with_open.splitlines()) if line.strip() == "QED"
+        )
+        r1 = await hol_state_at(session=session, line=qed_line_with_open, col=1)
+        assert "proof complete" in r1.lower(), f"Expected proof complete before edit: {r1}"
+
+        # Edit prelude: remove open arithmeticTheory; ADD1 should no longer resolve.
+        test_file.write_text(without_open)
+
+        qed_line_without_open = next(
+            i + 1 for i, line in enumerate(without_open.splitlines()) if line.strip() == "QED"
+        )
+        r2 = await hol_state_at(session=session, line=qed_line_without_open, col=1)
+
+        assert "ERROR" in r2, f"Expected replay error after prelude change: {r2}"
+        assert "proof complete" not in r2.lower(), f"Should not still be complete after removing open: {r2}"
+        assert (
+            "ADD1" in r2
+            or "has not been declared" in r2
+            or "Tactic replay failed" in r2
+        ), f"Expected missing ADD1-style failure after prelude change: {r2}"
+    finally:
+        await hol_stop(session=session)
+
+
 async def test_check_proof_deleted_file_returns_error(tmp_path):
     """Regression: hol_check_proof should return an ERROR, not raise, when file was deleted."""
     test_file = tmp_path / "testScript.sml"

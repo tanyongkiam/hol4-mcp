@@ -319,6 +319,10 @@ class FileProofCursor:
         # Invalidated when file content changes
         self._proof_traces: dict[str, list[TraceEntry]] = {}
 
+        # True when pre-theorem context changed (e.g., open/Theory/Ancestors).
+        # Such changes require rebuilding HOL session context from scratch.
+        self._needs_session_reinit: bool = False
+
     def _compute_hash(self, content: str) -> str:
         """Compute SHA256 hash of content."""
         return hashlib.sha256(content.encode()).hexdigest()
@@ -366,6 +370,33 @@ class FileProofCursor:
                 self._loaded_to_line = max(0, first_changed - 1)
                 self._loaded_content_hash = ""  # Empty string = needs recompute
 
+            # If change is before first theorem, pre-theorem context may have changed
+            # (e.g., open/Theory/Ancestors). Rebuild HOL session on next query.
+            first_thm_line = self._theorems[0].start_line if self._theorems else None
+            if first_thm_line and first_changed < first_thm_line:
+                self._needs_session_reinit = True
+                self._loaded_to_line = 0
+                self._loaded_content_hash = ""
+                self._proof_initialized = False
+                self._current_tactic_idx = 0
+                self._active_theorem = None
+
+                # Invalidate all caches/checkpoints that depend on old context
+                self._invalidate_all_checkpoints()
+                self._proof_traces.clear()
+
+                # Invalidate saved base/deps checkpoints (stale imports/ancestors)
+                for ckpt_path in [self._base_checkpoint_path, self._deps_checkpoint_path]:
+                    if ckpt_path and ckpt_path.exists():
+                        try:
+                            ckpt_path.unlink()
+                        except OSError:
+                            pass
+                self._base_checkpoint_path = None
+                self._deps_checkpoint_path = None
+                self._base_checkpoint_saved = False
+                self._deps_checkpoint_saved = False
+
         # Clear active theorem if it was renamed/deleted
         if self._active_theorem:
             if not any(t.name == self._active_theorem for t in self._theorems):
@@ -397,6 +428,40 @@ class FileProofCursor:
         # Compare hash of content up to loaded line
         loaded_content = '\n'.join(self._content.split('\n')[:self._loaded_to_line - 1])
         return self._compute_hash(loaded_content) != self._loaded_content_hash
+
+    async def _reinitialize_session_if_needed(self) -> str | None:
+        """Rebuild HOL session/context after pre-theorem file edits.
+
+        Needed when imports/theory header/ancestor block changes, since those
+        alter top-level context that cannot be safely undone incrementally.
+
+        Returns:
+            None on success, or an error string.
+        """
+        if not self._needs_session_reinit:
+            return None
+
+        # Restart HOL process for a clean top-level environment
+        if self.session.is_running:
+            await self.session.stop()
+        await self.session.start()
+
+        # Reset runtime tracking before re-init
+        self._loaded_to_line = 0
+        self._loaded_content_hash = ""
+        self._proof_initialized = False
+        self._current_tactic_idx = 0
+        self._active_theorem = None
+        self._step_plan = []
+        self._needs_session_reinit = False
+
+        # Re-run full initialization to rebuild deps/context/checkpoints
+        init_result = await self.init()
+        if init_result.get("error"):
+            self._needs_session_reinit = True
+            return init_result["error"]
+
+        return None
 
     # =========================================================================
     # Checkpoint Management
@@ -878,6 +943,10 @@ class FileProofCursor:
         except FileNotFoundError:
             return {"error": f"File not found: {self.file}"}
 
+        reinit_error = await self._reinitialize_session_if_needed()
+        if reinit_error:
+            return {"error": reinit_error}
+
         thm = self._get_theorem(name)
         if not thm:
             return {"error": f"Theorem '{name}' not found"}
@@ -939,6 +1008,14 @@ class FileProofCursor:
                 error=f"File not found: {self.file}"
             )
         timings['reparse'] = time.perf_counter() - t0
+
+        # Rebuild session/context when pre-theorem header changed
+        reinit_error = await self._reinitialize_session_if_needed()
+        if reinit_error:
+            return StateAtResult(
+                goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                file_hash=self._content_hash, error=reinit_error
+            )
 
         # Find theorem at position and auto-enter if needed
         thm_at_pos = self._get_theorem_at_position(line)
@@ -1276,6 +1353,15 @@ class FileProofCursor:
         Returns:
             List of TraceEntry objects for each tactic
         """
+        try:
+            self._reparse_if_changed()
+        except FileNotFoundError:
+            return []
+
+        reinit_error = await self._reinitialize_session_if_needed()
+        if reinit_error:
+            return []
+
         if theorem_name in self._proof_traces:
             return self._proof_traces[theorem_name]
 
@@ -1347,6 +1433,15 @@ class FileProofCursor:
         Returns:
             Dict mapping theorem name to trace (empty list for cheats/no tactics)
         """
+        try:
+            self._reparse_if_changed()
+        except FileNotFoundError:
+            return {}
+
+        reinit_error = await self._reinitialize_session_if_needed()
+        if reinit_error:
+            return {}
+
         results: dict[str, list[TraceEntry]] = {}
 
         # Restore to clean deps-only state
