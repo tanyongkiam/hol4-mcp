@@ -838,6 +838,59 @@ async def test_state_at_broken_two_step_qed_reports_stuck_location(tmp_path):
         await hol_stop(session=session)
 
 
+# Repro from GH issue #2: reverse + >- inside >> chain.
+# This script is intentionally brittle in replay; state_at should still recover
+# nearest valid prefix state instead of falling back to the original goal.
+ISSUE2_REVERSE_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib arithmeticTheory;
+
+val _ = new_theory "issue2";
+
+Theorem foo:
+  (!n. n < 5 ==> n + 1 <= 5) /\\ (!n. n < 10 ==> n * 2 < 20) /\\ (!n m. n + m = m + n)
+Proof
+  reverse conj_tac >- simp[] >>
+  reverse conj_tac >- (
+    rpt strip_tac >>
+    cheat ) >>
+  simp[]
+QED
+
+val _ = export_theory();
+'''
+
+
+async def test_state_at_reverse_modifier_recovers_nearest_prefix_state(tmp_path):
+    """Regression for issue #2: broken prefix replay should recover best-effort goals.
+
+    At the `cheat` line, prefix replay can fail deep in a compound tactic.
+    We should back off to the nearest executable prefix and show that state,
+    rather than the original theorem goal.
+    """
+    test_file = tmp_path / "issue2Script.sml"
+    test_file.write_text(ISSUE2_REVERSE_SCRIPT)
+    session = "issue2_reverse_test"
+
+    # Find the line containing cheat in the test script
+    cheat_line = next(
+        i + 1 for i, line in enumerate(ISSUE2_REVERSE_SCRIPT.splitlines())
+        if "cheat" in line
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        r = await hol_state_at(session=session, line=cheat_line, col=5)
+
+        assert "Prefix replay failed" in r
+        assert "using nearest valid prefix" in r
+        # Recovered state should not be the original 3-way conjunction goal
+        assert "n < 5" in r
+        assert "n < 10" not in r
+    finally:
+        await hol_stop(session=session)
+
+
 # =============================================================================
 # Process Group Tests
 # =============================================================================

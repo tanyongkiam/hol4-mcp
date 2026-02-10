@@ -1086,35 +1086,66 @@ class FileProofCursor:
             # Shouldn't happen, but keep original batch error if fallback fully succeeds.
             return replayed, f"Tactic replay failed: {result[:200]}"
 
-        used_checkpoint = False
-
-        if need_partial and thm.proof_body:
-            # Fine-grained position: use prefix replay from theorem start
-            # This correctly handles ThenLT semantics via sliceTacticBlock
+        async def _execute_prefix_at_offset(offset: int) -> tuple[bool, str | None]:
+            """Reset goal, replay prefix up to offset, return (ok, err_msg)."""
             setup_err = await _reset_goal_state()
             if setup_err:
-                return StateAtResult(
-                    goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
-                    tactics_total=total_tactics, file_hash=self._content_hash,
-                    error=setup_err
-                )
+                return False, setup_err
 
-            # Get prefix command from start to current position
             prefix_result = await self.session.send(
-                f'prefix_commands_json "{escaped_body}" {proof_body_offset};',
+                f'prefix_commands_json "{escaped_body}" {offset};',
                 timeout=30
             )
             try:
                 prefix_cmd = parse_prefix_commands_output(prefix_result)
             except HOLParseError as e:
-                error_msg = f"Failed to get prefix commands: {e}"
-                prefix_cmd = ""
+                return False, f"Failed to get prefix commands: {e}"
 
-            if prefix_cmd.strip() and not error_msg:
-                result = await self.session.send(prefix_cmd, timeout=self._tactic_timeout or 30)
-                if _is_hol_error(result):
-                    error_msg = f"Prefix replay failed: {result[:200]}"
+            if not prefix_cmd.strip():
+                return True, None
+
+            result = await self.session.send(prefix_cmd, timeout=self._tactic_timeout or 30)
+            if _is_hol_error(result):
+                return False, result[:200]
+            return True, None
+
+        used_checkpoint = False
+
+        if need_partial and thm.proof_body:
+            # Fine-grained position: use prefix replay from theorem start
+            # This correctly handles ThenLT semantics via sliceTacticBlock.
+            ok, prefix_err = await _execute_prefix_at_offset(proof_body_offset)
+            if ok:
                 actual_replayed = tactic_idx
+            else:
+                error_msg = f"Prefix replay failed: {prefix_err}"
+
+                # Best-effort recovery for broken proofs: find nearest earlier
+                # prefix that still executes, then keep that state/goals.
+                low = step_before_end
+                high = proof_body_offset
+                best = step_before_end
+                attempts = 0
+                while high - low > 1 and attempts < 12:
+                    mid = (low + high) // 2
+                    mid_ok, _ = await _execute_prefix_at_offset(mid)
+                    if mid_ok:
+                        best = mid
+                        low = mid
+                    else:
+                        high = mid
+                    attempts += 1
+
+                if best > step_before_end:
+                    best_ok, best_err = await _execute_prefix_at_offset(best)
+                    if best_ok:
+                        actual_replayed = sum(1 for step in self._step_plan if step.end <= best)
+                        error_msg = (
+                            f"Prefix replay failed at requested position: {prefix_err}; "
+                            f"using nearest valid prefix at offset {best}."
+                        )
+                    elif best_err and not error_msg:
+                        error_msg = f"Prefix replay failed: {best_err}"
         else:
             # Step boundary: try O(1) checkpoint path
             if self._is_checkpoint_valid(self._active_theorem) and thm.proof_body:
