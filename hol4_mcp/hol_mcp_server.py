@@ -149,7 +149,15 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None) -> st
     if not session.is_running:
         return f"ERROR: HOL failed to start. Output: {result}"
 
-    # Register session
+    # Register session. Handle concurrent hol_start(name=...) calls:
+    # if another caller already registered a running session, stop this one
+    # and return the existing session state.
+    existing = _sessions.get(name)
+    if existing and existing.session.is_running:
+        await session.stop()
+        goals = await existing.session.send("top_goals();", timeout=10)
+        return f"Session '{name}' already running.\n\n=== Goals ===\n{goals}"
+
     _sessions[name] = SessionEntry(session, datetime.now(), workdir_path, env=env)
 
     return f"Session '{name}' started. {result}\nWorkdir: {workdir_path}"
@@ -629,7 +637,9 @@ async def _init_file_cursor(
                     s = None
 
     if not s or not s.is_running:
-        start_result = await hol_start.fn(workdir=str(target_workdir), name=session)
+        # Preserve per-session HOL env (e.g., VFMDIR) across auto-restarts.
+        start_env = entry.env if entry else None
+        start_result = await hol_start.fn(workdir=str(target_workdir), name=session, env=start_env)
         if start_result.startswith("ERROR"):
             return start_result
         s = _get_session(session)

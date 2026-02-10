@@ -21,6 +21,7 @@ from hol4_mcp.hol_mcp_server import (
     hol_file_status as _hol_file_status,
     hol_check_proof as _hol_check_proof,
     _kill_process_group,
+    _sessions,
 )
 
 # Unwrap FunctionTool to get actual functions
@@ -70,6 +71,30 @@ async def test_session_lifecycle(workdir):
     finally:
         result = await hol_stop(session="test")
         assert "Session 'test' stopped" in result
+
+
+async def test_hol_start_concurrent_same_name_is_singleton(tmp_path):
+    """Concurrent hol_start calls for same name should not leak extra HOL sessions."""
+    session = "start_race_test"
+    workdir = str(tmp_path)
+
+    await hol_stop(session=session)
+    try:
+        r1, r2 = await asyncio.gather(
+            hol_start(workdir=workdir, name=session),
+            hol_start(workdir=workdir, name=session),
+        )
+
+        started = sum("started" in r.lower() for r in (r1, r2))
+        already = sum("already running" in r.lower() for r in (r1, r2))
+        assert started == 1
+        assert already == 1
+
+        sessions = await hol_sessions()
+        # Exactly one registry entry for this session name
+        assert sessions.count(session) == 1
+    finally:
+        await hol_stop(session=session)
 
 
 async def test_goaltree_raw_hol_send(workdir):
@@ -279,6 +304,37 @@ async def test_file_init_restarts_on_workdir_change(tmp_path):
         assert "dirA" not in sessions or "workdir_test" not in sessions.split("dirA")[0]
     finally:
         await hol_stop(session="workdir_test")
+
+
+async def test_file_init_restart_preserves_session_env(tmp_path):
+    """Auto-restart in hol_file_init should preserve session env (e.g., VFMDIR)."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    session = "env_preserve_test"
+    env = {"VFMDIR": "/tmp/vfm"}
+
+    await hol_stop(session=session)
+    try:
+        # Start with env and initialize cursor
+        start_result = await hol_start(workdir=str(tmp_path), name=session, env=env)
+        assert "started" in start_result.lower()
+
+        init_result = await hol_file_init(file=str(test_file), session=session)
+        assert "Theorems:" in init_result
+        assert _sessions[session].env == env
+
+        # Edit file to trigger auto-restart path in _init_file_cursor
+        content = test_file.read_text()
+        test_file.write_text(content + "\n(* trigger restart *)\n")
+
+        init_result2 = await hol_file_init(file=str(test_file), session=session)
+        assert "Theorems:" in init_result2
+
+        # Env must survive restart.
+        assert _sessions[session].env == env
+    finally:
+        await hol_stop(session=session)
 
 
 async def test_state_at_returns_goals(tmp_path):
