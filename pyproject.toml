@@ -18,7 +18,12 @@ build-backend = "hatchling.build"
 packages = ["hol4_mcp"]
 
 [tool.hatch.build.targets.sdist]
-include = ["hol4_mcp/**/*.ts"]
+include = [
+    "hol4_mcp/**/*.py",
+    "hol4_mcp/**/*.ts",
+    "pyproject.toml",
+    "LICENSE",
+]
 
 [tool.hatch.build.targets.wheel.force-include]
 "hol4_mcp/pi_extension/hol4-mcp.ts" = "hol4_mcp/pi_extension/hol4-mcp.ts"

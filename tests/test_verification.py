@@ -310,6 +310,32 @@ QED
     assert cursor.status["loaded_to_line"] == 0
 
 
+@pytest.mark.asyncio
+async def test_init_fails_on_missing_file_load_statement(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Regression: `load "..."` missing-file errors must be treated as fatal context failures."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""\
+load "definitely_missing";
+
+Theorem t:
+  T
+Proof
+  simp[]
+QED
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    result = await cursor.init()
+
+    assert "error" in result
+    assert result["error"].startswith("Failed to load context:")
+    assert "Missing dependency file:" in result["error"]
+    assert "definitely_missing.ui" in result["error"]
+
+    # Fatal pre-content failure must not mark file as loaded.
+    assert cursor.status["loaded_to_line"] == 0
+
+
 def test_format_context_error_includes_env_var_recovery_steps():
     output = '''
 error in load stableswapDefsTheory : Fail "Cannot find file $(VFMDIR)/spec/prop/vfmComputeTheory.ui"

@@ -866,7 +866,10 @@ async def hol_check_proof(
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
     # Re-parse file to pick up edits
-    cursor._reparse_if_changed()
+    try:
+        cursor._reparse_if_changed()
+    except FileNotFoundError:
+        return f"ERROR: File not found: {cursor.file}"
 
     # Enter theorem and get step plan
     enter_result = await cursor.enter_theorem(theorem)

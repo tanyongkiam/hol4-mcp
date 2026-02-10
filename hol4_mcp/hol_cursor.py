@@ -86,26 +86,28 @@ def _is_hol_error(output: str) -> bool:
 
 def _is_fatal_hol_error(output: str) -> bool:
     """Check if HOL output indicates a fatal error that prevents further loading.
-    
-    Unlike _is_hol_error, this ignores proof/tactic failures (HOL_ERR from by/prove)
-    since those just mean a theorem wasn't defined but don't break the session.
-    
-    Returns True only for:
+
+    Unlike _is_hol_error, this ignores normal proof/tactic failures (HOL_ERR from
+    proving) since those only mean a theorem wasn't established.
+
+    Returns True for:
     - TIMEOUT
-    - Poly/ML syntax errors ("poly: : error:")
-    - Static errors (parse/type errors)
-    
-    Returns False for:
-    - HOL_ERR from proof failures (theorem just won't be defined)
-    - Tactic Fail (same)
+    - Poly/ML syntax/type errors
+    - Static Errors
+    - Missing-file/load failures (environment/dependency setup problems)
     """
     if output.startswith("TIMEOUT"):
         return True
-    # Poly/ML syntax/parse errors are fatal
+    # Poly/ML syntax/parse/type errors are fatal
     if "poly: : error:" in output.lower():
         return True
     # "Static Errors" from Poly/ML parser
     if "Static Errors" in output:
+        return True
+    # Dependency/setup failures during context loading are fatal
+    if "Cannot find file" in output:
+        return True
+    if "error in load " in output:
         return True
     return False
 

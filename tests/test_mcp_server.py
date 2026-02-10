@@ -441,6 +441,24 @@ async def test_state_at_after_file_edit(tmp_path):
         await hol_stop(session="edit_test")
 
 
+async def test_check_proof_deleted_file_returns_error(tmp_path):
+    """Regression: hol_check_proof should return an ERROR, not raise, when file was deleted."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+
+    session = "deleted_file_check_test"
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+        test_file.unlink()
+
+        result = await hol_check_proof(
+            theorem="add_zero", file=str(test_file), session=session
+        )
+        assert result.startswith("ERROR: File not found:")
+    finally:
+        await hol_stop(session=session)
+
+
 async def test_state_at_uses_checkpoint_on_repeat(tmp_path):
     """Test that state_at uses checkpoint on second call (O(1) access)."""
     test_file = tmp_path / "testScript.sml"
