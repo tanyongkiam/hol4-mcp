@@ -777,6 +777,67 @@ async def test_check_proof_substeps_for_big_step(tmp_path):
         await hol_stop(session=session)
 
 
+# Broken replay script: first tactic succeeds, second tactic fails.
+BROKEN_TWO_STEP_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "broken2";
+
+Theorem broken_two_step:
+  T /\\ T
+Proof
+  conj_tac
+  >> FAIL_TAC "boom"
+QED
+
+val _ = export_theory();
+'''
+
+
+async def test_state_at_broken_two_step_start_does_not_over_replay(tmp_path):
+    """state_at at proof start should not run later failing tactics.
+
+    Regression: checkpoint-building path replayed whole proof, so a failure in
+    a later tactic polluted the state at an earlier position.
+    """
+    test_file = tmp_path / "brokenTwoStepScript.sml"
+    test_file.write_text(BROKEN_TWO_STEP_SCRIPT)
+    session = "broken_two_step_start_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # Start of proof body (before any tactic)
+        r = await hol_state_at(session=session, line=8, col=3)
+        assert "Tactic 0/2" in r
+        assert "ERROR: Tactic replay failed" not in r
+        # Should show the original single goal, not post-conj_tac subgoals
+        assert "T /\\ T" in r or "T ∧ T" in r
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_state_at_broken_two_step_qed_reports_stuck_location(tmp_path):
+    """state_at on QED for broken proof should report last good location.
+
+    Regression: replay failures returned tactics_replayed=0 and blank location.
+    """
+    test_file = tmp_path / "brokenTwoStepScript.sml"
+    test_file.write_text(BROKEN_TWO_STEP_SCRIPT)
+    session = "broken_two_step_qed_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # QED line: replay should fail at second tactic, but report progress.
+        r = await hol_state_at(session=session, line=10, col=1)
+        assert "ERROR" in r
+        assert "Stuck at line" in r
+        assert "Tactic 1/2" in r
+    finally:
+        await hol_stop(session=session)
+
+
 # =============================================================================
 # Process Group Tests
 # =============================================================================

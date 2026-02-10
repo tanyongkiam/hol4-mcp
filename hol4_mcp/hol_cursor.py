@@ -1037,28 +1037,68 @@ class FileProofCursor:
 
         # Two paths for navigation:
         # 1. Checkpoint path: O(1) to step boundaries via checkpoint + backup_n
-        # 2. Prefix path: O(n) for fine-grained positions via sliceTacticBlock
+        # 2. Prefix/targeted replay path for fine-grained positions or broken proofs
         #
         # For fine-grained positions (need_partial=true), use prefix replay directly.
-        # This handles ThenLT proofs correctly and also works for broken proofs.
-        
-        used_checkpoint = False
-        
-        if need_partial and thm.proof_body:
-            # Fine-grained position: use prefix replay from theorem start
-            # This correctly handles ThenLT semantics via sliceTacticBlock
+        # For step boundaries without a checkpoint, replay only up to requested step
+        # (not the full proof) so later broken tactics don't corrupt earlier states.
+
+        async def _reset_goal_state() -> str | None:
+            """Drop all goals and set theorem goal. Returns error string on failure."""
             await self.session.send('drop_all();', timeout=5)
             goal = thm.goal.replace('\n', ' ').strip()
             gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
             if _is_hol_error(gt_result):
                 self._proof_initialized = False
+                return f"Failed to set up goal: {gt_result[:300]}"
+            self._proof_initialized = True
+            return None
+
+        async def _replay_with_fallback(cmds: list[str], batch_timeout: int) -> tuple[int, str | None]:
+            """Replay commands; on batch failure, replay one-by-one to recover progress."""
+            if not cmds:
+                return 0, None
+
+            batch_cmds = "".join(cmds)
+            if not batch_cmds.strip():
+                return 0, None
+
+            result = await self.session.send(batch_cmds, timeout=batch_timeout)
+            if not _is_hol_error(result):
+                return len(cmds), None
+
+            # Batch failed: recover last good state by replaying step-by-step.
+            # This keeps hol_state_at useful on broken proofs.
+            setup_err = await _reset_goal_state()
+            if setup_err:
+                return 0, setup_err
+
+            replayed = 0
+            step_timeout = self._tactic_timeout or 30
+            for cmd in cmds:
+                step_result = await self.session.send(cmd, timeout=step_timeout)
+                if _is_hol_error(step_result):
+                    if step_result.startswith("TIMEOUT"):
+                        return replayed, f"Tactic replay timed out (>{step_timeout}s)"
+                    return replayed, f"Tactic replay failed: {step_result[:200]}"
+                replayed += 1
+
+            # Shouldn't happen, but keep original batch error if fallback fully succeeds.
+            return replayed, f"Tactic replay failed: {result[:200]}"
+
+        used_checkpoint = False
+
+        if need_partial and thm.proof_body:
+            # Fine-grained position: use prefix replay from theorem start
+            # This correctly handles ThenLT semantics via sliceTacticBlock
+            setup_err = await _reset_goal_state()
+            if setup_err:
                 return StateAtResult(
                     goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
                     tactics_total=total_tactics, file_hash=self._content_hash,
-                    error=f"Failed to set up goal: {gt_result[:300]}"
+                    error=setup_err
                 )
-            self._proof_initialized = True
-            
+
             # Get prefix command from start to current position
             prefix_result = await self.session.send(
                 f'prefix_commands_json "{escaped_body}" {proof_body_offset};',
@@ -1069,7 +1109,7 @@ class FileProofCursor:
             except HOLParseError as e:
                 error_msg = f"Failed to get prefix commands: {e}"
                 prefix_cmd = ""
-            
+
             if prefix_cmd.strip() and not error_msg:
                 result = await self.session.send(prefix_cmd, timeout=self._tactic_timeout or 30)
                 if _is_hol_error(result):
@@ -1084,39 +1124,35 @@ class FileProofCursor:
                     actual_replayed = tactic_idx
 
             if not used_checkpoint:
-                # Build checkpoint: replay all steps, then backup
-                await self.session.send('drop_all();', timeout=5)
-                goal = thm.goal.replace('\n', ' ').strip()
-                gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
-                if _is_hol_error(gt_result):
-                    self._proof_initialized = False
+                setup_err = await _reset_goal_state()
+                if setup_err:
                     return StateAtResult(
                         goals=[], tactic_idx=tactic_idx, tactics_replayed=0,
                         tactics_total=total_tactics, file_hash=self._content_hash,
-                        error=f"Failed to set up goal: {gt_result[:300]}"
+                        error=setup_err
                     )
-                self._proof_initialized = True
 
                 if thm.proof_body and total_tactics > 0:
-                    # Execute all steps as batch for checkpoint building
-                    step_cmds = "".join(step.cmd for step in self._step_plan)
-
-                    if step_cmds.strip():
+                    # If user asks for proof end, replay full theorem and checkpoint on success.
+                    # Otherwise replay only requested prefix to avoid failures in later tactics.
+                    if tactic_idx == total_tactics:
+                        cmds = [step.cmd for step in self._step_plan]
                         batch_timeout = max(30, int(self._tactic_timeout * total_tactics)) if self._tactic_timeout else 300
-                        result = await self.session.send(step_cmds, timeout=batch_timeout)
-                        if _is_hol_error(result):
-                            if result.startswith("TIMEOUT"):
-                                error_msg = f"Tactic replay timed out (>{batch_timeout}s)"
-                            else:
-                                error_msg = f"Tactic replay failed: {result[:200]}"
-                        else:
-                            # Save checkpoint at proof end
+                        replayed, replay_error = await _replay_with_fallback(cmds, batch_timeout)
+                        actual_replayed = replayed
+                        error_msg = replay_error
+
+                        if replay_error is None:
+                            # Save checkpoint at proof end for O(1) future access
                             await self._save_end_of_proof_checkpoint(self._active_theorem, total_tactics)
-                            # Backup to target position
-                            backups_needed = total_tactics - tactic_idx
-                            if backups_needed > 0:
-                                await self.session.send(f'backup_n {backups_needed};', timeout=30)
-                            actual_replayed = tactic_idx
+                    else:
+                        cmds = [step.cmd for step in self._step_plan[:tactic_idx]]
+                        # Prefix replay timeout scales with commands actually replayed
+                        replay_steps = max(1, tactic_idx)
+                        batch_timeout = max(30, int(self._tactic_timeout * replay_steps)) if self._tactic_timeout else 300
+                        replayed, replay_error = await _replay_with_fallback(cmds, batch_timeout)
+                        actual_replayed = replayed
+                        error_msg = replay_error
 
         timings['replay'] = time.perf_counter() - t3
         timings['used_checkpoint'] = 1.0 if used_checkpoint else 0.0

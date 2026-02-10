@@ -720,8 +720,10 @@ async def hol_state_at(
 
     # Helper to convert tactic index to line:col
     def tactic_to_loc(idx):
-        if not thm or not thm.proof_body or idx <= 0:
+        if not thm:
             return None
+        if not thm.proof_body or idx <= 0:
+            return (thm.proof_start_line, 1)
         if idx > len(cursor._step_plan):
             idx = len(cursor._step_plan)
         if idx > 0:
