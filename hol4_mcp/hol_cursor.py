@@ -112,27 +112,71 @@ def _is_fatal_hol_error(output: str) -> bool:
 
 def _format_context_error(output: str) -> str:
     """Format a context loading error with actionable suggestions.
-    
+
     Detects common patterns and provides helpful messages:
-    - Missing Structure/signature -> suggest Holmake
-    - Timeout -> suggest simplifying or checking loops
+    - Missing Structure/signature -> dependency/setup hints
+    - Missing file with $(VAR) -> env var + restart guidance
+    - Timeout -> simplify or increase timeout
     """
+    def _missing_file_hint(text: str) -> str | None:
+        file_match = re.search(r'Cannot find file\s+"?([^"\n]+)"?', text)
+        if not file_match:
+            return None
+
+        missing_file = file_match.group(1).strip()
+        env_vars = sorted(set(re.findall(r'\$\(([^)]+)\)', missing_file)))
+
+        if env_vars:
+            var = env_vars[0]
+            return (
+                f"Missing dependency file: {missing_file}\n"
+                f"Likely cause: unresolved env var $({var}) in Holmakefile INCLUDES\n"
+                f"  Fix:\n"
+                f"    1) holmake(workdir=..., env={{\"{var}\": \"/abs/path\"}})\n"
+                f"    2) hol_setenv(env={{\"{var}\": \"/abs/path\"}})\n"
+                f"    3) hol_restart(session=...)"
+            )
+
+        return (
+            f"Missing dependency file: {missing_file}\n"
+            "  Hint: run 'Holmake' in the script workdir to build dependencies"
+        )
+
     # Missing structure: "Structure (X) has not been declared"
     match = re.search(r'Structure \((\w+)\) has not been declared', output)
     if match:
         struct = match.group(1)
-        return f"Missing dependency: {struct}\n  Hint: run 'Holmake' to build dependencies"
-    
+        file_hint = _missing_file_hint(output)
+        if file_hint:
+            return f"Missing dependency: {struct}\n{file_hint}"
+        return (
+            f"Missing dependency: {struct}\n"
+            "  Hint: run 'Holmake' to build dependencies.\n"
+            "  If INCLUDES uses $(...) variables, set them via holmake env + hol_setenv, then hol_restart."
+        )
+
     # Missing signature: "Signature (X) has not been declared"
     match = re.search(r'Signature \((\w+)\) has not been declared', output)
     if match:
         sig = match.group(1)
-        return f"Missing dependency: {sig}\n  Hint: run 'Holmake' to build dependencies"
-    
+        file_hint = _missing_file_hint(output)
+        if file_hint:
+            return f"Missing dependency: {sig}\n{file_hint}"
+        return (
+            f"Missing dependency: {sig}\n"
+            "  Hint: run 'Holmake' to build dependencies.\n"
+            "  If INCLUDES uses $(...) variables, set them via holmake env + hol_setenv, then hol_restart."
+        )
+
+    # Missing file (without structure/signature wrapper)
+    file_hint = _missing_file_hint(output)
+    if file_hint:
+        return file_hint
+
     # Timeout
     if output.startswith("TIMEOUT"):
         return "Timeout loading context\n  Hint: check for infinite loops or increase timeout"
-    
+
     # Generic: truncate raw output
     return output[:300]
 
@@ -667,7 +711,13 @@ class FileProofCursor:
         await self._save_deps_checkpoint()
 
         # Load file content (definitions, theorems) into session
-        await self._load_remaining_content()
+        load_error = await self._load_remaining_content()
+        if load_error:
+            return {
+                "theorems": [],
+                "cheats": [],
+                "error": load_error,
+            }
 
         # Save base checkpoint for fast theorem navigation
         await self.session.send('drop_all();', timeout=5)
@@ -678,18 +728,17 @@ class FileProofCursor:
             "cheats": cheats,
         }
 
-    async def _load_remaining_content(self) -> None:
-        """Load remaining file content after verification, theorem by theorem.
-        
-        Handles broken proofs gracefully by loading each theorem separately.
-        This ensures that a proof failure in one theorem doesn't prevent
-        loading of subsequent definitions/theorems.
+    async def _load_remaining_content(self) -> str | None:
+        """Load remaining file content, theorem-by-theorem.
+
+        Returns:
+            Error message if a fatal load error occurs, else None.
         """
         content_lines = self._content.split('\n')
-        
+
         # Find theorems we haven't loaded yet
         remaining_thms = [t for t in self._theorems if t.proof_end_line > self._loaded_to_line]
-        
+
         for thm in remaining_thms:
             # Load any content between current position and theorem start
             if thm.start_line > self._loaded_to_line:
@@ -697,17 +746,21 @@ class FileProofCursor:
                 start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
                 to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
                 if to_load.strip():
-                    await self.session.send(to_load, timeout=60)
+                    result = await self.session.send(to_load, timeout=60)
+                    if _is_fatal_hol_error(result):
+                        return f"Failed to load context: {_format_context_error(result)}"
                 self._loaded_to_line = thm.start_line
-            
+
             # Load the theorem (header through QED)
             thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
             if thm_content.strip():
-                # Ignore errors - proof failures are expected for broken cheat theorems
-                await self.session.send(thm_content, timeout=60)
+                # Allow proof failures (broken/cheat theorems), but stop on fatal errors
+                result = await self.session.send(thm_content, timeout=60)
+                if _is_fatal_hol_error(result):
+                    return f"Failed to load context: {_format_context_error(result)}"
             # proof_end_line is "line after QED" (1-indexed); we loaded through QED
             self._loaded_to_line = thm.proof_end_line
-        
+
         # Load any trailing content after last theorem
         last_thm = self._theorems[-1] if self._theorems else None
         if last_thm:
@@ -716,11 +769,14 @@ class FileProofCursor:
                 start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
                 trailing = '\n'.join(content_lines[start_idx:])
                 if trailing.strip():
-                    await self.session.send(trailing, timeout=60)
+                    result = await self.session.send(trailing, timeout=60)
+                    if _is_fatal_hol_error(result):
+                        return f"Failed to load context: {_format_context_error(result)}"
                 self._loaded_to_line = total_lines + 1
 
         # Track content hash so _check_stale_state works correctly
         self._loaded_content_hash = self._content_hash
+        return None
 
     async def _load_context_to_line(self, target_line: int, timeout: float = 300, strict: bool = False) -> str | None:
         """Load file content up to target_line into HOL session.

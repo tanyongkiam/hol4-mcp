@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from hol4_mcp.hol_cursor import FileProofCursor
+from hol4_mcp.hol_cursor import FileProofCursor, _format_context_error
 from hol4_mcp.hol_session import HOLSession
 
 
@@ -279,3 +279,54 @@ QED
     assert len(trace2) > 0
     assert trace2[-1].goals_after == 0, "post-QED content not loaded (Definition/val after QED skipped)"
     assert trace2[-1].error is None
+
+
+@pytest.mark.asyncio
+async def test_init_fails_on_fatal_pre_theorem_load_error(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Regression: fatal pre-theorem load errors must fail init (not silently advance loaded_to_line)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""\
+open definitelyMissingTheory;
+
+Definition pre_def:
+  pre_const = T
+End
+
+Theorem uses_pre_def:
+  pre_const
+Proof
+  simp[pre_def]
+QED
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    result = await cursor.init()
+
+    assert "error" in result
+    assert result["error"].startswith("Failed to load context:")
+    assert "Missing dependency:" in result["error"]
+
+    # Fatal pre-content failure must not mark file as loaded.
+    assert cursor.status["loaded_to_line"] == 0
+
+
+def test_format_context_error_includes_env_var_recovery_steps():
+    output = '''
+error in load stableswapDefsTheory : Fail "Cannot find file $(VFMDIR)/spec/prop/vfmComputeTheory.ui"
+Exception- Fail "Cannot find file $(VFMDIR)/spec/prop/vfmComputeTheory.ui" raised
+'''
+    msg = _format_context_error(output)
+
+    assert "Missing dependency file:" in msg
+    assert "$(VFMDIR)" in msg
+    assert "holmake(workdir=..., env={\"VFMDIR\": \"/abs/path\"})" in msg
+    assert "hol_setenv(env={\"VFMDIR\": \"/abs/path\"})" in msg
+    assert "hol_restart(session=...)" in msg
+
+
+def test_format_context_error_structure_fallback_mentions_env_vars():
+    output = "poly: : error: Structure (fooTheory) has not been declared\nStatic Errors"
+    msg = _format_context_error(output)
+
+    assert "Missing dependency: fooTheory" in msg
+    assert "hol_setenv" in msg
