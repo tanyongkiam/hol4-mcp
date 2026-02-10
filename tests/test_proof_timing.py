@@ -96,6 +96,9 @@ QED
     assert hasattr(entry, 'goals_before')
     assert hasattr(entry, 'goals_after')
     assert hasattr(entry, 'error')
+    assert hasattr(entry, 'start_offset')
+    assert hasattr(entry, 'end_offset')
+    assert entry.end_offset is not None
     assert entry.error is None  # Successful tactic has no error
 
 

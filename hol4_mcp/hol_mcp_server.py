@@ -1139,7 +1139,7 @@ async def hol_trace_proof(
         workdir: Working directory for HOL (used with file)
         session: Session name (default: "default")
 
-    Returns: Full trace with timing for each tactic
+    Returns: Full trace with line/col ranges and timing for each tactic
     """
     cursor = _get_cursor(session)
 
@@ -1162,13 +1162,38 @@ async def hol_trace_proof(
     if not trace:
         return f"No trace data. Theorem '{theorem}' may not exist or has no tactics."
 
+    thm = cursor._get_theorem(theorem)
+
+    # Convert offset within proof_body to source line/col
+    def offset_to_pos(offset):
+        if not thm or offset is None or offset < 0:
+            return None
+        if not thm.proof_body:
+            return (thm.proof_start_line, 1)
+        offset = min(offset, len(thm.proof_body))
+        before = thm.proof_body[:offset]
+        line = thm.proof_start_line + before.count('\n')
+        last_nl = before.rfind('\n')
+        col = offset - last_nl if last_nl >= 0 else offset + 1
+        return line, col
+
     lines = [f"Proof trace for {theorem}: {len(trace)} steps", ""]
 
     total_real = 0
     has_error = False
     for i, entry in enumerate(trace, 1):
         total_real += entry.real_ms
-        lines.append(f"Step {i}: {entry.cmd[:60]}{'...' if len(entry.cmd) > 60 else ''}")
+        start_pos = offset_to_pos(entry.start_offset)
+        end_pos = offset_to_pos(entry.end_offset)
+        loc = None
+        if start_pos and end_pos:
+            loc = f"line/col {start_pos[0]}:{start_pos[1]}-{end_pos[0]}:{end_pos[1]}"
+
+        header = f"Step {i}"
+        if loc:
+            header += f" ({loc})"
+        lines.append(f"{header}: {entry.cmd[:60]}{'...' if len(entry.cmd) > 60 else ''}")
+
         if entry.error:
             lines.append(f"  ERROR: {entry.error}")
             has_error = True

@@ -226,13 +226,15 @@ class StateAtResult:
 @dataclass
 class TraceEntry:
     """Single entry in a proof timing trace."""
-    cmd: str                  # Command that was executed
-    real_ms: int             # Real time in milliseconds
-    usr_ms: int              # User CPU time in milliseconds
-    sys_ms: int              # System CPU time in milliseconds
-    goals_before: int        # Number of goals before execution
-    goals_after: int         # Number of goals after execution
-    error: str | None = None  # Error message if tactic failed
+    cmd: str                    # Command that was executed
+    real_ms: int                # Real time in milliseconds
+    usr_ms: int                 # User CPU time in milliseconds
+    sys_ms: int                 # System CPU time in milliseconds
+    goals_before: int           # Number of goals before execution
+    goals_after: int            # Number of goals after execution
+    error: str | None = None    # Error message if tactic failed
+    start_offset: int | None = None  # Start offset in theorem proof_body
+    end_offset: int | None = None    # End offset in theorem proof_body
 
 
 @dataclass
@@ -1244,16 +1246,21 @@ class FileProofCursor:
         # Parse response into TraceEntry list
         parsed = _find_json_line(result)
         trace = []
+        steps = [step for step in self._step_plan if step.cmd.strip()]
         if 'ok' in parsed:
             for i, entry in enumerate(parsed['ok'].get('trace', [])):
                 cmd = tactics[i] if i < len(tactics) else ""
+                start_offset = steps[i - 1].end if i > 0 and i - 1 < len(steps) else 0
+                end_offset = steps[i].end if i < len(steps) else None
                 trace.append(TraceEntry(
                     cmd=cmd,
                     real_ms=entry.get('real_ms', 0),
                     usr_ms=0, sys_ms=0,
                     goals_before=entry.get('goals_before', 0),
                     goals_after=entry.get('goals_after', 0),
-                    error=entry.get('err')
+                    error=entry.get('err'),
+                    start_offset=start_offset,
+                    end_offset=end_offset,
                 ))
         elif 'err' in parsed:
             trace.append(TraceEntry(
@@ -1355,16 +1362,21 @@ class FileProofCursor:
             # Parse response and convert to TraceEntry list
             parsed = _find_json_line(result)
             trace = []
+            steps = [step for step in step_plan if step.cmd.strip()]
             if 'ok' in parsed:
                 for i, entry in enumerate(parsed['ok'].get('trace', [])):
                     cmd = tactics[i] if i < len(tactics) else ""
+                    start_offset = steps[i - 1].end if i > 0 and i - 1 < len(steps) else 0
+                    end_offset = steps[i].end if i < len(steps) else None
                     trace.append(TraceEntry(
                         cmd=cmd,
                         real_ms=entry.get('real_ms', 0),
                         usr_ms=0, sys_ms=0,
                         goals_before=entry.get('goals_before', 0),
                         goals_after=entry.get('goals_after', 0),
-                        error=entry.get('err')
+                        error=entry.get('err'),
+                        start_offset=start_offset,
+                        end_offset=end_offset,
                     ))
             elif 'err' in parsed:
                 # Goal setup failed - record single error entry
