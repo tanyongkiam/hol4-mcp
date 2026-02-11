@@ -170,6 +170,21 @@ def _format_context_error(output: str) -> str:
             "  If INCLUDES uses $(...) variables, set them via holmake env + hol_setenv, then hol_restart."
         )
 
+    # Missing value/constructor (often forward reference or stale prelude assumptions)
+    match = re.search(r'Value or constructor \(([^)]+)\) has not been declared', output)
+    if match:
+        ident = match.group(1)
+        line_match = re.search(r':(\d+):\s*error:', output)
+        line_hint = f" (line {line_match.group(1)})" if line_match else ""
+        return (
+            f"Unknown identifier: {ident}{line_hint}\n"
+            "  Likely causes:\n"
+            "    - forward reference (used before declaration in file order)\n"
+            "    - earlier theorem failed, so its name was never bound\n"
+            "    - missing prelude/import change (open/load/Theory/Ancestors)\n"
+            "  Hint: run hol_check_proof on earlier theorems and run Holmake to confirm file order/build."
+        )
+
     # Missing file (without structure/signature wrapper)
     file_hint = _missing_file_hint(output)
     if file_hint:

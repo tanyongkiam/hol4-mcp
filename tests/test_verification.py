@@ -356,3 +356,17 @@ def test_format_context_error_structure_fallback_mentions_env_vars():
 
     assert "Missing dependency: fooTheory" in msg
     assert "hol_setenv" in msg
+
+
+def test_format_context_error_value_constructor_forward_ref_hint():
+    output = (
+        "/tmp/fwdNameScript.sml:11: error: Value or constructor (later) has not been declared "
+        "Found near later\n"
+        "error in quse /tmp/fwdNameScript.sml : Fail \"Static Errors\""
+    )
+    msg = _format_context_error(output)
+
+    assert "Unknown identifier: later" in msg
+    assert "line 11" in msg
+    assert "forward reference" in msg
+    assert "hol_check_proof" in msg
