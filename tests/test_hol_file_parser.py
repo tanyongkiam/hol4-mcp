@@ -53,6 +53,27 @@ QED
     assert thms[2].has_cheat == True
 
 
+def test_parse_theorems_with_prime_names():
+    """Theorem/Definition names with trailing prime should be parsed."""
+    content = r'''
+Theorem compile_correct':
+  T
+Proof
+  simp[]
+QED
+
+Definition helper_def':
+  helper' x = x
+Termination
+  WF_REL_TAC `measure I`
+End
+'''
+    thms = parse_theorems(content)
+    names = [t.name for t in thms]
+    assert "compile_correct'" in names
+    assert "helper_def'" in names
+
+
 def test_parse_fixture_file():
     """Test parsing the fixture HOL file."""
     f = FIXTURES_DIR / "testScript.sml"

@@ -606,6 +606,21 @@ val _ = export_theory();
         await hol_stop(session=session)
 
 
+async def test_check_proof_cheat_reports_not_replayed_note(tmp_path):
+    """hol_check_proof should clarify that cheat proofs are not replayed."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+    session = "check_cheat_note_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+        r = await hol_check_proof(theorem="needs_proof", session=session)
+        assert "Status: CHEAT (not verified)" in r
+        assert "not replayed" in r
+    finally:
+        await hol_stop(session=session)
+
+
 async def test_check_proof_deleted_file_returns_error(tmp_path):
     """Regression: hol_check_proof should return an ERROR, not raise, when file was deleted."""
     test_file = tmp_path / "testScript.sml"

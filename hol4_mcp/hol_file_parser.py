@@ -256,7 +256,8 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
     # Pattern for Theorem/Triviality with optional attributes
     # Matches: Theorem name:, Theorem name[simp]:, Triviality foo[local,simp]:
     header_pattern = re.compile(
-        r'^(Theorem|Triviality)\s+(\w+)(?:\s*\[([^\]]*)\])?\s*:',
+        # Name allows SML-style primes, e.g. compile_correct'
+        r"^(Theorem|Triviality)\s+([A-Za-z][A-Za-z0-9_']*)(?:\s*\[([^\]]*)\])?\s*:",
         re.MULTILINE
     )
 
@@ -318,7 +319,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
 
     # Second pass: Definition ... Termination ... End (recursive function proofs)
     def_pattern = re.compile(
-        r'^(Definition)\s+(\w+)(?:\s*\[([^\]]*)\])?\s*:',
+        r"^(Definition)\s+([A-Za-z][A-Za-z0-9_']*)(?:\s*\[([^\]]*)\])?\s*:",
         re.MULTILINE
     )
 

@@ -900,6 +900,8 @@ async def hol_check_proof(
 
     if thm.has_cheat:
         lines.append("Status: CHEAT (not verified)")
+        lines.append("NOTE: Tactics before 'cheat' are not replayed in this mode.")
+        lines.append("      Remove 'cheat' and rerun hol_check_proof for full replay.")
         return "\n".join(lines)
 
     # Execute proof (clean mode by default - matches holmake, uses cache)
