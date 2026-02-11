@@ -552,6 +552,60 @@ val _ = export_theory();
         await hol_stop(session=session)
 
 
+async def test_state_at_with_val_fun_definition_between_theorems(tmp_path):
+    """Regression: hol_state_at should work with val/fun/Definition between theorems."""
+    script = tmp_path / "middefsScript.sml"
+    content = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "middefs";
+
+Theorem first_thm:
+  T
+Proof
+  simp[]
+QED
+
+val mid = TRUTH;
+fun midfun x = x;
+Definition mid_def:
+  mid_const = T
+End
+
+Theorem second_thm:
+  mid_const
+Proof
+  simp[mid_def]
+QED
+
+val _ = export_theory();
+'''
+    script.write_text(content)
+    session = "state_at_middefs_test"
+
+    # Compute key lines dynamically so edits to fixture text don't break the test.
+    lines = content.splitlines()
+    simp_line = next(i + 1 for i, line in enumerate(lines) if "simp[mid_def]" in line)
+    qed_lines = [i + 1 for i, line in enumerate(lines) if line.strip() == "QED"]
+    second_qed_line = qed_lines[-1]
+
+    try:
+        init_result = await hol_file_init(file=str(script), session=session)
+        assert "Theorems: 2" in init_result
+
+        # Inside second theorem proof body.
+        r1 = await hol_state_at(session=session, line=simp_line, col=3)
+        assert "Theorem: second_thm" in r1
+        assert "ERROR" not in r1
+
+        # QED line of second theorem should show completed proof.
+        r2 = await hol_state_at(session=session, line=second_qed_line, col=1)
+        assert "Theorem: second_thm" in r2
+        assert "proof complete" in r2.lower()
+    finally:
+        await hol_stop(session=session)
+
+
 async def test_check_proof_deleted_file_returns_error(tmp_path):
     """Regression: hol_check_proof should return an ERROR, not raise, when file was deleted."""
     test_file = tmp_path / "testScript.sml"
