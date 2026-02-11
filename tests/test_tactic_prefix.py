@@ -511,6 +511,16 @@ class TestStepPlan:
         result = await call_step_plan(hol_session, "simp[]")
         assert len(result) == 1
 
+    async def test_empty_proof_body_returns_no_steps(self, hol_session):
+        """Empty proof body should return no executable steps."""
+        result = await call_step_plan(hol_session, "")
+        assert result == []
+
+    async def test_comment_only_returns_no_steps(self, hol_session):
+        """Comments/whitespace-only body should return no executable steps."""
+        result = await call_step_plan(hol_session, "(* just a comment *)")
+        assert result == []
+
     async def test_matches_tactic_steps(self, hol_session):
         """step_plan should return same step count as tactic_steps."""
         tactic = "simp[] >> rpt strip_tac >> gvs[]"
@@ -546,6 +556,19 @@ class TestStepPlan:
         """`by` in >> chain should be one step."""
         result = await call_step_plan(hol_session, "rpt strip_tac >> `P` by simp[] >> fs[]")
         assert len(result) == 3
+
+    async def test_every_block_not_forced_atomic_by_coverage_heuristic(self, hol_session):
+        """Regression: EVERY [...] should not be forced to one atomic step.
+
+        Previously step_plan_json used a parseCoverage<0.9 heuristic and
+        incorrectly collapsed some valid parses (e.g., EVERY lists) into a
+        single raw e(full_proof) step.
+        """
+        result = await call_step_plan(hol_session, "EVERY [strip_tac, simp[], fs[]]")
+        assert len(result) == 3
+        assert "strip_tac" in result[0].cmd
+        assert "simp" in result[1].cmd
+        assert "fs" in result[2].cmd
 
     async def test_commands_are_valid_e_or_eall_calls(self, hol_session):
         """Each cmd should be a valid e() or eall() command."""

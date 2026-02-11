@@ -442,24 +442,13 @@ fun step_plan proofBody =
 fun step_plan_json proofBody =
   let
     val steps = step_plan proofBody
-    val fullEnd = String.size proofBody
-    
-    (* Check if parser covered the full proof body.
-       TacticParse can fail on complex quotations like `do...od`.
-       If last step ends significantly before proof end, fall back to atomic.
-       Use raw proof body wrapped in e() since sliceTacticBlock also fails. *)
-    val lastEnd = case steps of [] => 0 | _ => #1 (List.last steps)
-    val parseCoverage = Real.fromInt lastEnd / Real.fromInt fullEnd
-    
-    val finalSteps = 
-      if parseCoverage < 0.9 then
-        (* Parser didn't cover full proof - use raw proof body *)
-        [(fullEnd, "e(" ^ proofBody ^ ");\n")]
-      else steps
-    
+
+    (* No synthetic fallback here.
+       If there are no executable steps (e.g., empty body/comments-only),
+       return []. Parse errors still surface via {"err":...} through handler. *)
     fun stepToJson (endOff, cmd) =
       "{\"end\":" ^ json_int endOff ^ ",\"cmd\":" ^ json_string cmd ^ "}"
-    val stepsJson = "[" ^ String.concatWith "," (map stepToJson finalSteps) ^ "]"
+    val stepsJson = "[" ^ String.concatWith "," (map stepToJson steps) ^ "]"
   in
     print (json_ok stepsJson ^ "\n")
   end
