@@ -27,12 +27,12 @@ async def test_verify_detects_incomplete_proof(hol_session_tmpdir: HOLSession, t
     script = tmp_path / "testScript.sml"
     script.write_text("""
 Theorem incomplete_proof:
-  T /\\ T
+  !x:num. x < x + 1 /\\ x < x + 2
 Proof
-  ALL_TAC
+  strip_tac
 QED
 """)
-    # ALL_TAC does nothing, leaves goal unchanged
+    # strip_tac removes the quantifier but leaves conjuncts unsolved
     
     cursor = FileProofCursor(script, hol_session_tmpdir)
     await cursor.init()
@@ -145,7 +145,7 @@ async def test_verify_failed_theorem_not_stored(hol_session_tmpdir: HOLSession, 
 Theorem broken:
   F
 Proof
-  ALL_TAC
+  simp[]
 QED
 
 Theorem tries_to_use_broken:
