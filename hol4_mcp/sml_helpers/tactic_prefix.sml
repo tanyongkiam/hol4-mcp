@@ -467,7 +467,8 @@ fun timed_step_json cmd =
     val goals_before = length (top_goals()) handle _ => 0
     val start_real = Timer.startRealTimer()
     val start_cpu = Timer.startCPUTimer()
-    val _ = smlExecute.quse_string cmd
+    val ok = smlExecute.quse_string cmd
+    val _ = if not ok then raise Fail ("Tactic execution failed: " ^ cmd) else ()
     val real_ms = Time.toMilliseconds (Timer.checkRealTimer start_real)
     val cpu = Timer.checkCPUTimer start_cpu
     val usr_ms = Time.toMilliseconds (#usr cpu)
@@ -498,13 +499,19 @@ fun verify_theorem_json goal name tactics store timeout_sec =
       let
         val goals_before = length (top_goals()) handle _ => 0
         val start = Timer.startRealTimer()
-        val _ = smlTimeout.timeout timeout_sec (fn () => smlExecute.quse_string cmd) ()
+        val ok = smlTimeout.timeout timeout_sec (fn () => smlExecute.quse_string cmd) ()
         val real_ms = Time.toMilliseconds (Timer.checkRealTimer start)
         val goals_after = length (top_goals()) handle _ => 0
       in
-        (SOME ("{\"real_ms\":" ^ LargeInt.toString real_ms ^
-               ",\"goals_before\":" ^ Int.toString goals_before ^
-               ",\"goals_after\":" ^ Int.toString goals_after ^ "}"), true)
+        if ok then
+          (SOME ("{\"real_ms\":" ^ LargeInt.toString real_ms ^
+                 ",\"goals_before\":" ^ Int.toString goals_before ^
+                 ",\"goals_after\":" ^ Int.toString goals_after ^ "}"), true)
+        else
+          (SOME ("{\"err\":" ^ json_string ("Tactic execution failed: " ^ cmd) ^
+                 ",\"real_ms\":" ^ LargeInt.toString real_ms ^
+                 ",\"goals_before\":" ^ Int.toString goals_before ^
+                 ",\"goals_after\":" ^ Int.toString goals_after ^ "}"), false)
       end
       handle smlTimeout.FunctionTimeout =>
         let val timeout_ms = Real.round (timeout_sec * 1000.0) in
