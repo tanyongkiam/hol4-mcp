@@ -403,12 +403,14 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
     logs_dir = workdir_path / ".hol" / "logs"
 
-    # Snapshot existing log mtimes before build
-    pre_logs = {}
+    # Delete all prior logs so only this run's logs exist afterward.
+    # Holmake only truncates a target's log when that target's job starts,
+    # so stale logs from prior runs would otherwise persist for any target
+    # not reached (e.g. due to timeout or dependency failure).
     if logs_dir.exists():
         for log_file in logs_dir.iterdir():
             if log_file.is_file():
-                pre_logs[log_file.name] = log_file.stat().st_mtime
+                log_file.unlink()
 
     cmd = [str(holmake_bin), "--qof"]
     if target:
@@ -474,7 +476,11 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 continue  # Keep polling
 
         if timed_out:
-            return f"ERROR: Build timed out after {timeout}s."
+            return (
+                f"ERROR: Build timed out after {timeout}s.\n"
+                "WARNING: Any existing .hol/logs/ are from a PRIOR build, not this one. "
+                "Do NOT interpret them as current results."
+            )
 
         output = b''.join(stdout_chunks).decode("utf-8", errors="replace")
 
@@ -489,24 +495,17 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 result += f"\nHOLMAKE_ENV: {json.dumps(env)}"
             return result
 
-        # Build failed - append relevant logs
+        # Build failed - append relevant logs (all logs are from this run)
         result = f"Build failed (exit code {proc.returncode}).\n\n{output}"
 
         if logs_dir.exists():
-            # Find logs modified during build
-            modified = []
-            for log_file in logs_dir.iterdir():
-                if not log_file.is_file():
-                    continue
-                mtime = log_file.stat().st_mtime
-                if log_file.name not in pre_logs or mtime > pre_logs[log_file.name]:
-                    modified.append((log_file, mtime))
-
-            if modified:
-                # Sort by mtime descending (most recent first)
-                modified.sort(key=lambda x: -x[1])
+            logs = sorted(
+                [f for f in logs_dir.iterdir() if f.is_file()],
+                key=lambda f: -f.stat().st_mtime
+            )
+            if logs:
                 result += "\n\n=== Build Logs ===\n"
-                for log_file, _ in modified[:3]:
+                for log_file in logs[:3]:
                     content = log_file.read_text(errors="replace")
                     if len(content) > log_limit:
                         content = f"...(truncated, showing last {log_limit} bytes)...\n" + content[-log_limit:]
@@ -531,7 +530,7 @@ async def hol_log(workdir: str, theory: str, limit: int = 1024) -> str:
         theory: Theory name (e.g., "fooTheory")
         limit: Max bytes to return (default 1024, 0 for unlimited)
 
-    Returns: Log file contents (tail if truncated)
+    Returns: Log file contents (tail if truncated).
     """
     workdir_path = Path(workdir).resolve()
     log_file = workdir_path / ".hol" / "logs" / theory
