@@ -908,6 +908,20 @@ async def hol_check_proof(
     trace = await cursor.execute_proof_traced(theorem)
     
     if not trace:
+        if thm.kind == "Definition" and thm.proof_body:
+            # Definition blocks can't use execute_proof_traced (TC goal context).
+            # Fall back to state_at at the End line to check proof completion.
+            result = await cursor.state_at(thm.proof_end_line - 1, col=1)
+            # "no goals" error from goals_json means proof completed successfully
+            no_goals_ok = result.error and "no goals" in result.error
+            if not result.goals or no_goals_ok:
+                lines.append(f"Status: OK (Definition termination proof)")
+            elif result.error:
+                lines.append(f"Status: FAILED")
+                lines.append(f"Error: {result.error}")
+            else:
+                lines.append(f"Status: INCOMPLETE ({len(result.goals)} goals remaining)")
+            return "\n".join(lines)
         lines.append("Status: NO TACTICS (trivial or unparseable)")
         return "\n".join(lines)
 
@@ -1051,9 +1065,15 @@ async def hol_file_status(file: str = None, workdir: str = None, timing: bool = 
                     verified.append(thm['name'])
                     timing_lines.append(f"  {thm['name']}: {thm_ms}ms")
             else:
-                timing_lines.append(f"  {thm['name']}: (no tactics)")
-                # No tactics = likely just goal statement, count as incomplete
-                failed.append((thm['name'], "no tactics"))
+                # Check if this is a Definition block (loaded as a unit, no timing)
+                thm_info = cursor._get_theorem(thm['name']) if cursor else None
+                if thm_info and thm_info.kind == "Definition":
+                    timing_lines.append(f"  {thm['name']}: (definition)")
+                    verified.append(thm['name'])
+                else:
+                    timing_lines.append(f"  {thm['name']}: (no tactics)")
+                    # No tactics = likely just goal statement, count as incomplete
+                    failed.append((thm['name'], "no tactics"))
 
         lines = [
             f"File: {status['file']}",

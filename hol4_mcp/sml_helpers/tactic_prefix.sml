@@ -550,3 +550,48 @@ fun verify_theorem_json goal name tactics store timeout_sec =
       ",\"trace\":" ^ trace_json ^ "}") ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* =============================================================================
+ * Definition Termination Goal Extraction
+ * =============================================================================
+ * Extract the termination conditions (TC) goal from a recursive definition
+ * body WITHOUT permanently modifying the theory.
+ *
+ * Used for Definition ... Termination ... End blocks where we need to
+ * recreate the termination proof goal for interactive state inspection.
+ *
+ * Approach: temporarily create the defn via Hol_defn inside nested
+ * try_grammar_extension + try_theory_extension, extract the TC goal
+ * string, then roll back all theory and grammar changes.
+ *
+ * MUST be called BEFORE the Definition block is processed (so the
+ * function constant doesn't exist yet). If the constant already exists,
+ * try_theory_extension rollback won't properly undo the replacement
+ * (KernelSig.insert retires the old constant silently).
+ *)
+
+val _ = load "Defn" handle _ => ();
+
+exception MCP_TC_Rollback;
+
+fun extract_tc_goal_json body_str =
+  let
+    val result = ref ""
+    fun inner () =
+      let
+        val d = Defn.Hol_defn "mcp_tc_extract" [QUOTE body_str]
+        val _ = Defn.tgoal d
+        val (_, t) = hd (top_goals())
+        val _ = result := term_to_string t
+        val _ = ((drop_all(); ()) handle _ => ())
+      in
+        raise MCP_TC_Rollback
+      end
+    val _ = (
+      Parse.try_grammar_extension
+        (fn () => Theory.try_theory_extension inner ()) ()
+    ) handle MCP_TC_Rollback => ()
+  in
+    print (json_ok (json_string (!result)) ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");

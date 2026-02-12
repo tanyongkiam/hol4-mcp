@@ -370,3 +370,72 @@ def test_format_context_error_value_constructor_forward_ref_hint():
     assert "line 11" in msg
     assert "forward reference" in msg
     assert "hol_check_proof" in msg
+
+
+# =============================================================================
+# Definition ... Termination ... End
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_definition_termination_state_at(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Test that state_at works for Definition ... Termination ... End blocks."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Definition fact_def:
+  fact (n:num) = if n = 0 then 1 else n * fact (n - 1)
+Termination
+  WF_REL_TAC `measure I`
+End
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # TC goal should have been extracted during init
+    assert "fact_def" in cursor._tc_goals
+    assert "WF" in cursor._tc_goals["fact_def"]
+
+    # state_at before tactic: should show TC goal
+    result = await cursor.state_at(4, col=1)  # Termination line
+    assert not result.error or "no goals" in (result.error or "")
+    assert result.tactics_total >= 1
+
+    # state_at after tactic: should be complete
+    result = await cursor.state_at(6, col=1)  # End line
+    # Either goals is empty or error says "no goals" (proof complete)
+    assert not result.goals or "no goals" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_definition_termination_verify_all(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Test verify_all_proofs with Definition blocks."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Definition fact_def:
+  fact (n:num) = if n = 0 then 1 else n * fact (n - 1)
+Termination
+  WF_REL_TAC `measure I`
+End
+
+Theorem fact_0:
+  fact 0 = 1
+Proof
+  simp[Once fact_def]
+QED
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    results = await cursor.verify_all_proofs()
+
+    # Definition block: loaded as unit, empty trace
+    assert "fact_def" in results
+    assert results["fact_def"] == []
+
+    # Theorem using definition should succeed
+    assert "fact_0" in results
+    trace = results["fact_0"]
+    assert len(trace) > 0
+    assert trace[-1].goals_after == 0  # proof complete

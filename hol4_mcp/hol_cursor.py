@@ -334,6 +334,13 @@ class FileProofCursor:
         # Invalidated when file content changes
         self._proof_traces: dict[str, list[TraceEntry]] = {}
 
+        # Termination condition goals for Definition blocks:
+        # Maps definition name -> TC goal string (e.g., "?R. WF R /\ ...")
+        # Extracted during _load_remaining_content BEFORE each Definition
+        # block is processed (required because Hol_defn can't be re-called
+        # after the constant exists without corrupting theory state).
+        self._tc_goals: dict[str, str] = {}
+
         # True when pre-theorem context changed (e.g., open/Theory/Ancestors).
         # Such changes require rebuilding HOL session context from scratch.
         self._needs_session_reinit: bool = False
@@ -399,6 +406,7 @@ class FileProofCursor:
                 # Invalidate all caches/checkpoints that depend on old context
                 self._invalidate_all_checkpoints()
                 self._proof_traces.clear()
+                self._tc_goals.clear()
 
                 # Invalidate saved base/deps checkpoints (stale imports/ancestors)
                 for ckpt_path in [self._base_checkpoint_path, self._deps_checkpoint_path]:
@@ -699,20 +707,25 @@ class FileProofCursor:
         """
         current_thm_names = {thm.name for thm in self._theorems}
         
-        # Invalidate checkpoints/traces for theorems that no longer exist
+        # Invalidate checkpoints/traces/tc_goals for theorems that no longer exist
         for name in list(self._checkpoints.keys()):
             if name not in current_thm_names:
                 self._invalidate_checkpoint(name)
         for name in list(self._proof_traces.keys()):
             if name not in current_thm_names:
                 del self._proof_traces[name]
+        for name in list(self._tc_goals.keys()):
+            if name not in current_thm_names:
+                del self._tc_goals[name]
         
-        # Invalidate checkpoints/traces for theorems at or after change point
+        # Invalidate checkpoints/traces/tc_goals for theorems at or after change point
         for thm in self._theorems:
             if thm.proof_end_line >= start_line:
                 self._invalidate_checkpoint(thm.name)
                 if thm.name in self._proof_traces:
                     del self._proof_traces[thm.name]
+                if thm.name in self._tc_goals:
+                    del self._tc_goals[thm.name]
 
     def _evict_lru_checkpoints(self) -> None:
         """Evict oldest checkpoints if over limit.
@@ -812,6 +825,27 @@ class FileProofCursor:
             "cheats": cheats,
         }
 
+    async def _extract_tc_goal(self, thm: TheoremInfo) -> None:
+        """Extract termination conditions goal for a Definition block.
+
+        Calls extract_tc_goal_json which temporarily creates the defn via
+        Hol_defn inside try_grammar_extension + try_theory_extension,
+        extracts the TC goal string, then rolls back all changes.
+
+        MUST be called BEFORE the Definition block is processed (before
+        the function constant exists in the theory).
+
+        Results are cached in self._tc_goals[thm.name].
+        """
+        goal_body = thm.goal.replace('\n', ' ').strip()
+        escaped = escape_sml_string(goal_body)
+        tc_result = await self.session.send(
+            f'extract_tc_goal_json "{escaped}";', timeout=30
+        )
+        tc_data = _find_json_line(tc_result)
+        if 'ok' in tc_data and tc_data['ok']:
+            self._tc_goals[thm.name] = tc_data['ok']
+
     async def _load_remaining_content(self) -> str | None:
         """Load remaining file content, theorem-by-theorem.
 
@@ -835,14 +869,21 @@ class FileProofCursor:
                         return f"Failed to load context: {_format_context_error(result)}"
                 self._loaded_to_line = thm.start_line
 
-            # Load the theorem (header through QED)
+            # For Definition blocks with Termination: extract TC goal BEFORE
+            # processing the block. Hol_defn is called inside try_grammar_extension
+            # + try_theory_extension so all theory/grammar changes are rolled back.
+            # Must happen before the constant exists (rollback won't undo replacement).
+            if thm.kind == "Definition" and thm.proof_body:
+                await self._extract_tc_goal(thm)
+
+            # Load the theorem (header through QED/End)
             thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
             if thm_content.strip():
                 # Allow proof failures (broken/cheat theorems), but stop on fatal errors
                 result = await self.session.send(thm_content, timeout=60)
                 if _is_fatal_hol_error(result):
                     return f"Failed to load context: {_format_context_error(result)}"
-            # proof_end_line is "line after QED" (1-indexed); we loaded through QED
+            # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
             self._loaded_to_line = thm.proof_end_line
 
         # Load any trailing content after last theorem
@@ -912,6 +953,10 @@ class FileProofCursor:
                         if check(result):
                             return f"Failed to load context: {_format_context_error(result)}"
                 
+                # For Definition blocks: extract TC goal before processing
+                if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
+                    await self._extract_tc_goal(thm)
+
                 # Load the theorem itself (may fail if proof is broken, that's OK in lenient mode)
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
@@ -919,7 +964,7 @@ class FileProofCursor:
                     if check(result):
                         return f"Failed to load context: {_format_context_error(result)}"
                 
-                # proof_end_line is "line after QED" (1-indexed); we loaded through QED
+                # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
                 current_line = thm.proof_end_line
             
             # Load remaining content after last theorem (up to target_line)
@@ -1138,8 +1183,14 @@ class FileProofCursor:
         async def _reset_goal_state() -> str | None:
             """Drop all goals and set theorem goal. Returns error string on failure."""
             await self.session.send('drop_all();', timeout=5)
-            goal = thm.goal.replace('\n', ' ').strip()
-            gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
+            if thm.kind == "Definition" and thm.name in self._tc_goals:
+                # Definition with Termination: use the termination conditions
+                # goal (e.g., "?R. WF R /\ ...") instead of the function body.
+                tc_goal = self._tc_goals[thm.name]
+                gt_result = await self.session.send(f'g `{tc_goal}`;', timeout=30)
+            else:
+                goal = thm.goal.replace('\n', ' ').strip()
+                gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
             if _is_hol_error(gt_result):
                 self._proof_initialized = False
                 return f"Failed to set up goal: {gt_result[:300]}"
@@ -1393,6 +1444,10 @@ class FileProofCursor:
         if "error" in enter_result:
             return []
 
+        # Definition blocks can't use verify_theorem_json (TC goal context issue)
+        if thm.kind == "Definition":
+            return []
+
         # Get tactics from step plan
         tactics = [step.cmd for step in self._step_plan if step.cmd.strip()]
         if not tactics:
@@ -1509,8 +1564,11 @@ class FileProofCursor:
             else:
                 step_plan = []
 
-            if not step_plan:
-                # No tactics - load theorem as-is
+            if not step_plan or thm.kind == "Definition":
+                # No tactics, or Definition block — load as-is.
+                # Definition blocks with Termination are processed as a unit
+                # by HOL (verify_theorem_json can't handle their TC goals in
+                # this context since the constant doesn't exist yet for g()).
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     await self.session.send(thm_content, timeout=60)
