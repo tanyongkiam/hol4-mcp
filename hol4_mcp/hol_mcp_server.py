@@ -845,6 +845,7 @@ async def hol_check_proof(
     theorem: str,
     file: str = None,
     workdir: str = None,
+    trace: bool = True,
     session: str = "default",
 ) -> str:
     """Check if a theorem's proof completes after editing.
@@ -856,9 +857,11 @@ async def hol_check_proof(
         theorem: Theorem name to check
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
+        trace: If True, include full per-step timing trace
         session: Session name (default: "default")
 
-    Returns: Whether proof completes, failure location, brief goal summary
+    Returns: Whether proof completes, failure location, brief goal summary.
+             With trace=True, also includes per-step timing and goal counts.
     """
     cursor = _get_cursor(session)
 
@@ -904,9 +907,9 @@ async def hol_check_proof(
         return "\n".join(lines)
 
     # Execute proof (clean mode by default - matches holmake, uses cache)
-    trace = await cursor.execute_proof_traced(theorem)
+    trace_data = await cursor.execute_proof_traced(theorem)
     
-    if not trace:
+    if not trace_data:
         if thm.kind == "Definition" and thm.proof_body:
             # Definition blocks can't use execute_proof_traced (TC goal context).
             # Fall back to state_at at the End line to check proof completion.
@@ -926,8 +929,8 @@ async def hol_check_proof(
 
     # Find failure point
     failed_idx = None
-    for i, entry in enumerate(trace):
-        if entry.error or (i == len(trace) - 1 and entry.goals_after != 0):
+    for i, entry in enumerate(trace_data):
+        if entry.error or (i == len(trace_data) - 1 and entry.goals_after != 0):
             failed_idx = i
             break
 
@@ -941,12 +944,6 @@ async def hol_check_proof(
         col = offset - last_nl if last_nl >= 0 else offset + 1
         return line, col
 
-    # Get tactic end position
-    def tactic_pos(idx):
-        if idx is None or idx >= len(cursor._step_plan):
-            return thm.proof_start_line, 1
-        return offset_to_pos(cursor._step_plan[idx].end)
-
     # Get tactic start/end range
     def tactic_range(idx):
         if idx is None or idx >= len(cursor._step_plan):
@@ -955,24 +952,40 @@ async def hol_check_proof(
         end_offset = cursor._step_plan[idx].end
         return offset_to_pos(start_offset), offset_to_pos(end_offset)
 
-    final = trace[-1]
-    total_ms = sum(e.real_ms for e in trace)
-    total_steps = len(trace)
+    final = trace_data[-1]
+    total_ms = sum(e.real_ms for e in trace_data)
+    total_steps = len(trace_data)
     
     if final.error:
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")
         lines.append(f"Error: {final.error}")
     elif final.goals_after == 0:
         lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps)")
-        return "\n".join(lines)
+        if not trace:
+            return "\n".join(lines)
     else:
-        lines.append(f"Status: INCOMPLETE at step {len(trace)}/{total_steps} ({total_ms}ms)")
+        lines.append(f"Status: INCOMPLETE at step {len(trace_data)}/{total_steps} ({total_ms}ms)")
 
-    # Show failing tactic with location
-    substeps = None
-    if failed_idx is not None and failed_idx < len(trace):
+    # Per-step timing trace (when requested, or always on failure/incomplete)
+    if trace:
+        lines.append("")
+        for i, entry in enumerate(trace_data, 1):
+            (sp, sc), (ep, ec) = tactic_range(i - 1)
+            loc = f"line/col {sp}:{sc}-{ep}:{ec}"
+            cmd_text = entry.cmd.strip().replace('\n', ' ')
+            if len(cmd_text) > 60:
+                cmd_text = cmd_text[:57] + "..."
+            lines.append(f"Step {i} ({loc}): {cmd_text}")
+            if entry.error:
+                lines.append(f"  ERROR: {entry.error}")
+            else:
+                lines.append(f"  {entry.real_ms}ms | Goals: {entry.goals_before} -> {entry.goals_after}")
+        lines.append("")
+
+    # Show failing tactic with location (when not in trace mode, which already shows all steps)
+    if not trace and failed_idx is not None and failed_idx < len(trace_data):
         (start_line, start_col), (end_line, end_col) = tactic_range(failed_idx)
-        tactic_text = trace[failed_idx].cmd.strip().replace('\n', ' ')
+        tactic_text = trace_data[failed_idx].cmd.strip().replace('\n', ' ')
         is_big = len(tactic_text) > 80
         if is_big:
             tactic_text = tactic_text[:77] + "..."
@@ -991,11 +1004,12 @@ async def hol_check_proof(
                         sub_text = sub_text[:57] + "..."
                     lines.append(f"    {i+1}. line {sl} col {sc}: {sub_text}")
 
-    # Brief goal summary
-    lines.append("")
-    lines.append(f"Remaining: {final.goals_after} goal(s)")
-    (fail_line, fail_col), _ = tactic_range(failed_idx)
-    lines.append(f"Use hol_state_at(line={fail_line}, col={fail_col}) for full goals")
+    # Brief goal summary for failure/incomplete
+    if failed_idx is not None:
+        lines.append("")
+        lines.append(f"Remaining: {final.goals_after} goal(s)")
+        (fail_line, fail_col), _ = tactic_range(failed_idx)
+        lines.append(f"Use hol_state_at(line={fail_line}, col={fail_col}) for full goals")
 
     return "\n".join(lines)
 
@@ -1138,98 +1152,6 @@ async def hol_file_status(file: str = None, workdir: str = None, timing: bool = 
 
     return "\n".join(lines)
 
-
-# =============================================================================
-# Proof Timing Trace Tools
-# =============================================================================
-
-
-@mcp.tool()
-async def hol_trace_proof(
-    theorem: str,
-    file: str = None,
-    workdir: str = None,
-    session: str = "default",
-) -> str:
-    """Execute a proof and return full timing trace.
-
-    Executes all tactics for the given theorem and records timing
-    for each step.
-
-    Args:
-        theorem: Theorem name to trace
-        file: Path to .sml file (auto-inits cursor if no cursor exists)
-        workdir: Working directory for HOL (used with file)
-        session: Session name (default: "default")
-
-    Returns: Full trace with line/col ranges and timing for each tactic
-    """
-    cursor = _get_cursor(session)
-
-    # Auto-init if file provided and no cursor (or different file)
-    if file:
-        file_path = Path(file).resolve()
-        if not cursor or Path(cursor.file).resolve() != file_path:
-            init_result = await _init_file_cursor(
-                file=file, session=session, workdir=workdir
-            )
-            if init_result.startswith("ERROR"):
-                return init_result
-            cursor = _get_cursor(session)
-
-    if not cursor:
-        return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
-
-    trace = await cursor.execute_proof_traced(theorem)
-
-    if not trace:
-        return f"No trace data. Theorem '{theorem}' may not exist or has no tactics."
-
-    thm = cursor._get_theorem(theorem)
-
-    # Convert offset within proof_body to source line/col
-    def offset_to_pos(offset):
-        if not thm or offset is None or offset < 0:
-            return None
-        if not thm.proof_body:
-            return (thm.proof_start_line, 1)
-        offset = min(offset, len(thm.proof_body))
-        before = thm.proof_body[:offset]
-        line = thm.proof_start_line + before.count('\n')
-        last_nl = before.rfind('\n')
-        col = offset - last_nl if last_nl >= 0 else offset + 1
-        return line, col
-
-    lines = [f"Proof trace for {theorem}: {len(trace)} steps", ""]
-
-    total_real = 0
-    has_error = False
-    for i, entry in enumerate(trace, 1):
-        total_real += entry.real_ms
-        start_pos = offset_to_pos(entry.start_offset)
-        end_pos = offset_to_pos(entry.end_offset)
-        loc = None
-        if start_pos and end_pos:
-            loc = f"line/col {start_pos[0]}:{start_pos[1]}-{end_pos[0]}:{end_pos[1]}"
-
-        header = f"Step {i}"
-        if loc:
-            header += f" ({loc})"
-        lines.append(f"{header}: {entry.cmd[:60]}{'...' if len(entry.cmd) > 60 else ''}")
-
-        if entry.error:
-            lines.append(f"  ERROR: {entry.error}")
-            has_error = True
-        else:
-            lines.append(f"  Real: {entry.real_ms}ms, User: {entry.usr_ms}ms, Sys: {entry.sys_ms}ms")
-            lines.append(f"  Goals: {entry.goals_before} -> {entry.goals_after}")
-        lines.append("")
-
-    lines.append(f"Total real time: {total_real}ms")
-    if has_error:
-        lines.append("WARNING: Trace incomplete due to error")
-
-    return "\n".join(lines)
 
 
 def _install_pi_extension():

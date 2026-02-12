@@ -887,8 +887,9 @@ async def test_check_proof_substeps_for_big_step(tmp_path):
     session = "narrow_test"
 
     try:
+        # trace=False to trigger substep decomposition (trace mode shows steps directly)
         r = await hol_check_proof(
-            theorem="broken_thenlt", file=str(test_file), session=session
+            theorem="broken_thenlt", file=str(test_file), session=session, trace=False
         )
         # Should be INCOMPLETE (>- catches tactic failure, leaves goals)
         assert "INCOMPLETE" in r or "FAILED" in r, f"Should not succeed: {r}"
@@ -1177,3 +1178,92 @@ def test_cli_main_function():
         assert exc_info.value.code == 0
     finally:
         sys.argv = old_argv
+
+
+# =============================================================================
+# Trace tests (hol_check_proof with trace=True)
+# =============================================================================
+
+
+async def test_check_proof_trace_ok(tmp_path):
+    """trace=True on a passing proof shows per-step timing."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+    session = "trace_ok_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="add_zero", file=str(test_file), session=session, trace=True
+        )
+        assert "Status: OK" in r
+        assert "Step 1" in r
+        assert "ms" in r
+        assert "Goals:" in r
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_check_proof_trace_false_omits_steps(tmp_path):
+    """trace=False on a passing proof omits per-step detail."""
+    test_file = tmp_path / "testScript.sml"
+    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
+    session = "trace_false_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="add_zero", file=str(test_file), session=session, trace=False
+        )
+        assert "Status: OK" in r
+        assert "Step 1" not in r
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_check_proof_trace_failure(tmp_path):
+    """trace=True on a failing proof shows steps up to failure."""
+    test_file = tmp_path / "brokenTwoStepScript.sml"
+    test_file.write_text(BROKEN_TWO_STEP_SCRIPT)
+    session = "trace_fail_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="broken_two_step", file=str(test_file), session=session, trace=True
+        )
+        assert "FAILED" in r or "INCOMPLETE" in r
+        assert "Step 1" in r
+        assert "Goals:" in r
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_check_proof_trace_multi_step(tmp_path):
+    """trace=True on a multi-step proof shows all steps with goal transitions."""
+    script = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "multi";
+
+Theorem conj_swap:
+  (A:bool) /\\ B ==> B /\\ A
+Proof
+  strip_tac >>
+  conj_tac >- (fs[]) >>
+  fs[]
+QED
+
+val _ = export_theory();
+'''
+    test_file = tmp_path / "multiScript.sml"
+    test_file.write_text(script)
+    session = "trace_multi_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="conj_swap", file=str(test_file), session=session, trace=True
+        )
+        assert "Status: OK" in r
+        assert "Step 1" in r
+        # Should show goal count transitions
+        assert "-> 0" in r  # final step resolves all goals
+    finally:
+        await hol_stop(session=session)
