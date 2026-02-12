@@ -430,12 +430,99 @@ QED
 
     results = await cursor.verify_all_proofs()
 
-    # Definition block: loaded as unit, empty trace
+    # Definition block: timed via TC goal
     assert "fact_def" in results
-    assert results["fact_def"] == []
+    fact_trace = results["fact_def"]
+    assert len(fact_trace) > 0
+    # First (and only) step should have completed the proof
+    assert fact_trace[0].goals_before > 0
+    assert fact_trace[0].goals_after == 0
 
     # Theorem using definition should succeed
     assert "fact_0" in results
     trace = results["fact_0"]
     assert len(trace) > 0
     assert trace[-1].goals_after == 0  # proof complete
+
+
+@pytest.mark.asyncio
+async def test_definition_termination_trace(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Test execute_proof_traced works for Definition termination proofs."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Definition fact_def:
+  fact (n:num) = if n = 0 then 1 else n * fact (n - 1)
+Termination
+  WF_REL_TAC `measure I`
+End
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    trace = await cursor.execute_proof_traced("fact_def")
+    assert len(trace) > 0
+    assert trace[0].real_ms >= 0
+    assert trace[0].goals_before > 0
+    assert trace[0].goals_after == 0
+
+
+@pytest.mark.asyncio
+async def test_definition_termination_wrong_tactic(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Test state_at shows TC goal when termination tactic is wrong."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Definition bad_def:
+  bad_fn (n:num) = if n = 0 then 1 else n * bad_fn (n - 1)
+Termination
+  simp[]
+End
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Before the wrong tactic: should show TC goal with WF
+    result = await cursor.state_at(4, col=1)  # Termination line
+    assert result.goals, "Should have goals before tactic"
+    tc_goal = result.goals[0]["goal"]
+    assert "WF" in tc_goal, f"TC goal should mention WF, got: {tc_goal}"
+
+    # After the wrong tactic: simp[] doesn't solve TCs, goal should remain
+    result = await cursor.state_at(6, col=1)  # End line
+    # simp[] on TC goal doesn't fail but also doesn't solve it
+    assert result.goals, "Should still have goals after wrong tactic"
+
+
+@pytest.mark.asyncio
+async def test_definition_termination_incomplete(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Test state_at with incomplete termination proof (cheat)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Definition cheat_def:
+  cheat_fn (n:num) (m:num) =
+    if n = 0 then m else cheat_fn (n - 1) (m + 1)
+Termination
+  WF_REL_TAC `measure FST` >>
+  cheat
+End
+
+Theorem uses_cheat:
+  cheat_fn 0 5 = 5
+Proof
+  simp[Once cheat_def]
+QED
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Before tactic: TC goal should be shown
+    result = await cursor.state_at(5, col=1)  # Termination line
+    assert result.goals
+    assert "WF" in result.goals[0]["goal"]
+
+    # Theorem referencing cheated definition should still work
+    # (HOL processes the full Definition block including cheat)
+    result = await cursor.state_at(12, col=1)  # Inside uses_cheat proof
+    assert result.tactics_total >= 1

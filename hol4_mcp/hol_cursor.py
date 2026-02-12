@@ -1444,17 +1444,17 @@ class FileProofCursor:
         if "error" in enter_result:
             return []
 
-        # Definition blocks can't use verify_theorem_json (TC goal context issue)
-        if thm.kind == "Definition":
-            return []
-
         # Get tactics from step plan
         tactics = [step.cmd for step in self._step_plan if step.cmd.strip()]
         if not tactics:
             return []
 
-        # Single batched call with store=false (trace only, don't commit)
-        goal = thm.goal.replace('\n', ' ').strip()
+        # For Definitions, use the TC goal (which doesn't reference the
+        # function constant, so it works even before the Definition is processed)
+        if thm.kind == "Definition" and thm.name in self._tc_goals:
+            goal = self._tc_goals[thm.name]
+        else:
+            goal = thm.goal.replace('\n', ' ').strip()
         tactics_sml = "[" + ",".join(
             f'"{escape_sml_string(t)}"' for t in tactics
         ) + "]"
@@ -1564,11 +1564,8 @@ class FileProofCursor:
             else:
                 step_plan = []
 
-            if not step_plan or thm.kind == "Definition":
-                # No tactics, or Definition block — load as-is.
-                # Definition blocks with Termination are processed as a unit
-                # by HOL (verify_theorem_json can't handle their TC goals in
-                # this context since the constant doesn't exist yet for g()).
+            if not step_plan:
+                # No tactics - load theorem as-is
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     await self.session.send(thm_content, timeout=60)
@@ -1576,8 +1573,24 @@ class FileProofCursor:
                 current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
                 continue
 
-            # Batch verify entire theorem in one IPC call
-            goal = thm.goal.replace('\n', ' ').strip()
+            # For Definitions: extract TC goal, verify with store=false for
+            # timing, then load the full block to establish the definition.
+            if thm.kind == "Definition":
+                if thm.name not in self._tc_goals:
+                    await self._extract_tc_goal(thm)
+                tc_goal = self._tc_goals.get(thm.name)
+                if tc_goal:
+                    goal = tc_goal
+                else:
+                    # TC extraction failed — load as-is without timing
+                    thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
+                    if thm_content.strip():
+                        await self.session.send(thm_content, timeout=60)
+                    results[thm.name] = []
+                    current_line = thm.proof_end_line - 1
+                    continue
+            else:
+                goal = thm.goal.replace('\n', ' ').strip()
             tactics = [step.cmd for step in step_plan if step.cmd.strip()]
 
             # Build SML list literal: ["tac1", "tac2", ...]
@@ -1586,11 +1599,12 @@ class FileProofCursor:
             ) + "]"
 
             # Single call: sets goal, runs tactics with timing, stores if OK
-            # SML handles per-tactic timeout; Python timeout is buffer
+            # For Definitions, store=false (can't save TC proof as definition)
+            store = "false" if thm.kind == "Definition" else "true"
             tactic_timeout = self._tactic_timeout or 60.0
             python_timeout = tactic_timeout * len(tactics) + 10
             result = await self.session.send(
-                f'verify_theorem_json "{escape_sml_string(goal)}" "{thm.name}" {tactics_sml} true {tactic_timeout:.1f};',
+                f'verify_theorem_json "{escape_sml_string(goal)}" "{thm.name}" {tactics_sml} {store} {tactic_timeout:.1f};',
                 timeout=max(30, python_timeout)
             )
 
@@ -1620,10 +1634,11 @@ class FileProofCursor:
                     goals_before=0, goals_after=0, error=parsed['err']
                 ))
 
-            # verify_theorem_json uses save_thm() which doesn't register
-            # attributes like [simp], [compute]. Re-send the full block
-            # so HOL processes attributes correctly for subsequent theorems.
-            if thm.attributes and trace and not any(e.error for e in trace):
+            # For Definitions: always re-send the full block to create the
+            # constant and store def/ind theorems (verify_theorem_json only
+            # proved the TCs without creating the definition).
+            # For Theorems: re-send if attributes need registration.
+            if thm.kind == "Definition" or (thm.attributes and trace and not any(e.error for e in trace)):
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     await self.session.send(thm_content, timeout=60)
