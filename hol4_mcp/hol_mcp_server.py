@@ -476,11 +476,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 continue  # Keep polling
 
         if timed_out:
-            return (
-                f"ERROR: Build timed out after {timeout}s.\n"
-                "WARNING: Any existing .hol/logs/ are from a PRIOR build, not this one. "
-                "Do NOT interpret them as current results."
-            )
+            return f"ERROR: Build timed out after {timeout}s."
 
         output = b''.join(stdout_chunks).decode("utf-8", errors="replace")
 
