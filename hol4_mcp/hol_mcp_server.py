@@ -42,9 +42,14 @@ class SessionEntry:
     session: HOLSession
     started: datetime
     workdir: Path
+    last_used: float = 0.0  # time.time() of last activity
     cursor: Optional[FileProofCursor] = None
     holmake_env: Optional[dict] = None  # env vars for holmake (auto-captured on success)
     env: Optional[dict] = None  # env vars passed to HOL process
+
+    def __post_init__(self):
+        if self.last_used == 0.0:
+            self.last_used = time.time()
 
 
 mcp = FastMCP("hol", instructions="""HOL4 theorem prover - proof development workflow:
@@ -82,15 +87,42 @@ def _sigint_handler(signum, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
+_SESSION_IDLE_TIMEOUT = 7200  # 2 hours
+
+
+def _touch_session(name: str):
+    """Update last_used timestamp for a session."""
+    entry = _sessions.get(name)
+    if entry:
+        entry.last_used = time.time()
+
+
+async def _prune_idle_sessions():
+    """Stop and remove sessions idle longer than _SESSION_IDLE_TIMEOUT."""
+    now = time.time()
+    to_prune = [
+        name for name, entry in _sessions.items()
+        if now - entry.last_used > _SESSION_IDLE_TIMEOUT
+    ]
+    for name in to_prune:
+        entry = _sessions.pop(name, None)
+        if entry:
+            await entry.session.stop()
+
+
 def _get_session(name: str) -> Optional[HOLSession]:
     """Get session from registry, or None if not found."""
     entry = _sessions.get(name)
+    if entry:
+        entry.last_used = time.time()
     return entry.session if entry else None
 
 
 def _get_cursor(name: str) -> Optional[FileProofCursor]:
     """Get cursor from registry, or None if not found."""
     entry = _sessions.get(name)
+    if entry:
+        entry.last_used = time.time()
     return entry.cursor if entry else None
 
 
@@ -124,6 +156,7 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None) -> st
 
     Returns: Session status
     """
+    await _prune_idle_sessions()
     # If session exists and is running, return its state
     if name in _sessions:
         session = _sessions[name].session
@@ -166,15 +199,24 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None) -> st
 @mcp.tool()
 async def hol_sessions() -> str:
     """List all active HOL sessions with their workdir, age, status, cursor."""
+    await _prune_idle_sessions()
     if not _sessions:
         return "No active sessions."
 
-    lines = ["SESSION      WORKDIR                                    AGE     STATUS   CURSOR"]
-    lines.append("-" * 95)
+    lines = ["SESSION      WORKDIR                                    AGE     IDLE    STATUS   CURSOR"]
+    lines.append("-" * 105)
 
+    now = time.time()
     for name, entry in _sessions.items():
         status = "running" if entry.session.is_running else "dead"
         age = _session_age(name)
+        idle_secs = int(now - entry.last_used)
+        if idle_secs < 60:
+            idle_str = f"{idle_secs}s"
+        elif idle_secs < 3600:
+            idle_str = f"{idle_secs // 60}m"
+        else:
+            idle_str = f"{idle_secs / 3600:.1f}h"
         workdir_str = str(entry.workdir)
         if len(workdir_str) > 40:
             workdir_str = "..." + workdir_str[-37:]
@@ -186,7 +228,7 @@ async def hol_sessions() -> str:
         else:
             cursor_str = "(none)"
 
-        lines.append(f"{name:<12} {workdir_str:<42} {age:<7} {status:<8} {cursor_str}")
+        lines.append(f"{name:<12} {workdir_str:<42} {age:<7} {idle_str:<7} {status:<8} {cursor_str}")
 
     return "\n".join(lines)
 
