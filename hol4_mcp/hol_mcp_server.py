@@ -376,7 +376,7 @@ _PROGRESS_INTERVAL = 10  # seconds
 
 
 @mcp.tool()
-async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 90, ctx: Context = None) -> str:
+async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 90, heap_size: int = 12288, ctx: Context = None) -> str:
     """Run Holmake --qof in directory.
 
     Args:
@@ -385,14 +385,16 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         env: Optional environment variables (e.g. {"MY_VAR": "/some/path"})
         log_limit: Max bytes per log file to include on failure (default 1024)
         timeout: Max seconds to wait (default 90, max 1800)
+        heap_size: Max heap size in MB for Poly/ML builds (default 12288)
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
 
     Note: For builds > 60s, progress notifications are sent every 10s to prevent
     MCP client timeout. Configure tool_timeout_sec in ~/.codex/config.toml if needed.
     """
-    # Validate timeout
+    # Validate limits
     timeout = max(1, min(timeout, 1800))
+    heap_size = max(256, heap_size)
     workdir_path = Path(workdir).resolve()
     if not workdir_path.exists():
         return f"ERROR: Directory does not exist: {workdir}"
@@ -412,7 +414,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
             if log_file.is_file():
                 log_file.unlink()
 
-    cmd = [str(holmake_bin), "--qof"]
+    cmd = [str(holmake_bin), "--qof", f"--heap-size={heap_size}"]
     if target:
         cmd.append(target)
 
