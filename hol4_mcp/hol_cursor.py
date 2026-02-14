@@ -341,6 +341,10 @@ class FileProofCursor:
         # after the constant exists without corrupting theory state).
         self._tc_goals: dict[str, str] = {}
 
+        # Theorems whose proofs failed during content loading and were
+        # auto-cheated to prevent cascading compile errors. Cleared on file change.
+        self._failed_proofs: set[str] = set()
+
         # True when pre-theorem context changed (e.g., open/Theory/Ancestors).
         # Such changes require rebuilding HOL session context from scratch.
         self._needs_session_reinit: bool = False
@@ -407,6 +411,7 @@ class FileProofCursor:
                 self._invalidate_all_checkpoints()
                 self._proof_traces.clear()
                 self._tc_goals.clear()
+                self._failed_proofs.clear()
 
                 # Invalidate saved base/deps checkpoints (stale imports/ancestors)
                 for ckpt_path in [self._base_checkpoint_path, self._deps_checkpoint_path]:
@@ -846,6 +851,25 @@ class FileProofCursor:
         if 'ok' in tc_data and tc_data['ok']:
             self._tc_goals[thm.name] = tc_data['ok']
 
+    async def _cheat_failed_theorem(self, thm: TheoremInfo) -> str | None:
+        """After a proof failure, re-send the theorem with cheat to bind its name.
+
+        Without this, later theorems that reference the failed one get a fatal
+        Poly/ML compile error ("Value or constructor not declared").
+
+        Returns error string if the cheat itself fails, else None.
+        """
+        attrs = f"[{','.join(thm.attributes)}]" if thm.attributes else ""
+        cheat_block = f'Theorem {thm.name}{attrs}:\n{thm.goal}\nProof\n  cheat\nQED'
+        result = await self.session.send(cheat_block, timeout=30)
+        if _is_hol_error(result):
+            return (
+                f"Proof of '{thm.name}' failed (line {thm.start_line}) "
+                f"and could not be cheated: {result[:200]}"
+            )
+        self._failed_proofs.add(thm.name)
+        return None
+
     async def _load_remaining_content(self) -> str | None:
         """Load remaining file content, theorem-by-theorem.
 
@@ -879,10 +903,16 @@ class FileProofCursor:
             # Load the theorem (header through QED/End)
             thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
             if thm_content.strip():
-                # Allow proof failures (broken/cheat theorems), but stop on fatal errors
                 result = await self.session.send(thm_content, timeout=60)
                 if _is_fatal_hol_error(result):
                     return f"Failed to load context: {_format_context_error(result)}"
+                # On proof failure, cheat the theorem so its name is bound.
+                # Without this, later theorems that reference it get a fatal
+                # Poly/ML compile error ("Value or constructor not declared").
+                if _is_hol_error(result) and thm.kind != "Definition":
+                    cheat_err = await self._cheat_failed_theorem(thm)
+                    if cheat_err:
+                        return cheat_err
             # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
             self._loaded_to_line = thm.proof_end_line
 
@@ -903,7 +933,7 @@ class FileProofCursor:
         self._loaded_content_hash = self._content_hash
         return None
 
-    async def _load_context_to_line(self, target_line: int, timeout: float = 300, strict: bool = False) -> str | None:
+    async def _load_context_to_line(self, target_line: int, timeout: float = 300) -> str | None:
         """Load file content up to target_line into HOL session.
         
         Loads content granularly - theorem by theorem - so that a broken proof
@@ -912,8 +942,6 @@ class FileProofCursor:
         Args:
             target_line: 1-indexed line to load up to (exclusive)
             timeout: Timeout for HOL send (default 300s for large files)
-            strict: If True, any HOL error fails. If False (default), only fatal
-                    errors (syntax, timeout) fail - proof failures are tolerated.
             
         Returns:
             Error message if failed, None if success.
@@ -922,7 +950,6 @@ class FileProofCursor:
             return None  # Already loaded
             
         content_lines = self._content.split('\n')
-        check = _is_hol_error if strict else _is_fatal_hol_error
         
         # Find theorems that are in the range we need to load
         # These need special handling because broken proofs can stop HOL processing
@@ -937,7 +964,7 @@ class FileProofCursor:
             to_load = '\n'.join(content_lines[start_idx:target_line - 1])
             if to_load.strip():
                 result = await self.session.send(to_load, timeout=timeout)
-                if check(result):
+                if _is_fatal_hol_error(result):
                     return f"Failed to load context: {_format_context_error(result)}"
         else:
             # Theorems in range - load piece by piece to isolate failures
@@ -950,19 +977,24 @@ class FileProofCursor:
                     pre_content = '\n'.join(content_lines[start_idx:thm.start_line - 1])
                     if pre_content.strip():
                         result = await self.session.send(pre_content, timeout=timeout)
-                        if check(result):
+                        if _is_fatal_hol_error(result):
                             return f"Failed to load context: {_format_context_error(result)}"
                 
                 # For Definition blocks: extract TC goal before processing
                 if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
                     await self._extract_tc_goal(thm)
 
-                # Load the theorem itself (may fail if proof is broken, that's OK in lenient mode)
+                # Load the theorem
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     result = await self.session.send(thm_content, timeout=timeout)
-                    if check(result):
+                    if _is_fatal_hol_error(result):
                         return f"Failed to load context: {_format_context_error(result)}"
+                    # On proof failure, cheat so later theorems can reference it
+                    if _is_hol_error(result) and thm.kind != "Definition":
+                        cheat_err = await self._cheat_failed_theorem(thm)
+                        if cheat_err:
+                            return cheat_err
                 
                 # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
                 current_line = thm.proof_end_line
@@ -973,7 +1005,7 @@ class FileProofCursor:
                 remaining = '\n'.join(content_lines[start_idx:target_line - 1])
                 if remaining.strip():
                     result = await self.session.send(remaining, timeout=timeout)
-                    if check(result):
+                    if _is_fatal_hol_error(result):
                         return f"Failed to load context: {_format_context_error(result)}"
         
         # Update tracking
@@ -1394,7 +1426,8 @@ class FileProofCursor:
             "stale": stale,
             "completed": [],
             "theorems": [
-                {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
+                {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat,
+                 **({"proof_failed": True} if t.name in self._failed_proofs else {})}
                 for t in self._theorems
             ],
             "cheats": [
