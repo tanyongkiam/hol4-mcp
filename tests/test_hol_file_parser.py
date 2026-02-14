@@ -139,6 +139,133 @@ QED
     assert thms[1].start_line == 18
 
 
+def test_parse_resume_blocks():
+    """Resume blocks should be parsed with suspension_name and label_name."""
+    content = r'''
+Theorem conj_comm[suspend]:
+  !A B. A /\ B ==> B /\ A
+Proof
+  rpt strip_tac
+QED
+
+Resume conj_comm[1]:
+  metis_tac[]
+QED
+
+Resume conj_comm[2,simp]:
+  metis_tac[]
+QED
+
+Theorem simple_thm:
+  !x. x = x
+Proof
+  simp[]
+QED
+'''
+    thms = parse_theorems(content)
+    names = [t.name for t in thms]
+    assert "conj_comm" in names
+    assert "conj_comm[1]" in names
+    assert "conj_comm[2]" in names
+    assert "simple_thm" in names
+    assert len(thms) == 4
+
+    # Check Resume block fields
+    r1 = thms[1]
+    assert r1.name == "conj_comm[1]"
+    assert r1.kind == "Resume"
+    assert r1.suspension_name == "conj_comm"
+    assert r1.label_name == "1"
+    assert r1.attributes == []
+    assert r1.goal == ""  # Extracted at runtime
+    assert "metis_tac" in r1.proof_body
+
+    r2 = thms[2]
+    assert r2.name == "conj_comm[2]"
+    assert r2.kind == "Resume"
+    assert r2.suspension_name == "conj_comm"
+    assert r2.label_name == "2"
+    assert r2.attributes == ["simp"]
+
+    # Non-Resume theorems should NOT have suspension fields
+    assert thms[0].suspension_name is None
+    assert thms[0].label_name is None
+    assert thms[3].suspension_name is None
+
+
+def test_parse_resume_proof_body_offset():
+    """Resume proof_body_offset should point to actual proof body."""
+    content = '''Resume foo[lbl]:
+  simp[] >> gvs[]
+QED
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    thm = thms[0]
+    assert thm.proof_body == "simp[] >> gvs[]"
+    assert content[thm.proof_body_offset:thm.proof_body_offset + 15] == "simp[] >> gvs[]"
+
+
+def test_parse_resume_in_comments_ignored():
+    """Resume blocks inside comments should be ignored."""
+    content = r'''
+(* Resume ghost[lbl]:
+  cheat
+QED *)
+
+Resume real_one[a]:
+  simp[]
+QED
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    assert thms[0].name == "real_one[a]"
+
+
+def test_parse_resume_with_attrs():
+    """Resume with extra attributes (smlname, exclude_simps)."""
+    content = r'''
+Theorem foo:
+  T
+Proof
+  suspend "bar"
+QED
+
+Resume foo[bar,smlname=myname,exclude_simps=AND_CLAUSES]:
+  simp[]
+QED
+'''
+    thms = parse_theorems(content)
+    resume = next(t for t in thms if t.kind == "Resume")
+    assert resume.name == "foo[bar]"
+    assert resume.suspension_name == "foo"
+    assert resume.label_name == "bar"
+    assert resume.attributes == ["smlname=myname", "exclude_simps=AND_CLAUSES"]
+
+
+def test_parse_multiple_resume_same_theorem():
+    """Multiple Resume blocks for the same theorem should all be parsed."""
+    content = r'''
+Theorem multi:
+  T
+Proof
+  iff_tac >- suspend "l2r" >- suspend "r2l"
+QED
+
+Resume multi[l2r]:
+  simp[]
+QED
+
+Resume multi[r2l]:
+  simp[]
+QED
+'''
+    thms = parse_theorems(content)
+    names = [t.name for t in thms]
+    assert "multi[l2r]" in names
+    assert "multi[r2l]" in names
+
+
 def test_parse_definition_termination():
     """Definition with Termination...End should be parsed as a theorem."""
     content = r'''

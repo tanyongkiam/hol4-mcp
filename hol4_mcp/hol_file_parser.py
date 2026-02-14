@@ -205,6 +205,8 @@ class TheoremInfo:
     proof_body: str = ""  # Content between Proof and QED (stripped)
     proof_body_offset: int = 0  # File offset where proof_body starts
     attributes: list[str] = field(default_factory=list)
+    suspension_name: str | None = None  # For Resume: base theorem name
+    label_name: str | None = None       # For Resume: first attribute = label
 
     @property
     def line_before_qed(self) -> int:
@@ -370,6 +372,65 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
             proof_body=proof_body_stripped,
             proof_body_offset=proof_body_offset,
             attributes=attributes,
+        ))
+
+    # Third pass: Resume blocks (suspended subgoal proofs)
+    resume_pattern = re.compile(
+        r"^(Resume)\s+([A-Za-z][A-Za-z0-9_']*)\s*\[([^\]]*)\]\s*:",
+        re.MULTILINE
+    )
+
+    for match in resume_pattern.finditer(stripped):
+        attrs_str = match.group(3)
+        suspension_name = match.group(2)
+
+        # First attribute is the label name; rest are proof modifiers
+        attrs = [a.strip() for a in attrs_str.split(',')]
+        label_name = attrs[0] if attrs else ""
+        remaining_attrs = attrs[1:] if len(attrs) > 1 else []
+
+        # Composite name for uniqueness ([ not valid in theorem names)
+        name = f"{suspension_name}[{label_name}]"
+
+        start_pos = match.start()
+        start_line = content[:start_pos].count('\n') + 1
+
+        rest_stripped = stripped[match.end():]
+        rest = content[match.end():]
+
+        qed_match = re.search(r'^\s*QED\s*$', rest_stripped, re.MULTILINE)
+        if not qed_match:
+            continue
+
+        # No "Proof" keyword — body starts right after the header line's ":"
+        # proof_start_line = line after the Resume header
+        header_end_line = start_line + content[start_pos:match.end()].count('\n')
+        proof_start_line = header_end_line + 1
+        proof_end_line = start_line + rest[:qed_match.start()].count('\n') + 1
+
+        # Extract proof body
+        proof_body_raw = rest[:qed_match.start()]
+        proof_body_stripped = proof_body_raw.strip()
+        leading_ws = len(proof_body_raw) - len(proof_body_raw.lstrip())
+        proof_body_offset = match.end() + leading_ws
+
+        # Check for cheat
+        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
+
+        theorems.append(TheoremInfo(
+            name=name,
+            kind="Resume",
+            goal="",  # Extracted at runtime from HOL session
+            start_line=start_line,
+            proof_start_line=proof_start_line,
+            proof_end_line=proof_end_line,
+            has_cheat=has_cheat,
+            proof_body=proof_body_stripped,
+            proof_body_offset=proof_body_offset,
+            attributes=remaining_attrs,
+            suspension_name=suspension_name,
+            label_name=label_name,
         ))
 
     # Sort by file position (theorems and definitions interleaved)
