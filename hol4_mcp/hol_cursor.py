@@ -349,6 +349,10 @@ class FileProofCursor:
         # e.g. {"thm_c": ["cheat"]} means thm_c transitively depends on a cheat.
         self._theorem_oracles: dict[str, list[str]] = {}
 
+        # Resume goals: name -> {"asms": [...], "goal": "..."}
+        # Extracted during _load_remaining_content BEFORE each Resume block
+        self._resume_goals: dict[str, dict] = {}
+
         # True when pre-theorem context changed (e.g., open/Theory/Ancestors).
         # Such changes require rebuilding HOL session context from scratch.
         self._needs_session_reinit: bool = False
@@ -415,6 +419,7 @@ class FileProofCursor:
                 self._invalidate_all_checkpoints()
                 self._proof_traces.clear()
                 self._tc_goals.clear()
+                self._resume_goals.clear()
                 self._failed_proofs.clear()
                 self._theorem_oracles.clear()
 
@@ -727,8 +732,11 @@ class FileProofCursor:
         for name in list(self._tc_goals.keys()):
             if name not in current_thm_names:
                 del self._tc_goals[name]
+        for name in list(self._resume_goals.keys()):
+            if name not in current_thm_names:
+                del self._resume_goals[name]
         
-        # Invalidate checkpoints/traces/tc_goals for theorems at or after change point
+        # Invalidate checkpoints/traces/tc_goals/resume_goals for theorems at or after change point
         for thm in self._theorems:
             if thm.proof_end_line >= start_line:
                 self._invalidate_checkpoint(thm.name)
@@ -736,6 +744,8 @@ class FileProofCursor:
                     del self._proof_traces[thm.name]
                 if thm.name in self._tc_goals:
                     del self._tc_goals[thm.name]
+                if thm.name in self._resume_goals:
+                    del self._resume_goals[thm.name]
 
     def _evict_lru_checkpoints(self) -> None:
         """Evict oldest checkpoints if over limit.
@@ -856,6 +866,26 @@ class FileProofCursor:
         if 'ok' in tc_data and tc_data['ok']:
             self._tc_goals[thm.name] = tc_data['ok']
 
+    async def _extract_resume_goal(self, thm: TheoremInfo) -> None:
+        """Extract goal for a Resume block from the suspension DB.
+        
+        Must be called AFTER the original Theorem with suspend has been loaded,
+        but BEFORE the Resume block itself is loaded.
+        
+        Results are cached in self._resume_goals[thm.name].
+        """
+        if not thm.suspension_name or thm.label_name is None:
+            return
+        escaped_susp = escape_sml_string(thm.suspension_name)
+        escaped_label = escape_sml_string(thm.label_name)
+        result = await self.session.send(
+            f'extract_resume_goal_json "{escaped_susp}" "{escaped_label}";',
+            timeout=30
+        )
+        data = _find_json_line(result)
+        if 'ok' in data:
+            self._resume_goals[thm.name] = data['ok']
+
     async def _cheat_failed_theorem(self, thm: TheoremInfo) -> str | None:
         """After a proof failure, re-send the theorem with cheat to bind its name.
 
@@ -864,6 +894,20 @@ class FileProofCursor:
 
         Returns error string if the cheat itself fails, else None.
         """
+        if thm.kind == "Resume":
+            attrs_parts = [thm.label_name] if thm.label_name else []
+            attrs_parts.extend(thm.attributes)
+            attrs_str = ','.join(attrs_parts)
+            cheat_block = f'Resume {thm.suspension_name}[{attrs_str}]:\n  cheat\nQED'
+            result = await self.session.send(cheat_block, timeout=30)
+            if _is_hol_error(result):
+                return (
+                    f"Resume '{thm.name}' failed (line {thm.start_line}) "
+                    f"and could not be cheated: {result[:200]}"
+                )
+            self._failed_proofs.add(thm.name)
+            return None
+
         attrs = f"[{','.join(thm.attributes)}]" if thm.attributes else ""
         cheat_block = f'Theorem {thm.name}{attrs}:\n{thm.goal}\nProof\n  cheat\nQED'
         result = await self.session.send(cheat_block, timeout=30)
@@ -904,6 +948,11 @@ class FileProofCursor:
             # Must happen before the constant exists (rollback won't undo replacement).
             if thm.kind == "Definition" and thm.proof_body:
                 await self._extract_tc_goal(thm)
+
+            # For Resume blocks: extract goal from suspension BEFORE loading
+            # (loading resolves the suspension label)
+            if thm.kind == "Resume":
+                await self._extract_resume_goal(thm)
 
             # Load the theorem (header through QED/End)
             thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
@@ -996,6 +1045,10 @@ class FileProofCursor:
                 if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
                     await self._extract_tc_goal(thm)
 
+                # For Resume blocks: extract goal before loading
+                if thm.kind == "Resume" and thm.name not in self._resume_goals:
+                    await self._extract_resume_goal(thm)
+
                 # Load the theorem
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
@@ -1082,9 +1135,18 @@ class FileProofCursor:
         self._current_tactic_idx = 0  # Reset position for new theorem
         self._proof_initialized = False  # Will be set on first state_at
 
+        # For Resume blocks, show the extracted goal if available
+        goal_display = thm.goal
+        if thm.kind == "Resume" and thm.name in self._resume_goals:
+            rg = self._resume_goals[thm.name]
+            goal_display = rg.get('goal', '')
+            asms = rg.get('asms', [])
+            if asms:
+                goal_display = ", ".join(asms) + " ⊢ " + goal_display
+
         return {
             "theorem": name,
-            "goal": thm.goal,
+            "goal": goal_display,
             "tactics": len(self._step_plan),
             "has_cheat": thm.has_cheat,
         }
@@ -1232,7 +1294,23 @@ class FileProofCursor:
         async def _reset_goal_state() -> str | None:
             """Drop all goals and set theorem goal. Returns error string on failure."""
             await self.session.send('drop_all();', timeout=5)
-            if thm.kind == "Definition" and thm.name in self._tc_goals:
+            if thm.kind == "Resume" and thm.name in self._resume_goals:
+                # Resume block: use extracted goal with assumptions
+                rg = self._resume_goals[thm.name]
+                asms = rg.get('asms', [])
+                goal_str = rg.get('goal', '')
+                if asms:
+                    asm_terms = ", ".join(
+                        f'Parse.Term [QUOTE "{escape_sml_string(a)}"]' for a in asms
+                    )
+                    gt_result = await self.session.send(
+                        f'proofManagerLib.set_goal([{asm_terms}], '
+                        f'Parse.Term [QUOTE "{escape_sml_string(goal_str)}"]);',
+                        timeout=30
+                    )
+                else:
+                    gt_result = await self.session.send(f'g `{goal_str}`;', timeout=30)
+            elif thm.kind == "Definition" and thm.name in self._tc_goals:
                 # Definition with Termination: use the termination conditions
                 # goal (e.g., "?R. WF R /\ ...") instead of the function body.
                 tc_goal = self._tc_goals[thm.name]
@@ -1500,21 +1578,42 @@ class FileProofCursor:
             return []
 
         # For Definitions, use the TC goal (which doesn't reference the
-        # function constant, so it works even before the Definition is processed)
-        if thm.kind == "Definition" and thm.name in self._tc_goals:
+        # function constant, so it works even before the Definition is processed).
+        # For Resume blocks, extract goal from suspension DB if not already cached
+        # (suspension exists because enter_theorem loaded context to theorem start).
+        if thm.kind == "Resume":
+            if thm.name not in self._resume_goals:
+                await self._extract_resume_goal(thm)
+            rg = self._resume_goals.get(thm.name)
+            if not rg:
+                return []  # Can't extract goal from suspension
+            goal = rg.get('goal', '')
+            asms = rg.get('asms', [])
+        elif thm.kind == "Definition" and thm.name in self._tc_goals:
             goal = self._tc_goals[thm.name]
+            asms = []
         else:
             goal = thm.goal.replace('\n', ' ').strip()
+            asms = []
         tactics_sml = "[" + ",".join(
             f'"{escape_sml_string(t)}"' for t in tactics
         ) + "]"
         tactic_timeout = self._tactic_timeout or 60.0
         # Python timeout = per-tactic timeout * num tactics + buffer
         python_timeout = tactic_timeout * len(tactics) + 10
-        result = await self.session.send(
-            f'verify_theorem_json "{escape_sml_string(goal)}" "{theorem_name}" {tactics_sml} false {tactic_timeout:.1f};',
-            timeout=max(30, python_timeout)
-        )
+        if asms:
+            asms_sml = "[" + ",".join(
+                f'"{escape_sml_string(a)}"' for a in asms
+            ) + "]"
+            result = await self.session.send(
+                f'verify_theorem_with_asms_json "{escape_sml_string(goal)}" {asms_sml} "{theorem_name}" {tactics_sml} false {tactic_timeout:.1f};',
+                timeout=max(30, python_timeout)
+            )
+        else:
+            result = await self.session.send(
+                f'verify_theorem_json "{escape_sml_string(goal)}" "{theorem_name}" {tactics_sml} false {tactic_timeout:.1f};',
+                timeout=max(30, python_timeout)
+            )
 
         # Parse response into TraceEntry list
         parsed = _find_json_line(result)
@@ -1645,7 +1744,28 @@ class FileProofCursor:
 
             # For Definitions: extract TC goal, verify with store=false for
             # timing, then load the full block to establish the definition.
-            if thm.kind == "Definition":
+            # For Resume: extract goal from suspension DB.
+            asms = []
+            if thm.kind == "Resume":
+                if thm.name not in self._resume_goals:
+                    await self._extract_resume_goal(thm)
+                rg = self._resume_goals.get(thm.name)
+                if rg:
+                    goal = rg.get('goal', '')
+                    asms = rg.get('asms', [])
+                else:
+                    # Resume goal extraction failed — load as-is
+                    thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
+                    if thm_content.strip():
+                        resume_result = await self.session.send(thm_content, timeout=60)
+                        if _is_hol_error(resume_result):
+                            cheat_err = await self._cheat_failed_theorem(thm)
+                            if cheat_err:
+                                return {}
+                    results[thm.name] = []
+                    current_line = thm.proof_end_line - 1
+                    continue
+            elif thm.kind == "Definition":
                 if thm.name not in self._tc_goals:
                     await self._extract_tc_goal(thm)
                 tc_goal = self._tc_goals.get(thm.name)
@@ -1678,14 +1798,23 @@ class FileProofCursor:
             ) + "]"
 
             # Single call: sets goal, runs tactics with timing, stores if OK
-            # For Definitions, store=false (can't save TC proof as definition)
-            store = "false" if thm.kind == "Definition" else "true"
+            # For Definitions/Resume, store=false (can't save TC/Resume proof as definition)
+            store = "false" if thm.kind in ("Definition", "Resume") else "true"
             tactic_timeout = self._tactic_timeout or 60.0
             python_timeout = tactic_timeout * len(tactics) + 10
-            result = await self.session.send(
-                f'verify_theorem_json "{escape_sml_string(goal)}" "{thm.name}" {tactics_sml} {store} {tactic_timeout:.1f};',
-                timeout=max(30, python_timeout)
-            )
+            if asms:
+                asms_sml = "[" + ",".join(
+                    f'"{escape_sml_string(a)}"' for a in asms
+                ) + "]"
+                result = await self.session.send(
+                    f'verify_theorem_with_asms_json "{escape_sml_string(goal)}" {asms_sml} "{thm.name}" {tactics_sml} {store} {tactic_timeout:.1f};',
+                    timeout=max(30, python_timeout)
+                )
+            else:
+                result = await self.session.send(
+                    f'verify_theorem_json "{escape_sml_string(goal)}" "{thm.name}" {tactics_sml} {store} {tactic_timeout:.1f};',
+                    timeout=max(30, python_timeout)
+                )
 
             # Parse response and convert to TraceEntry list
             parsed = _find_json_line(result)
@@ -1726,11 +1855,19 @@ class FileProofCursor:
                 if oracles:
                     self._theorem_oracles[thm.name] = oracles
 
-            # For Definitions: always re-send the full block to create the
-            # constant and store def/ind theorems (verify_theorem_json only
-            # proved the TCs without creating the definition).
+            # For Definitions/Resume: always re-send the full block.
+            # Definitions: create the constant and store def/ind theorems.
+            # Resume: finalise the suspended subgoal.
             # For Theorems: re-send if attributes need registration.
-            if thm.kind == "Definition":
+            if thm.kind == "Resume":
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
+                if thm_content.strip():
+                    resume_result = await self.session.send(thm_content, timeout=60)
+                    if _is_hol_error(resume_result):
+                        cheat_err = await self._cheat_failed_theorem(thm)
+                        if cheat_err:
+                            return {}
+            elif thm.kind == "Definition":
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     def_result = await self.session.send(thm_content, timeout=60)

@@ -803,3 +803,215 @@ val _ = export_theory();
     # Both theorems should have results
     assert len(results) == 2, f"Expected 2, got {list(results.keys())}"
     assert "uses_incomplete" in results
+
+
+# =============================================================================
+# Resume/Finalise tests
+# =============================================================================
+
+RESUME_SCRIPT = """\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testResume";
+
+Theorem split_conj:
+  p /\\ (p ==> q) ==> p /\\ q
+Proof
+  strip_tac >> conj_tac
+  >- suspend "p_case"
+  >- suspend "q_case"
+QED
+
+Resume split_conj[p_case]:
+  ASM_REWRITE_TAC[]
+QED
+
+Resume split_conj[q_case]:
+  RES_TAC
+QED
+
+Finalise split_conj
+
+Theorem after_resume:
+  T
+Proof
+  simp[]
+QED
+
+val _ = export_theory();
+"""
+
+
+@pytest.mark.asyncio
+async def test_resume_init_lists_blocks(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """init() should list Resume blocks alongside regular theorems."""
+    script = tmp_path / "testResumeScript.sml"
+    script.write_text(RESUME_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    result = await cursor.init()
+
+    names = [t['name'] for t in result['theorems']]
+    assert "split_conj" in names
+    assert "split_conj[p_case]" in names
+    assert "split_conj[q_case]" in names
+    assert "after_resume" in names
+    assert not result.get('error'), f"init error: {result.get('error')}"
+
+
+@pytest.mark.asyncio
+async def test_resume_state_at(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """state_at should navigate into Resume blocks and show goals."""
+    script = tmp_path / "testResumeScript.sml"
+    script.write_text(RESUME_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Find the p_case Resume block
+    thm = cursor._get_theorem("split_conj[p_case]")
+    assert thm is not None, "split_conj[p_case] should exist"
+
+    # Navigate to the proof start (should show the suspended goal)
+    result = await cursor.state_at(thm.proof_start_line, 1)
+    assert result.goals, f"Expected goals, got error: {result.error}"
+    # The goal should be related to p (the suspended subgoal)
+    goal_text = result.goals[0].get('goal', '')
+    assert goal_text, f"Expected non-empty goal, goals={result.goals}"
+
+
+@pytest.mark.asyncio
+async def test_resume_state_at_after_tactics(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """state_at at QED line should show proof complete (no goals)."""
+    script = tmp_path / "testResumeScript.sml"
+    script.write_text(RESUME_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    thm = cursor._get_theorem("split_conj[p_case]")
+    assert thm is not None
+
+    # Navigate to QED line — should have all tactics replayed
+    qed_line = thm.proof_end_line - 1
+    result = await cursor.state_at(qed_line, 1)
+    # "no goals" error from goals_json means proof completed
+    no_goals_ok = result.error and "no goals" in result.error.lower()
+    assert len(result.goals) == 0 or no_goals_ok, \
+        f"Expected proof complete at QED, got {len(result.goals)} goals, error={result.error}"
+
+
+@pytest.mark.asyncio
+async def test_resume_enter_theorem_shows_goal(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """enter_theorem on a Resume block should show the suspended goal."""
+    script = tmp_path / "testResumeScript.sml"
+    script.write_text(RESUME_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    result = await cursor.enter_theorem("split_conj[p_case]")
+    assert "error" not in result, f"enter_theorem error: {result.get('error')}"
+    assert result.get('goal'), "Goal should be non-empty for Resume block"
+    assert result.get('tactics', 0) > 0, "Should have at least one tactic"
+
+
+@pytest.mark.asyncio
+async def test_resume_check_proof(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """execute_proof_traced on a Resume block should return timing trace."""
+    script = tmp_path / "testResumeScript.sml"
+    script.write_text(RESUME_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    trace = await cursor.execute_proof_traced("split_conj[p_case]")
+    assert trace, "Should have trace entries for Resume block"
+    assert not any(e.error for e in trace), \
+        f"No errors expected: {[e.error for e in trace if e.error]}"
+
+
+@pytest.mark.asyncio
+async def test_resume_verify_all_proofs(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """verify_all_proofs should handle Resume blocks."""
+    script = tmp_path / "testResumeScript.sml"
+    script.write_text(RESUME_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    results = await cursor.verify_all_proofs()
+
+    # Should have results for all theorems including Resume blocks
+    assert "split_conj" in results
+    assert "split_conj[p_case]" in results
+    assert "split_conj[q_case]" in results
+    assert "after_resume" in results
+
+    # Resume proofs should succeed (no errors)
+    for name in ["split_conj[p_case]", "split_conj[q_case]"]:
+        trace = results[name]
+        if trace:
+            errors = [e.error for e in trace if e.error]
+            assert not errors, f"{name} has errors: {errors}"
+
+
+@pytest.mark.asyncio
+async def test_resume_file_status(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Cursor status should list Resume blocks."""
+    script = tmp_path / "testResumeScript.sml"
+    script.write_text(RESUME_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    status = cursor.status
+    names = [t['name'] for t in status['theorems']]
+    assert "split_conj[p_case]" in names
+    assert "split_conj[q_case]" in names
+
+
+@pytest.mark.asyncio
+async def test_resume_failed_proof_cheated(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """A Resume with a failing tactic (runtime fail) should be cheated."""
+    script = tmp_path / "testResumeBadScript.sml"
+    # Use a real tactic that fails (ACCEPT_TAC TRUTH doesn't solve "p")
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testResumeBad";
+
+Theorem split_conj:
+  p /\\ (p ==> q) ==> p /\\ q
+Proof
+  strip_tac >> conj_tac
+  >- suspend "p_case"
+  >- suspend "q_case"
+QED
+
+Resume split_conj[p_case]:
+  ACCEPT_TAC TRUTH
+QED
+
+Resume split_conj[q_case]:
+  RES_TAC
+QED
+
+Finalise split_conj
+
+Theorem still_works:
+  T
+Proof
+  simp[]
+QED
+
+val _ = export_theory();
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    result = await cursor.init()
+
+    # Init should succeed (failed Resume cheated)
+    assert not result.get('error'), f"init error: {result.get('error')}"
+
+    # The after-resume theorem should be accessible
+    names = [t['name'] for t in result['theorems']]
+    assert "still_works" in names
