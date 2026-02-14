@@ -684,3 +684,122 @@ val _ = export_theory();
     status = cursor.status
     ok2_status = next(t for t in status["theorems"] if t["name"] == "ok2")
     assert "proof_failed" not in ok2_status
+
+
+@pytest.mark.asyncio
+async def test_definition_failure_reported_clearly(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """T6: Failed Definition is reported as error, not silently swallowed.
+
+    Definitions create constants + def/ind theorems as a unit.
+    They can't be cheated. A failed Definition should produce a clear error.
+    """
+    script = tmp_path / "testDefFailScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "testDefFail";
+
+Definition bad_def:
+  bad (n:num) = bad n + 1
+Termination
+  FAIL_TAC "broken"
+End
+
+Theorem uses_bad:
+  bad 0 = 1
+Proof
+  simp[Once bad_def]
+QED
+
+val _ = export_theory();
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    result = await cursor.init()
+
+    # Init should report the Definition failure clearly
+    assert "error" in result
+    assert "bad_def" in result["error"]
+    # Definition should NOT be in _failed_proofs (not cheated)
+    assert "bad_def" not in cursor._failed_proofs
+
+
+@pytest.mark.asyncio
+async def test_verify_all_proofs_cascade(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """T7: verify_all_proofs cheats failed proofs to prevent cascade."""
+    script = tmp_path / "testVerifyCascadeScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "testVerifyCascade";
+
+Theorem good_a:
+  T ==> T
+Proof
+  strip_tac
+QED
+
+Theorem broken_b:
+  T /\\ T
+Proof
+  FAIL_TAC "intentional"
+QED
+
+Theorem uses_b:
+  T
+Proof
+  metis_tac[broken_b]
+QED
+
+val _ = export_theory();
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    results = await cursor.verify_all_proofs()
+
+    # All 3 theorems should have results (no crash from cascade)
+    assert len(results) == 3, f"Expected 3, got {list(results.keys())}"
+
+    # good_a should verify cleanly
+    assert results["good_a"]
+    assert not any(e.error for e in results["good_a"])
+
+    # broken_b should have an error in its trace
+    assert results["broken_b"]
+    assert any(e.error for e in results["broken_b"])
+
+    # uses_b should succeed — broken_b cheated, metis_tac[broken_b] works
+    assert "uses_b" in results
+    assert results["uses_b"]
+    assert not any(e.error for e in results["uses_b"]), \
+        f"uses_b should succeed: {[e.error for e in results['uses_b']]}"
+
+
+@pytest.mark.asyncio
+async def test_verify_all_proofs_incomplete_cheated(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """verify_all_proofs cheats incomplete proofs (goals remain) too."""
+    script = tmp_path / "testVerifyIncompleteScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "testVerifyIncomplete";
+
+Theorem incomplete_b:
+  T /\\ T
+Proof
+  conj_tac
+QED
+
+Theorem uses_incomplete:
+  T ==> T /\\ T
+Proof
+  strip_tac >> ACCEPT_TAC incomplete_b
+QED
+
+val _ = export_theory();
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    results = await cursor.verify_all_proofs()
+
+    # Both theorems should have results
+    assert len(results) == 2, f"Expected 2, got {list(results.keys())}"
+    assert "uses_incomplete" in results

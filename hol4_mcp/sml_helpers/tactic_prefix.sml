@@ -542,11 +542,22 @@ fun verify_theorem_json goal name tactics store timeout_sec =
             then (smlExecute.quse_string ("val " ^ name ^ " = save_thm(\"" ^ name ^ "\", top_thm());"); ())
             else (drop_all (); ())
 
+    (* Check oracle tags on stored theorem — detects cheat cascades.
+       Oracle tags propagate through inference, so if any dependency
+       was cheated, this theorem's tag will contain "cheat". *)
+    val oracles =
+      if stored then
+        Lib.set_diff (fst (Tag.dest_tag (Thm.tag (DB.fetch "-" name)))) ["DISK_THM"]
+        handle _ => []
+      else []
+
+    val oracles_json = "[" ^ String.concatWith "," (map json_string oracles) ^ "]"
     val trace_json = "[" ^ String.concatWith "," trace_entries ^ "]"
   in
     print (json_ok (
       "{\"stored\":" ^ (if stored then "true" else "false") ^
       ",\"name\":" ^ json_string name ^
+      ",\"oracles\":" ^ oracles_json ^
       ",\"trace\":" ^ trace_json ^ "}") ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");

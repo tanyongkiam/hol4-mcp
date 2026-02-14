@@ -946,6 +946,9 @@ async def hol_check_proof(
         lines.append("      Remove 'cheat' and rerun hol_check_proof for full replay.")
         return "\n".join(lines)
 
+    # Oracle tags are populated after execute_proof_traced (calls verify_theorem_json).
+    # We check them after execution below.
+
     # Execute proof (clean mode by default - matches holmake, uses cache)
     trace_data = await cursor.execute_proof_traced(theorem)
     
@@ -1000,8 +1003,12 @@ async def hol_check_proof(
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")
         lines.append(f"Error: {final.error}")
     elif final.goals_after == 0:
-        lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps)")
-        if not trace:
+        oracles = cursor._theorem_oracles.get(theorem, [])
+        if oracles:
+            lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps) ⚠ depends on cheat")
+        else:
+            lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps)")
+        if not trace and not oracles:
             return "\n".join(lines)
     else:
         lines.append(f"Status: INCOMPLETE at step {len(trace_data)}/{total_steps} ({total_ms}ms)")
@@ -1099,10 +1106,18 @@ async def hol_file_status(file: str = None, workdir: str = None, timing: bool = 
 
         for thm in status['theorems']:
             trace = all_traces.get(thm['name'], [])
+            if thm['has_cheat'] or thm.get('proof_failed'):
+                if thm['has_cheat']:
+                    cheated.append(thm['name'])
+                    timing_lines.append(f"  {thm['name']}: (cheat)")
+                # proof_failed theorems are handled in the trace branch below
+                if thm.get('proof_failed') and not trace:
+                    failed.append((thm['name'], "proof failed"))
+                    timing_lines.append(f"  {thm['name']}: (proof failed)")
+                    continue
             if thm['has_cheat']:
-                cheated.append(thm['name'])
-                timing_lines.append(f"  {thm['name']}: (cheat)")
-            elif trace:
+                continue
+            if trace:
                 thm_ms = sum(e.real_ms for e in trace)
                 total_ms += thm_ms
                 error = next((e.error for e in trace if e.error), None)
@@ -1115,8 +1130,11 @@ async def hol_file_status(file: str = None, workdir: str = None, timing: bool = 
                     failed.append((thm['name'], f"incomplete ({final_goals} goals remain)"))
                     timing_lines.append(f"  {thm['name']}: {thm_ms}ms (INCOMPLETE: {final_goals} goals)")
                 else:
+                    # Check oracle tags from HOL4 — detects cheat cascades
+                    oracles = cursor._theorem_oracles.get(thm['name'], [])
+                    warn = f" ⚠ depends on cheat" if oracles else ""
                     verified.append(thm['name'])
-                    timing_lines.append(f"  {thm['name']}: {thm_ms}ms")
+                    timing_lines.append(f"  {thm['name']}: {thm_ms}ms{warn}")
             else:
                 # Check if this is a Definition block (loaded as a unit, no timing)
                 thm_info = cursor._get_theorem(thm['name']) if cursor else None

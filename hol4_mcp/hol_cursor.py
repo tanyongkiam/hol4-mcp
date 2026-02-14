@@ -345,6 +345,10 @@ class FileProofCursor:
         # auto-cheated to prevent cascading compile errors. Cleared on file change.
         self._failed_proofs: set[str] = set()
 
+        # Oracle tags per theorem from verify_all_proofs.
+        # e.g. {"thm_c": ["cheat"]} means thm_c transitively depends on a cheat.
+        self._theorem_oracles: dict[str, list[str]] = {}
+
         # True when pre-theorem context changed (e.g., open/Theory/Ancestors).
         # Such changes require rebuilding HOL session context from scratch.
         self._needs_session_reinit: bool = False
@@ -412,6 +416,7 @@ class FileProofCursor:
                 self._proof_traces.clear()
                 self._tc_goals.clear()
                 self._failed_proofs.clear()
+                self._theorem_oracles.clear()
 
                 # Invalidate saved base/deps checkpoints (stale imports/ancestors)
                 for ckpt_path in [self._base_checkpoint_path, self._deps_checkpoint_path]:
@@ -909,7 +914,14 @@ class FileProofCursor:
                 # On proof failure, cheat the theorem so its name is bound.
                 # Without this, later theorems that reference it get a fatal
                 # Poly/ML compile error ("Value or constructor not declared").
-                if _is_hol_error(result) and thm.kind != "Definition":
+                if _is_hol_error(result):
+                    if thm.kind == "Definition":
+                        # Definition failures are fatal — they create constants
+                        # and can't be cheated. Report clearly.
+                        return (
+                            f"Definition '{thm.name}' failed (line {thm.start_line}): "
+                            f"{result[:300]}"
+                        )
                     cheat_err = await self._cheat_failed_theorem(thm)
                     if cheat_err:
                         return cheat_err
@@ -991,7 +1003,12 @@ class FileProofCursor:
                     if _is_fatal_hol_error(result):
                         return f"Failed to load context: {_format_context_error(result)}"
                     # On proof failure, cheat so later theorems can reference it
-                    if _is_hol_error(result) and thm.kind != "Definition":
+                    if _is_hol_error(result):
+                        if thm.kind == "Definition":
+                            return (
+                                f"Definition '{thm.name}' failed (line {thm.start_line}): "
+                                f"{result[:300]}"
+                            )
                         cheat_err = await self._cheat_failed_theorem(thm)
                         if cheat_err:
                             return cheat_err
@@ -1524,6 +1541,12 @@ class FileProofCursor:
                 goals_before=0, goals_after=0, error=parsed['err']
             ))
 
+        # Track oracle tags (detects cheat cascades via HOL4's tag propagation)
+        if 'ok' in parsed:
+            oracles = parsed['ok'].get('oracles', [])
+            if oracles:
+                self._theorem_oracles[theorem_name] = oracles
+
         self._proof_traces[theorem_name] = trace
         return trace
 
@@ -1601,7 +1624,21 @@ class FileProofCursor:
                 # No tactics - load theorem as-is
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
-                    await self.session.send(thm_content, timeout=60)
+                    result = await self.session.send(thm_content, timeout=60)
+                    # If proof failed, cheat to bind name for later theorems
+                    if _is_hol_error(result):
+                        if thm.kind == "Definition":
+                            # Definition failures can't be cheated; record error
+                            results[thm.name] = [TraceEntry(
+                                cmd="", real_ms=0, usr_ms=0, sys_ms=0,
+                                goals_before=0, goals_after=0,
+                                error=f"Definition failed: {result[:200]}"
+                            )]
+                            current_line = thm.proof_end_line - 1
+                            continue
+                        cheat_err = await self._cheat_failed_theorem(thm)
+                        if cheat_err:
+                            return {}
                 results[thm.name] = []
                 current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
                 continue
@@ -1618,8 +1655,17 @@ class FileProofCursor:
                     # TC extraction failed — load as-is without timing
                     thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                     if thm_content.strip():
-                        await self.session.send(thm_content, timeout=60)
-                    results[thm.name] = []
+                        def_result = await self.session.send(thm_content, timeout=60)
+                        if _is_hol_error(def_result):
+                            results[thm.name] = [TraceEntry(
+                                cmd="", real_ms=0, usr_ms=0, sys_ms=0,
+                                goals_before=0, goals_after=0,
+                                error=f"Definition failed: {def_result[:200]}"
+                            )]
+                        else:
+                            results[thm.name] = []
+                    else:
+                        results[thm.name] = []
                     current_line = thm.proof_end_line - 1
                     continue
             else:
@@ -1667,14 +1713,45 @@ class FileProofCursor:
                     goals_before=0, goals_after=0, error=parsed['err']
                 ))
 
+            # Did verify_theorem_json store the theorem?
+            # stored=true only when proof_ok AND store=true.
+            stored = (
+                'ok' in parsed
+                and parsed['ok'].get('stored', False)
+            )
+
+            # Track oracle tags (detects cheat cascades via HOL4's tag propagation)
+            if 'ok' in parsed:
+                oracles = parsed['ok'].get('oracles', [])
+                if oracles:
+                    self._theorem_oracles[thm.name] = oracles
+
             # For Definitions: always re-send the full block to create the
             # constant and store def/ind theorems (verify_theorem_json only
             # proved the TCs without creating the definition).
             # For Theorems: re-send if attributes need registration.
-            if thm.kind == "Definition" or (thm.attributes and trace and not any(e.error for e in trace)):
+            if thm.kind == "Definition":
+                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
+                if thm_content.strip():
+                    def_result = await self.session.send(thm_content, timeout=60)
+                    if _is_hol_error(def_result):
+                        # Definition block failed — record error in trace
+                        trace.append(TraceEntry(
+                            cmd="", real_ms=0, usr_ms=0, sys_ms=0,
+                            goals_before=0, goals_after=0,
+                            error=f"Definition failed: {def_result[:200]}"
+                        ))
+            elif stored and thm.attributes:
+                # Re-send to register attributes (e.g. [simp])
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
                     await self.session.send(thm_content, timeout=60)
+            elif not stored:
+                # Proof failed/incomplete and name is unbound.
+                # Cheat to bind the name so later theorems can reference it.
+                cheat_err = await self._cheat_failed_theorem(thm)
+                if cheat_err:
+                    return {}
 
             results[thm.name] = trace
             current_line = thm.proof_end_line - 1  # 0-indexed: next line to load
