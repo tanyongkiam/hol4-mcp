@@ -14,6 +14,7 @@
 (* Load dependencies *)
 load "TacticParse";
 load "smlExecute";
+load "markerLib";
 
 (* JSON helpers *)
 fun json_escape_char c =
@@ -484,17 +485,11 @@ fun timed_step_json cmd =
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
-(* verify_theorem_json: Execute entire proof with timing, optionally store.
-   Args: goal (string), name (string), tactics (string list), store (bool), timeout_sec (real)
-   Output: {"ok":{"stored":true/false,"name":"...",
-            "trace":[{"real_ms":N,"goals_before":N,"goals_after":N}, ...]}}
-   Does: drop_all -> g goal -> run tactics with timing -> save_thm if OK and store=true *)
-fun verify_theorem_json goal name tactics store timeout_sec =
+(* Core verification - goal must already be set on proof manager.
+   Runs tactics with per-tactic timing, optionally stores theorem.
+   Checks oracle tags on stored theorems for cheat detection. *)
+fun verify_core name tactics store timeout_sec =
   let
-    val _ = drop_all ()
-    val _ = smlExecute.quse_string ("g `" ^ goal ^ "`;")
-
-    (* Run single tactic with timeout, return JSON entry *)
     fun run_one cmd =
       let
         val goals_before = length (top_goals()) handle _ => 0
@@ -523,28 +518,22 @@ fun verify_theorem_json goal name tactics store timeout_sec =
         (SOME ("{\"err\":" ^ json_string (exnMessage e) ^
                ",\"goals_before\":" ^ Int.toString (length (top_goals()) handle _ => 0) ^ "}"), false)
 
-    (* Run all tactics, stop on error *)
     fun run_all [] acc = rev acc
       | run_all (cmd::rest) acc =
           case run_one cmd of
             (SOME entry, true) => run_all rest (entry::acc)
-          | (SOME entry, false) => rev (entry::acc)  (* error - stop *)
+          | (SOME entry, false) => rev (entry::acc)
           | (NONE, _) => rev acc
 
     val trace_entries = run_all tactics []
-    (* When proof complete, top_goals() raises - treat as 0 goals remaining *)
     val goals_remaining = length (top_goals()) handle _ => 0
     val proof_ok = goals_remaining = 0
 
-    (* Store if successful and requested - bind to val so later proofs can use it *)
     val stored = proof_ok andalso store
     val _ = if stored
             then (smlExecute.quse_string ("val " ^ name ^ " = save_thm(\"" ^ name ^ "\", top_thm());"); ())
             else (drop_all (); ())
 
-    (* Check oracle tags on stored theorem — detects cheat cascades.
-       Oracle tags propagate through inference, so if any dependency
-       was cheated, this theorem's tag will contain "cheat". *)
     val oracles =
       if stored then
         Lib.set_diff (fst (Tag.dest_tag (Thm.tag (DB.fetch "-" name)))) ["DISK_THM"]
@@ -561,6 +550,19 @@ fun verify_theorem_json goal name tactics store timeout_sec =
       ",\"trace\":" ^ trace_json ^ "}") ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* verify_theorem_json: Execute entire proof with timing, optionally store.
+   Args: goal (string), name (string), tactics (string list), store (bool), timeout_sec (real)
+   Output: {"ok":{"stored":true/false,"name":"...",
+            "trace":[{"real_ms":N,"goals_before":N,"goals_after":N}, ...]}}
+   Does: drop_all -> g goal -> run tactics with timing -> save_thm if OK and store=true *)
+fun verify_theorem_json goal name tactics store timeout_sec =
+  let
+    val _ = drop_all ()
+    val _ = smlExecute.quse_string ("g `" ^ goal ^ "`;")
+  in
+    verify_core name tactics store timeout_sec
+  end;
 
 (* =============================================================================
  * Definition Termination Goal Extraction
@@ -604,5 +606,48 @@ fun extract_tc_goal_json body_str =
     ) handle MCP_TC_Rollback => ()
   in
     print (json_ok (json_string (!result)) ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* =============================================================================
+ * Resume Goal Extraction
+ * =============================================================================
+ * Extract the goal for a Resume block from the suspension DB.
+ * Returns: {"ok":{"asms":[...], "goal":"..."}} or {"err":"..."}
+ *)
+
+fun extract_resume_goal_json suspension_name label_name =
+  let
+    val th = case boolLib.find_suspension suspension_name of
+                 SOME th => th
+               | NONE => raise Fail ("No suspension found: " ^ suspension_name)
+    val goal_term = markerLib.extract_suspended_goal th label_name
+    val (asms, concl) = markerLib.resumption_to_goal goal_term
+    (* Use type-annotated term_to_string so goals round-trip through Parse.Term.
+       Without annotations, variables like "p" parse as 'a instead of bool. *)
+    fun typed_term_to_string t =
+      Lib.with_flag (Globals.show_types, true) term_to_string t
+    val json = "{\"asms\":" ^ json_string_array (map typed_term_to_string asms) ^
+               ",\"goal\":" ^ json_string (typed_term_to_string concl) ^ "}"
+  in
+    print (json_ok json ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* Like verify_theorem_json but with explicit assumptions for Resume blocks.
+   When asms is non-empty, uses proofManagerLib.set_goal to set assumptions. *)
+fun verify_theorem_with_asms_json goal asms name tactics store timeout_sec =
+  let
+    val _ = drop_all ()
+    val _ = if null asms then
+              smlExecute.quse_string ("g `" ^ goal ^ "`;")
+            else
+              let val asm_terms = map (fn a => Parse.Term [QUOTE a]) asms
+                  val concl_term = Parse.Term [QUOTE goal]
+              in
+                proofManagerLib.set_goal(asm_terms, concl_term); true
+              end
+  in
+    verify_core name tactics store timeout_sec
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
