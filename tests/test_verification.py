@@ -526,3 +526,161 @@ QED
     # (HOL processes the full Definition block including cheat)
     result = await cursor.state_at(12, col=1)  # Inside uses_cheat proof
     assert result.tactics_total >= 1
+
+
+# ===========================================================================
+# Cascade prevention: cheat failed proofs during loading
+# ===========================================================================
+
+CASCADE_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "testCascade";
+
+Theorem thm_a:
+  T ==> T
+Proof
+  strip_tac
+QED
+
+Theorem thm_b:
+  T /\\ T
+Proof
+  FAIL_TAC "intentional"
+QED
+
+Theorem thm_c:
+  T ==> T /\\ T
+Proof
+  strip_tac >> ACCEPT_TAC thm_b
+QED
+
+val _ = export_theory();
+"""
+
+
+@pytest.mark.asyncio
+async def test_cascade_prevented_init(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """T1: Init succeeds despite broken proof; cascade prevented by auto-cheat."""
+    script = tmp_path / "testCascadeScript.sml"
+    script.write_text(CASCADE_SCRIPT)
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    result = await cursor.init()
+
+    # Init should succeed (no error), all 3 theorems found
+    assert "error" not in result
+    assert len(result["theorems"]) == 3
+
+    # thm_b should be in _failed_proofs and marked proof_failed in status
+    assert "thm_b" in cursor._failed_proofs
+    status = cursor.status
+    thm_b_status = next(t for t in status["theorems"] if t["name"] == "thm_b")
+    assert thm_b_status.get("proof_failed") is True
+
+    # thm_a should NOT be marked proof_failed
+    thm_a_status = next(t for t in status["theorems"] if t["name"] == "thm_a")
+    assert "proof_failed" not in thm_a_status
+
+    # thm_c should NOT be marked proof_failed (its proof uses the cheated thm_b)
+    thm_c_status = next(t for t in status["theorems"] if t["name"] == "thm_c")
+    assert "proof_failed" not in thm_c_status
+
+
+@pytest.mark.asyncio
+async def test_state_at_after_cheated_theorem(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """T3: state_at works on theorem after a cheated one."""
+    script = tmp_path / "testCascadeScript.sml"
+    script.write_text(CASCADE_SCRIPT)
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # state_at on thm_c should work - it uses thm_b which was cheated to TRUTH
+    result = await cursor.state_at(19, col=1)  # "strip_tac >> ACCEPT_TAC thm_b"
+    assert result.error is None, f"state_at failed: {result.error}"
+    assert result.tactics_total >= 1
+
+
+@pytest.mark.asyncio
+async def test_enter_theorem_after_cheated(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """T4: enter_theorem loads context with cheated intermediate theorem."""
+    script = tmp_path / "testCascadeScript.sml"
+    script.write_text(CASCADE_SCRIPT)
+    # Use a fresh cursor — don't call init first, to test _load_context_to_line
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Entering thm_c should work - it triggers _load_context_to_line
+    # which must cheat thm_b to proceed
+    result = await cursor.enter_theorem("thm_c")
+    assert "error" not in result, f"enter_theorem failed: {result.get('error')}"
+    assert result["theorem"] == "thm_c"
+    assert result["tactics"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_failed_proofs_cleared_on_header_change(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """T5: _failed_proofs cleared when pre-theorem content changes (triggers reinit)."""
+    script = tmp_path / "testCascadeScript.sml"
+    script.write_text(CASCADE_SCRIPT)
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Verify thm_b is in failed_proofs after init
+    assert "thm_b" in cursor._failed_proofs
+
+    # Change pre-theorem content (triggers full session reinit path)
+    fixed_script = CASCADE_SCRIPT.replace(
+        'val _ = new_theory "testCascade";',
+        'val _ = new_theory "testCascade";\n(* changed *)',
+    )
+    script.write_text(fixed_script)
+
+    # status() triggers reparse; pre-theorem change clears _failed_proofs
+    status = cursor.status
+    assert "thm_b" not in cursor._failed_proofs
+
+
+@pytest.mark.asyncio
+async def test_cascade_multiple_failures(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Multiple broken proofs should all be cheated; later theorems still load."""
+    script = tmp_path / "testMultiFailScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "testMultiFail";
+
+Theorem ok1:
+  T ==> T
+Proof
+  strip_tac
+QED
+
+Theorem fail1:
+  T /\\ T
+Proof
+  FAIL_TAC "fail1"
+QED
+
+Theorem fail2:
+  T
+Proof
+  FAIL_TAC "fail2"
+QED
+
+Theorem ok2:
+  T ==> T /\\ T
+Proof
+  strip_tac >> ACCEPT_TAC fail1
+QED
+
+val _ = export_theory();
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    result = await cursor.init()
+
+    assert "error" not in result
+    assert len(result["theorems"]) == 4
+    assert cursor._failed_proofs == {"fail1", "fail2"}
+
+    # ok2 references fail1 (cheated to TRUTH) — should still load
+    status = cursor.status
+    ok2_status = next(t for t in status["theorems"] if t["name"] == "ok2")
+    assert "proof_failed" not in ok2_status
