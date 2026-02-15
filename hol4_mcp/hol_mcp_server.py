@@ -88,38 +88,80 @@ signal.signal(signal.SIGINT, _sigint_handler)
 
 
 _SESSION_IDLE_TIMEOUT = 7200  # 2 hours
-
-
-def _touch_session(name: str):
-    """Update last_used timestamp for a session."""
-    entry = _sessions.get(name)
-    if entry:
-        entry.last_used = time.time()
+_PRUNE_INTERVAL = 300  # Check every 5 minutes at most
+_last_prune_time = 0.0
 
 
 async def _prune_idle_sessions():
-    """Stop and remove sessions idle longer than _SESSION_IDLE_TIMEOUT."""
+    """Stop and remove sessions idle longer than _SESSION_IDLE_TIMEOUT.
+
+    Throttled to run at most once per _PRUNE_INTERVAL seconds.
+    """
+    global _last_prune_time
     now = time.time()
+    if now - _last_prune_time < _PRUNE_INTERVAL:
+        return
+    _last_prune_time = now
     to_prune = [
         name for name, entry in _sessions.items()
         if now - entry.last_used > _SESSION_IDLE_TIMEOUT
     ]
     for name in to_prune:
-        entry = _sessions.pop(name, None)
-        if entry:
-            await entry.session.stop()
+        entry = _sessions.get(name)
+        if not entry:
+            continue
+        # Re-check: session may have been touched during a prior await
+        if time.time() - entry.last_used <= _SESSION_IDLE_TIMEOUT:
+            continue
+        _sessions.pop(name, None)
+        await entry.session.stop()
 
 
-def _get_session(name: str) -> Optional[HOLSession]:
-    """Get session from registry, or None if not found."""
+_GC_CALL_INTERVAL = 10    # At most once per N tool calls
+_GC_TIME_INTERVAL = 120   # At most once per K seconds
+_gc_call_counter = 0
+_gc_last_time = 0.0
+
+
+async def _do_gc(session_name: str):
+    """Actually run PolyML.fullGC(). Runs as background task."""
+    entry = _sessions.get(session_name)
+    if entry and entry.session.is_running:
+        try:
+            await entry.session.send('PolyML.fullGC();', timeout=10)
+        except Exception:
+            pass  # Best effort — don't crash on GC failure
+
+
+def _schedule_gc(session_name: str):
+    """Schedule background GC if due. Non-blocking — doesn't delay response.
+
+    Triggers when both conditions met: N calls since last GC AND K seconds elapsed.
+    """
+    global _gc_call_counter, _gc_last_time
+    _gc_call_counter += 1
+    if _gc_call_counter < _GC_CALL_INTERVAL:
+        return
+    now = time.time()
+    if now - _gc_last_time < _GC_TIME_INTERVAL:
+        return
+    _gc_call_counter = 0
+    _gc_last_time = now
+    asyncio.create_task(_do_gc(session_name))
+
+
+async def _get_session(name: str) -> Optional[HOLSession]:
+    """Get session from registry, or None if not found. Triggers idle pruning."""
+    await _prune_idle_sessions()
     entry = _sessions.get(name)
     if entry:
         entry.last_used = time.time()
     return entry.session if entry else None
 
 
-def _get_cursor(name: str) -> Optional[FileProofCursor]:
-    """Get cursor from registry, or None if not found."""
+async def _get_cursor(name: str) -> Optional[FileProofCursor]:
+    """Get cursor from registry, or None if not found. Triggers idle pruning."""
+    await _prune_idle_sessions()
     entry = _sessions.get(name)
     if entry:
         entry.last_used = time.time()
@@ -256,7 +298,7 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
 
     Returns: HOL output (may include errors), truncated if exceeds max_output
     """
-    s = _get_session(session)
+    s = await _get_session(session)
     if not s:
         return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
 
@@ -271,6 +313,7 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
         timeout = 600
 
     result = await s.send(command, timeout=timeout)
+    _schedule_gc(session)
     return _truncate_output(result, max_output)
 
 
@@ -283,7 +326,7 @@ async def hol_interrupt(session: str = "default") -> str:
 
     Returns: Confirmation message
     """
-    s = _get_session(session)
+    s = await _get_session(session)
     if not s:
         return f"ERROR: Session '{session}' not found."
 
@@ -654,7 +697,7 @@ async def _init_file_cursor(
     target_workdir = Path(workdir).resolve() if workdir else file_path.parent
 
     # Auto-start or restart session if workdir changed or file content changed
-    s = _get_session(session)
+    s = await _get_session(session)
     entry = _sessions.get(session)
 
     if s and s.is_running:
@@ -681,7 +724,7 @@ async def _init_file_cursor(
         start_result = await hol_start.fn(workdir=str(target_workdir), name=session, env=start_env)
         if start_result.startswith("ERROR"):
             return start_result
-        s = _get_session(session)
+        s = await _get_session(session)
 
     t0 = time.perf_counter()
     
@@ -737,7 +780,7 @@ async def hol_state_at(
 
     Returns: Tactic position (N/M), goals at that position, errors if any
     """
-    cursor = _get_cursor(session)
+    cursor = await _get_cursor(session)
 
     # Auto-init if file provided and no cursor (or different file)
     if file:
@@ -748,7 +791,7 @@ async def hol_state_at(
             )
             if init_result.startswith("ERROR"):
                 return init_result
-            cursor = _get_cursor(session)
+            cursor = await _get_cursor(session)
 
     if not cursor:
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
@@ -834,6 +877,7 @@ async def hol_state_at(
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
                      f"checkpoint={'yes' if t.get('used_checkpoint') else 'no'}]")
 
+    _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output)
 
 
@@ -903,7 +947,7 @@ async def hol_check_proof(
     Returns: Whether proof completes, failure location, brief goal summary.
              With trace=True, also includes per-step timing and goal counts.
     """
-    cursor = _get_cursor(session)
+    cursor = await _get_cursor(session)
 
     # Auto-init if file provided
     if file:
@@ -914,7 +958,7 @@ async def hol_check_proof(
             )
             if init_result.startswith("ERROR"):
                 return init_result
-            cursor = _get_cursor(session)
+            cursor = await _get_cursor(session)
 
     if not cursor:
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
@@ -1058,6 +1102,7 @@ async def hol_check_proof(
         (fail_line, fail_col), _ = tactic_range(failed_idx)
         lines.append(f"Use hol_state_at(line={fail_line}, col={fail_col}) for full goals")
 
+    _schedule_gc(session)
     return "\n".join(lines)
 
 
@@ -1073,7 +1118,7 @@ async def hol_file_status(file: str = None, workdir: str = None, timing: bool = 
 
     Returns: File info, active theorem, theorems with cheats, completion status
     """
-    cursor = _get_cursor(session)
+    cursor = await _get_cursor(session)
 
     # Auto-init if file provided and no cursor (or different file)
     if file:
@@ -1084,7 +1129,7 @@ async def hol_file_status(file: str = None, workdir: str = None, timing: bool = 
             )
             if init_result.startswith("ERROR"):
                 return init_result
-            cursor = _get_cursor(session)
+            cursor = await _get_cursor(session)
 
     if not cursor:
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."

@@ -57,7 +57,7 @@ class HOLSession:
             proc_env.update(self.env)
 
         self.process = await asyncio.create_subprocess_exec(
-            str(HOLDIR / "bin" / "hol"), "--zero",
+            str(HOLDIR / "bin" / "hol"), "--maxheap", "8192", "--zero",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             # Merge stderr to stdout: HOL's interactive mode sends all output

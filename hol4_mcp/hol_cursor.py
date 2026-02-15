@@ -837,7 +837,7 @@ class FileProofCursor:
             }
 
         # Save base checkpoint for fast theorem navigation
-        await self.session.send('drop_all();', timeout=5)
+        await self.session.send('(drop_all(); PolyML.fullGC());', timeout=10)
         await self._save_base_checkpoint()
         
         return {
