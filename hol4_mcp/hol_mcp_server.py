@@ -885,18 +885,20 @@ async def hol_state_at(
         lines.append(f"ERROR: {result.error}")
         lines.append("")
         lines.append(
-            f"The requested position (tactic {result.tactic_idx}/{result.tactics_total}) "
-            f"is after the failure. Goals here would be from the wrong proof state."
+            f"Replay cannot reach the requested position (tactic "
+            f"{result.tactic_idx}/{result.tactics_total}) because an earlier "
+            f"tactic failed. The proof is sequential — later goals depend on "
+            f"earlier tactics succeeding."
         )
         if fail_loc:
             lines.append(
-                f"Fix the broken tactic first, or inspect the failure point with:\n"
+                f"Fix the broken tactic, or inspect the failure point with:\n"
                 f"  hol_state_at(line={fail_loc[0]}, col={fail_loc[1]})"
             )
 
         if show_partial and result.goals:
             lines.append("")
-            lines.append(f"=== Partial Goals (at {stuck_str}, before failure) ===")
+            lines.append(f"=== Goals at failure point ({stuck_str}, tactic {result.tactics_replayed}/{result.tactics_total}) ===")
             for i, g in enumerate(result.goals):
                 if i > 0:
                     lines.append("")

@@ -980,7 +980,7 @@ async def test_state_at_broken_show_partial(tmp_path):
             session=session, line=10, col=1, show_partial=True
         )
         assert "PROOF BROKEN" in r
-        assert "Partial Goals" in r
+        assert "Goals at failure point" in r
         # conj_tac succeeded, so we should see 2 subgoals (T and T)
     finally:
         await hol_stop(session=session)
