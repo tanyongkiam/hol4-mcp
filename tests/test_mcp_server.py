@@ -943,9 +943,10 @@ async def test_state_at_broken_two_step_start_does_not_over_replay(tmp_path):
 
 
 async def test_state_at_broken_two_step_qed_reports_stuck_location(tmp_path):
-    """state_at on QED for broken proof should report last good location.
+    """state_at on QED for broken proof should refuse to show goals (strict mode).
 
-    Regression: replay failures returned tactics_replayed=0 and blank location.
+    When replay fails before reaching the requested position, the default
+    behavior is to refuse to show goals and point the user to the failure.
     """
     test_file = tmp_path / "brokenTwoStepScript.sml"
     test_file.write_text(BROKEN_TWO_STEP_SCRIPT)
@@ -954,11 +955,70 @@ async def test_state_at_broken_two_step_qed_reports_stuck_location(tmp_path):
     try:
         await hol_file_init(file=str(test_file), session=session)
 
-        # QED line: replay should fail at second tactic, but report progress.
+        # QED line: replay should fail at second tactic.
+        # Strict mode (default): no goals shown, clear PROOF BROKEN message.
         r = await hol_state_at(session=session, line=10, col=1)
+        assert "PROOF BROKEN" in r
         assert "ERROR" in r
-        assert "Stuck at line" in r
-        assert "Tactic 1/2" in r
+        assert "=== Goals ===" not in r  # Goals section suppressed in strict mode
+        assert "hol_state_at" in r  # Suggests inspecting failure point
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_state_at_broken_show_partial(tmp_path):
+    """state_at with show_partial=True shows best-effort goals on broken proof."""
+    test_file = tmp_path / "brokenTwoStepScript.sml"
+    test_file.write_text(BROKEN_TWO_STEP_SCRIPT)
+    session = "broken_partial_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # QED line with show_partial=True: should show partial goals
+        r = await hol_state_at(
+            session=session, line=10, col=1, show_partial=True
+        )
+        assert "PROOF BROKEN" in r
+        assert "Partial Goals" in r
+        # conj_tac succeeded, so we should see 2 subgoals (T and T)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_state_at_broken_error_survives_truncation(tmp_path):
+    """Error info must survive output truncation (GH issue #4 comment)."""
+    test_file = tmp_path / "brokenTwoStepScript.sml"
+    test_file.write_text(BROKEN_TWO_STEP_SCRIPT)
+    session = "broken_truncation_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # Request with very small max_output to force truncation
+        r = await hol_state_at(
+            session=session, line=10, col=1, max_output=200
+        )
+        # Error must be visible even when truncated
+        assert "ERROR" in r
+        assert "PROOF BROKEN" in r
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_state_at_broken_before_failure_shows_goals(tmp_path):
+    """state_at BEFORE the broken tactic should still show goals normally."""
+    test_file = tmp_path / "brokenTwoStepScript.sml"
+    test_file.write_text(BROKEN_TWO_STEP_SCRIPT)
+    session = "broken_before_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # Line 8 is at/before conj_tac (first tactic) — should work fine
+        r = await hol_state_at(session=session, line=8, col=3)
+        assert "PROOF BROKEN" not in r
+        assert "Goals" in r
     finally:
         await hol_stop(session=session)
 

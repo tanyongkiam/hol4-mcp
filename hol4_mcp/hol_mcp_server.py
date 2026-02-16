@@ -27,10 +27,27 @@ from .hol_file_parser import parse_step_positions_output, HOLParseError
 DEFAULT_MAX_OUTPUT = 4096
 
 
-def _truncate_output(output: str, max_output: int) -> str:
-    """Truncate output to max_output bytes, showing tail."""
+def _truncate_output(output: str, max_output: int, footer: str = "") -> str:
+    """Truncate output to max_output bytes, showing tail.
+
+    If footer is provided, it's appended AFTER truncation so it's never lost.
+    """
     if max_output < 1:
         return f"ERROR: max_output must be positive (got {max_output})"
+    # Reserve space for footer
+    if footer:
+        footer = "\n" + footer
+        body_budget = max_output - len(footer)
+        if body_budget < 100:
+            # Not enough room — just show footer
+            return footer.lstrip("\n")
+        if len(output) > body_budget:
+            return (
+                f"[TRUNCATED: {len(output)} bytes, showing last {body_budget}]\n\n"
+                + output[-body_budget:]
+                + footer
+            )
+        return output + footer
     if len(output) > max_output:
         return f"[TRUNCATED: {len(output)} bytes, showing last {max_output}]\n\n{output[-max_output:]}"
     return output
@@ -764,11 +781,16 @@ async def hol_state_at(
     workdir: str = None,
     max_output: int = DEFAULT_MAX_OUTPUT,
     session: str = "default",
+    show_partial: bool = False,
 ) -> str:
     """Get proof state at a file position.
 
     Replays tactics from theorem start up to (but not including) the tactic at
     the given position, then shows current goals. Auto-enters theorem if needed.
+
+    If replay fails before reaching the requested position, the default behavior
+    is to refuse to show goals (they would be from the wrong proof state).
+    Set show_partial=True to see the best-effort goals anyway.
 
     Args:
         line: 1-indexed line number (position in the proof)
@@ -777,6 +799,8 @@ async def hol_state_at(
         workdir: Working directory for HOL (used with file)
         max_output: Max bytes of output (default 1000)
         session: Session name (default: "default")
+        show_partial: If True, show best-effort goals even when replay fails
+                      before reaching the requested position (default: False)
 
     Returns: Tactic position (N/M), goals at that position, errors if any
     """
@@ -819,6 +843,7 @@ async def hol_state_at(
         return (thm.proof_start_line, 1)
 
     lines = []
+    error_footer = ""  # Errors go in footer so truncation never hides them
     
     # Check if "no goals" error is actually success (proof complete)
     is_proof_complete = (
@@ -832,42 +857,84 @@ async def hol_state_at(
     if result.error and result.tactics_total == 0:
         lines.append(f"ERROR: {result.error}")
         return "\n".join(lines)
-    
+
+    # Detect broken proof: replay couldn't reach the requested position
+    is_broken = (
+        result.error
+        and not is_proof_complete
+        and result.tactics_replayed < result.tactic_idx
+    )
+
     # Show theorem name (useful for hol_check_proof after edits)
     if active_theorem:
         lines.append(f"Theorem: {active_theorem}")
     
-    # Show position info - clarify if we couldn't reach requested position
-    if result.error and result.tactics_replayed < result.tactic_idx:
-        loc = tactic_to_loc(result.tactics_replayed)
-        loc_str = f"line {loc[0]} col {loc[1]}" if loc else ""
-        lines.append(f"Stuck at {loc_str} (Tactic {result.tactics_replayed}/{result.tactics_total})")
-        lines.append(f"\nERROR: {result.error}")
+    if is_broken:
+        # Proof is broken before the requested position
+        stuck_loc = tactic_to_loc(result.tactics_replayed)
+        stuck_str = f"line {stuck_loc[0]} col {stuck_loc[1]}" if stuck_loc else ""
+        # Compute where the failed tactic starts (next step after last success)
+        fail_idx = result.tactics_replayed  # 0-indexed: the step that failed
+        fail_loc = tactic_to_loc(fail_idx)
+        fail_str = f"line {fail_loc[0]}" if fail_loc else ""
+
+        lines.append(
+            f"PROOF BROKEN at tactic {result.tactics_replayed + 1}/{result.tactics_total} "
+            f"({fail_str})"
+        )
+        lines.append(f"ERROR: {result.error}")
         lines.append("")
-        lines.append("=== Goals ===")
+        lines.append(
+            f"The requested position (tactic {result.tactic_idx}/{result.tactics_total}) "
+            f"is after the failure. Goals here would be from the wrong proof state."
+        )
+        if fail_loc:
+            lines.append(
+                f"Fix the broken tactic first, or inspect the failure point with:\n"
+                f"  hol_state_at(line={fail_loc[0]}, col={fail_loc[1]})"
+            )
+
+        if show_partial and result.goals:
+            lines.append("")
+            lines.append(f"=== Partial Goals (at {stuck_str}, before failure) ===")
+            for i, g in enumerate(result.goals):
+                if i > 0:
+                    lines.append("")
+                if g.get('asms'):
+                    for asm in g['asms']:
+                        lines.append(f"  {asm}")
+                    lines.append("  " + "-" * 40)
+                lines.append(f"  {g['goal']}")
+
+        # Error footer for truncation safety
+        error_footer = (
+            f"ERROR: PROOF BROKEN at tactic {result.tactics_replayed + 1}/"
+            f"{result.tactics_total} ({fail_str}). "
+            f"Fix the broken tactic before inspecting later positions."
+        )
     else:
+        # Normal path: replay succeeded (or position is at/before the failure)
         loc = tactic_to_loc(result.tactic_idx)
         loc_str = f"Line {loc[0]} col {loc[1]}, " if loc else ""
         lines.append(f"{loc_str}Tactic {result.tactic_idx}/{result.tactics_total}")
-        # Don't show "no goals" as error when proof is complete
         if result.error and not is_proof_complete:
-            lines.append(f"\nERROR: {result.error}")
+            error_footer = f"ERROR: {result.error}"
         lines.append("")
         lines.append("=== Goals ===")
 
-    if result.goals:
-        for i, g in enumerate(result.goals):
-            if i > 0:
-                lines.append("")  # Blank line between goals
-            if g.get('asms'):
-                for asm in g['asms']:
-                    lines.append(f"  {asm}")
-                lines.append("  " + "-" * 40)
-            lines.append(f"  {g['goal']}")
-    elif is_proof_complete:
-        lines.append("No goals (proof complete)")
-    else:
-        lines.append("No goals (proof complete)")
+        if result.goals:
+            for i, g in enumerate(result.goals):
+                if i > 0:
+                    lines.append("")  # Blank line between goals
+                if g.get('asms'):
+                    for asm in g['asms']:
+                        lines.append(f"  {asm}")
+                    lines.append("  " + "-" * 40)
+                lines.append(f"  {g['goal']}")
+        elif is_proof_complete:
+            lines.append("No goals (proof complete)")
+        else:
+            lines.append("No goals (proof complete)")
 
     # Add timing info if available
     if result.timings:
@@ -878,7 +945,7 @@ async def hol_state_at(
                      f"checkpoint={'yes' if t.get('used_checkpoint') else 'no'}]")
 
     _schedule_gc(session)
-    return _truncate_output("\n".join(lines), max_output)
+    return _truncate_output("\n".join(lines), max_output, footer=error_footer)
 
 
 async def _get_substep_positions(
