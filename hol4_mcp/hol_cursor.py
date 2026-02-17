@@ -1416,6 +1416,12 @@ class FileProofCursor:
                         )
                     elif best_err and not error_msg:
                         error_msg = f"Prefix replay failed: {best_err}"
+                else:
+                    # Binary search didn't find a better offset within this step.
+                    # Fall back to the step boundary so goals reflect completed steps.
+                    boundary_ok, _ = await _execute_prefix_at_offset(step_before_end)
+                    if boundary_ok:
+                        actual_replayed = tactic_idx
         else:
             # Step boundary: try O(1) checkpoint path
             if self._is_checkpoint_valid(self._active_theorem) and thm.proof_body:
