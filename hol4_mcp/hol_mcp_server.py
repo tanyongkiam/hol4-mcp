@@ -404,10 +404,9 @@ async def hol_restart(session: str = "default") -> str:
 
 @mcp.tool()
 async def hol_setenv(env: dict, session: str = "default") -> str:
-    """Set environment variables for a HOL session.
+    """Set environment variables for a HOL session and auto-restart to apply.
 
     These are passed to the HOL process and affect Holmakefile INCLUDES expansion.
-    Use before hol_state_at or call hol_restart after to apply.
 
     Example: hol_setenv({"VFMDIR": "/home/user/verifereum"})
 
@@ -415,7 +414,7 @@ async def hol_setenv(env: dict, session: str = "default") -> str:
         env: Environment variables to set (merged with existing)
         session: Session name (default: "default")
 
-    Returns: Confirmation message
+    Returns: Confirmation message (includes restart output if session was running)
     """
     entry = _sessions.get(session)
     if not entry:
@@ -427,7 +426,12 @@ async def hol_setenv(env: dict, session: str = "default") -> str:
     else:
         entry.env = env
 
-    return f"Environment updated for session '{session}': {env}\nUse hol_restart to apply to running session."
+    # Auto-restart to apply new env to running process
+    if entry.session.is_running:
+        restart_result = await hol_restart.fn(session)
+        return f"Environment updated and session restarted: {env}\n{restart_result}"
+
+    return f"Environment updated for session '{session}': {env}"
 
 
 async def _kill_process_group(proc):
