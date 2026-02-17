@@ -13,6 +13,7 @@ from .hol_file_parser import (
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
+    parse_step_positions_output,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -1151,6 +1152,151 @@ class FileProofCursor:
             "has_cheat": thm.has_cheat,
         }
 
+    async def _setup_proof_goal(self, thm_name: str) -> str | None:
+        """Drop all goals and set up the proof goal for a theorem.
+
+        Handles Theorem, Definition (TC goal), and Resume (goal + assumptions).
+        Returns error string on failure, None on success.
+        """
+        thm = self._get_theorem(thm_name)
+        if not thm:
+            return f"Theorem '{thm_name}' not found"
+
+        await self.session.send('drop_all();', timeout=5)
+
+        if thm.kind == "Resume" and thm.name in self._resume_goals:
+            rg = self._resume_goals[thm.name]
+            asms = rg.get('asms', [])
+            goal_str = rg.get('goal', '')
+            if asms:
+                asm_terms = ", ".join(
+                    f'Parse.Term [QUOTE "{escape_sml_string(a)}"]' for a in asms
+                )
+                gt_result = await self.session.send(
+                    f'proofManagerLib.set_goal([{asm_terms}], '
+                    f'Parse.Term [QUOTE "{escape_sml_string(goal_str)}"]);',
+                    timeout=30
+                )
+            else:
+                gt_result = await self.session.send(f'g `{goal_str}`;', timeout=30)
+        elif thm.kind == "Definition" and thm.name in self._tc_goals:
+            tc_goal = self._tc_goals[thm.name]
+            gt_result = await self.session.send(f'g `{tc_goal}`;', timeout=30)
+        else:
+            goal = thm.goal.replace('\n', ' ').strip()
+            gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
+
+        if _is_hol_error(gt_result):
+            self._proof_initialized = False
+            return f"Failed to set up goal: {gt_result[:300]}"
+        self._proof_initialized = True
+        return None
+
+    async def _try_prefix_at(self, thm_name: str, offset: int) -> tuple[bool, str | None]:
+        """Reset goal and try prefix replay up to offset in proof body.
+
+        Sets up a fresh goal, generates prefix commands via sliceTacticBlock,
+        and executes them. Returns (success, error_message).
+        """
+        thm = self._get_theorem(thm_name)
+        if not thm or not thm.proof_body:
+            return False, "No proof body"
+
+        setup_err = await self._setup_proof_goal(thm_name)
+        if setup_err:
+            return False, setup_err
+
+        escaped_body = escape_sml_string(thm.proof_body)
+        prefix_result = await self.session.send(
+            f'prefix_commands_json "{escaped_body}" {offset};',
+            timeout=30
+        )
+        try:
+            prefix_cmd = parse_prefix_commands_output(prefix_result)
+        except HOLParseError as e:
+            return False, f"Failed to get prefix commands: {e}"
+
+        if not prefix_cmd.strip():
+            return True, None
+
+        result = await self.session.send(
+            prefix_cmd, timeout=self._tactic_timeout or 30
+        )
+        if _is_hol_error(result):
+            return False, result[:200]
+        return True, None
+
+    async def find_failing_substep(
+        self, thm_name: str, failed_step_idx: int
+    ) -> dict | None:
+        """Binary search within a coarse step to pinpoint the failing substep.
+
+        Uses step_positions for fine-grained boundaries within the failing step,
+        then binary searches with prefix replay to find the exact failing substep.
+
+        Args:
+            thm_name: Theorem name (must be the active theorem with step_plan set)
+            failed_step_idx: 0-based index of the failing step in step_plan
+
+        Returns:
+            Dict with {start_offset, end_offset, idx, count} or None if no refinement.
+        """
+        thm = self._get_theorem(thm_name)
+        if not thm or not thm.proof_body:
+            return None
+        if failed_step_idx < 0 or failed_step_idx >= len(self._step_plan):
+            return None
+
+        # Get fine-grained positions within the proof body
+        escaped_body = escape_sml_string(thm.proof_body)
+        try:
+            pos_result = await self.session.send(
+                f'step_positions_json "{escaped_body}";', timeout=10
+            )
+            all_positions = parse_step_positions_output(pos_result)
+        except (HOLParseError, Exception):
+            return None
+
+        # Filter to positions inside the failing step's range
+        step_start = self._step_plan[failed_step_idx - 1].end if failed_step_idx > 0 else 0
+        step_end = self._step_plan[failed_step_idx].end
+        candidates = [p for p in all_positions if step_start < p <= step_end]
+        if len(candidates) <= 1:
+            return None
+
+        # Build (start, end) offset pairs for each substep
+        substeps = []
+        prev = step_start
+        for pos in candidates:
+            substeps.append((prev, pos))
+            prev = pos
+
+        # Binary search on substep end offsets
+        low = -1  # before first substep (nothing replayed)
+        high = len(substeps) - 1  # whole step fails, so some substep fails
+
+        # Quick check: does prefix up to first substep succeed?
+        first_ok, _ = await self._try_prefix_at(thm_name, substeps[0][1])
+        if not first_ok:
+            high = 0
+        else:
+            low = 0
+            while high - low > 1:
+                mid = (low + high) // 2
+                mid_ok, _ = await self._try_prefix_at(thm_name, substeps[mid][1])
+                if mid_ok:
+                    low = mid
+                else:
+                    high = mid
+
+        ss, se = substeps[high]
+        return {
+            'start_offset': ss,
+            'end_offset': se,
+            'idx': high,
+            'count': len(substeps),
+        }
+
     async def state_at(self, line: int, col: int = 1) -> StateAtResult:
         """Get proof state at file position using prefix-based replay.
 
@@ -1281,7 +1427,6 @@ class FileProofCursor:
         # This enables fine-grained navigation within atomic ThenLT steps
         need_partial = proof_body_offset > step_before_end and proof_body_offset < current_step_end
         actual_replayed = 0
-        escaped_body = escape_sml_string(thm.proof_body) if thm.proof_body else ""
 
         # Two paths for navigation:
         # 1. Checkpoint path: O(1) to step boundaries via checkpoint + backup_n
@@ -1290,39 +1435,6 @@ class FileProofCursor:
         # For fine-grained positions (need_partial=true), use prefix replay directly.
         # For step boundaries without a checkpoint, replay only up to requested step
         # (not the full proof) so later broken tactics don't corrupt earlier states.
-
-        async def _reset_goal_state() -> str | None:
-            """Drop all goals and set theorem goal. Returns error string on failure."""
-            await self.session.send('drop_all();', timeout=5)
-            if thm.kind == "Resume" and thm.name in self._resume_goals:
-                # Resume block: use extracted goal with assumptions
-                rg = self._resume_goals[thm.name]
-                asms = rg.get('asms', [])
-                goal_str = rg.get('goal', '')
-                if asms:
-                    asm_terms = ", ".join(
-                        f'Parse.Term [QUOTE "{escape_sml_string(a)}"]' for a in asms
-                    )
-                    gt_result = await self.session.send(
-                        f'proofManagerLib.set_goal([{asm_terms}], '
-                        f'Parse.Term [QUOTE "{escape_sml_string(goal_str)}"]);',
-                        timeout=30
-                    )
-                else:
-                    gt_result = await self.session.send(f'g `{goal_str}`;', timeout=30)
-            elif thm.kind == "Definition" and thm.name in self._tc_goals:
-                # Definition with Termination: use the termination conditions
-                # goal (e.g., "?R. WF R /\ ...") instead of the function body.
-                tc_goal = self._tc_goals[thm.name]
-                gt_result = await self.session.send(f'g `{tc_goal}`;', timeout=30)
-            else:
-                goal = thm.goal.replace('\n', ' ').strip()
-                gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
-            if _is_hol_error(gt_result):
-                self._proof_initialized = False
-                return f"Failed to set up goal: {gt_result[:300]}"
-            self._proof_initialized = True
-            return None
 
         async def _replay_with_fallback(cmds: list[str], batch_timeout: int) -> tuple[int, str | None]:
             """Replay commands; on batch failure, replay one-by-one to recover progress."""
@@ -1339,7 +1451,7 @@ class FileProofCursor:
 
             # Batch failed: recover last good state by replaying step-by-step.
             # This keeps hol_state_at useful on broken proofs.
-            setup_err = await _reset_goal_state()
+            setup_err = await self._setup_proof_goal(thm.name)
             if setup_err:
                 return 0, setup_err
 
@@ -1356,35 +1468,12 @@ class FileProofCursor:
             # Shouldn't happen, but keep original batch error if fallback fully succeeds.
             return replayed, f"Tactic replay failed: {result[:200]}"
 
-        async def _execute_prefix_at_offset(offset: int) -> tuple[bool, str | None]:
-            """Reset goal, replay prefix up to offset, return (ok, err_msg)."""
-            setup_err = await _reset_goal_state()
-            if setup_err:
-                return False, setup_err
-
-            prefix_result = await self.session.send(
-                f'prefix_commands_json "{escaped_body}" {offset};',
-                timeout=30
-            )
-            try:
-                prefix_cmd = parse_prefix_commands_output(prefix_result)
-            except HOLParseError as e:
-                return False, f"Failed to get prefix commands: {e}"
-
-            if not prefix_cmd.strip():
-                return True, None
-
-            result = await self.session.send(prefix_cmd, timeout=self._tactic_timeout or 30)
-            if _is_hol_error(result):
-                return False, result[:200]
-            return True, None
-
         used_checkpoint = False
 
         if need_partial and thm.proof_body:
             # Fine-grained position: use prefix replay from theorem start
             # This correctly handles ThenLT semantics via sliceTacticBlock.
-            ok, prefix_err = await _execute_prefix_at_offset(proof_body_offset)
+            ok, prefix_err = await self._try_prefix_at(thm.name, proof_body_offset)
             if ok:
                 actual_replayed = tactic_idx
             else:
@@ -1398,7 +1487,7 @@ class FileProofCursor:
                 attempts = 0
                 while high - low > 1 and attempts < 12:
                     mid = (low + high) // 2
-                    mid_ok, _ = await _execute_prefix_at_offset(mid)
+                    mid_ok, _ = await self._try_prefix_at(thm.name, mid)
                     if mid_ok:
                         best = mid
                         low = mid
@@ -1407,7 +1496,7 @@ class FileProofCursor:
                     attempts += 1
 
                 if best > step_before_end:
-                    best_ok, best_err = await _execute_prefix_at_offset(best)
+                    best_ok, best_err = await self._try_prefix_at(thm.name, best)
                     if best_ok:
                         actual_replayed = sum(1 for step in self._step_plan if step.end <= best)
                         error_msg = (
@@ -1419,7 +1508,7 @@ class FileProofCursor:
                 else:
                     # Binary search didn't find a better offset within this step.
                     # Fall back to the step boundary so goals reflect completed steps.
-                    boundary_ok, _ = await _execute_prefix_at_offset(step_before_end)
+                    boundary_ok, _ = await self._try_prefix_at(thm.name, step_before_end)
                     if boundary_ok:
                         actual_replayed = tactic_idx
         else:
@@ -1431,7 +1520,7 @@ class FileProofCursor:
                     actual_replayed = tactic_idx
 
             if not used_checkpoint:
-                setup_err = await _reset_goal_state()
+                setup_err = await self._setup_proof_goal(thm.name)
                 if setup_err:
                     return StateAtResult(
                         goals=[], tactic_idx=tactic_idx, tactics_replayed=0,

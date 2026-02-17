@@ -19,9 +19,9 @@ from typing import Optional
 
 from fastmcp import FastMCP, Context
 
-from .hol_session import HOLSession, HOLDIR, escape_sml_string
+from .hol_session import HOLSession, HOLDIR
 from .hol_cursor import FileProofCursor
-from .hol_file_parser import parse_step_positions_output, HOLParseError
+from .hol_file_parser import HOLParseError
 
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -954,49 +954,6 @@ async def hol_state_at(
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)
 
 
-async def _get_substep_positions(
-    cursor: FileProofCursor,
-    thm,
-    failed_idx: int,
-) -> list[tuple[int, int]] | None:
-    """Get fine-grained substep positions within a large atomic step.
-
-    When step_plan produces a coarse step (e.g., ThenLT/>- at top level),
-    this uses step_positions to find finer-grained boundaries that the user
-    can navigate with hol_state_at.
-
-    Returns list of (start_offset, end_offset) pairs, or None if no refinement.
-    """
-    if not thm.proof_body:
-        return None
-
-    session = cursor.session
-    escaped_body = escape_sml_string(thm.proof_body)
-
-    try:
-        pos_result = await session.send(
-            f'step_positions_json "{escaped_body}";', timeout=10
-        )
-        all_positions = parse_step_positions_output(pos_result)
-    except (HOLParseError, Exception):
-        return None
-
-    # Filter to positions inside the failing step's range
-    step_start = cursor._step_plan[failed_idx - 1].end if failed_idx > 0 else 0
-    step_end = cursor._step_plan[failed_idx].end
-    candidates = [p for p in all_positions if step_start < p <= step_end]
-    if len(candidates) <= 1:
-        return None
-
-    # Build (start, end) pairs for each substep
-    substeps = []
-    prev = step_start
-    for pos in candidates:
-        substeps.append((prev, pos))
-        prev = pos
-    return substeps
-
-
 @mcp.tool()
 async def hol_check_proof(
     theorem: str,
@@ -1130,6 +1087,13 @@ async def hol_check_proof(
     else:
         lines.append(f"Status: INCOMPLETE at step {len(trace_data)}/{total_steps} ({total_ms}ms)")
 
+    # Binary search to pinpoint failing substep within coarse steps.
+    # Only when the step has an actual error (not just INCOMPLETE with remaining goals).
+    substep_info = None
+    if (failed_idx is not None and failed_idx < len(trace_data)
+            and trace_data[failed_idx].error):
+        substep_info = await cursor.find_failing_substep(theorem, failed_idx)
+
     # Per-step timing trace (when requested, or always on failure/incomplete)
     if trace:
         lines.append("")
@@ -1142,6 +1106,15 @@ async def hol_check_proof(
             lines.append(f"Step {i} ({loc}): {cmd_text}")
             if entry.error:
                 lines.append(f"  ERROR: {entry.error}")
+                if i - 1 == failed_idx and substep_info:
+                    sl, sc = offset_to_pos(substep_info['start_offset'])
+                    sub_text = thm.proof_body[substep_info['start_offset']:substep_info['end_offset']].strip().replace('\n', ' ')
+                    if len(sub_text) > 60:
+                        sub_text = sub_text[:57] + "..."
+                    lines.append(
+                        f"  Failing substep {substep_info['idx'] + 1}/"
+                        f"{substep_info['count']} (line {sl} col {sc}): {sub_text}"
+                    )
             else:
                 lines.append(f"  {entry.real_ms}ms | Goals: {entry.goals_before} -> {entry.goals_after}")
         lines.append("")
@@ -1150,29 +1123,29 @@ async def hol_check_proof(
     if not trace and failed_idx is not None and failed_idx < len(trace_data):
         (start_line, start_col), (end_line, end_col) = tactic_range(failed_idx)
         tactic_text = trace_data[failed_idx].cmd.strip().replace('\n', ' ')
-        is_big = len(tactic_text) > 80
-        if is_big:
+        if len(tactic_text) > 80:
             tactic_text = tactic_text[:77] + "..."
         loc = f"line/col {start_line}:{start_col}-{end_line}:{end_col}"
         lines.append(f"Tactic ({loc}): {tactic_text}")
 
-        # Show fine-grained substep positions for big steps
-        if is_big:
-            substeps = await _get_substep_positions(cursor, thm, failed_idx)
-            if substeps:
-                lines.append(f"  Sub-steps ({len(substeps)} tactics in this step):")
-                for i, (ss, se) in enumerate(substeps):
-                    (sl, sc) = offset_to_pos(ss)
-                    sub_text = thm.proof_body[ss:se].strip().replace('\n', ' ')
-                    if len(sub_text) > 60:
-                        sub_text = sub_text[:57] + "..."
-                    lines.append(f"    {i+1}. line {sl} col {sc}: {sub_text}")
+        if substep_info:
+            sl, sc = offset_to_pos(substep_info['start_offset'])
+            sub_text = thm.proof_body[substep_info['start_offset']:substep_info['end_offset']].strip().replace('\n', ' ')
+            if len(sub_text) > 60:
+                sub_text = sub_text[:57] + "..."
+            lines.append(
+                f"  Failing substep {substep_info['idx'] + 1}/"
+                f"{substep_info['count']} (line {sl} col {sc}): {sub_text}"
+            )
 
     # Brief goal summary for failure/incomplete
     if failed_idx is not None:
         lines.append("")
         lines.append(f"Remaining: {final.goals_after} goal(s)")
-        (fail_line, fail_col), _ = tactic_range(failed_idx)
+        if substep_info:
+            fail_line, fail_col = offset_to_pos(substep_info['start_offset'])
+        else:
+            (fail_line, fail_col), _ = tactic_range(failed_idx)
         lines.append(f"Use hol_state_at(line={fail_line}, col={fail_col}) for full goals")
 
     _schedule_gc(session)

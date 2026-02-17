@@ -855,18 +855,18 @@ async def test_check_proof_by_sg_theorems(tmp_path):
         await hol_stop(session=session)
 
 
-# Test script with a broken proof that has ThenLT at top level (1 step)
-# rpt strip_tac >> conj_tac >- ... >- FAIL_TAC produces 1 atomic step
+# Test script with a broken ThenLT proof (1 coarse step, failure at FAIL_TAC)
+# strip_tac >> conj_tac >- arm1 >- FAIL_TAC gives 1 atomic step.
+# Uses strip_tac (not rpt) so conj_tac is the intended splitter.
 BROKEN_THENLT_SCRIPT = '''\
 open HolKernel Parse boolLib bossLib;
 
 val _ = new_theory "broken";
 
-(* ThenLT at top → 1 step, second >- arm fails *)
 Theorem broken_thenlt:
   (A:bool) /\\ B ==> B /\\ A
 Proof
-  rpt strip_tac >> conj_tac >-
+  strip_tac >> conj_tac >-
     (first_assum ACCEPT_TAC) >-
     FAIL_TAC "intentional failure"
 QED
@@ -875,29 +875,34 @@ val _ = export_theory();
 '''
 
 
-async def test_check_proof_substeps_for_big_step(tmp_path):
-    """Test hol_check_proof shows substep positions for big atomic steps.
+async def test_check_proof_substep_pinpoints_failure(tmp_path):
+    """Test hol_check_proof binary-searches within a coarse ThenLT step.
 
-    The proof uses >- (ThenLT) at top level, so step_plan gives 1 step.
-    The tactic text exceeds 80 chars, triggering substep decomposition.
-    Output should list individual substep positions for navigation.
+    Proof: strip_tac >> conj_tac >- ACCEPT >- FAIL_TAC
+    step_plan gives 1 step. Binary search should pinpoint FAIL_TAC as
+    the failing substep (not conj_tac or strip_tac).
     """
     test_file = tmp_path / "brokenScript.sml"
     test_file.write_text(BROKEN_THENLT_SCRIPT)
     session = "narrow_test"
 
     try:
-        # trace=False to trigger substep decomposition (trace mode shows steps directly)
         r = await hol_check_proof(
             theorem="broken_thenlt", file=str(test_file), session=session, trace=False
         )
-        # Should be INCOMPLETE (>- catches tactic failure, leaves goals)
-        assert "INCOMPLETE" in r or "FAILED" in r, f"Should not succeed: {r}"
-        # Should show substeps for the big atomic step
-        assert "Sub-steps" in r, f"Should show substep info: {r}"
-        # Should list individual tactics with line numbers
-        assert "strip_tac" in r
-        assert "EVAL_TAC" in r or "FAIL_TAC" in r
+        assert "FAILED" in r, f"Should fail: {r}"
+        # Binary search should pinpoint the FAIL_TAC substep
+        assert "Failing substep" in r, f"Should show failing substep: {r}"
+        assert "FAIL_TAC" in r, f"Should identify FAIL_TAC as the failing substep: {r}"
+        # hol_state_at hint should point to the substep location
+        assert "hol_state_at" in r
+
+        # Also verify trace=True annotates the failing step inline
+        r2 = await hol_check_proof(
+            theorem="broken_thenlt", file=str(test_file), session=session, trace=True
+        )
+        assert "Failing substep" in r2, f"Trace mode should also show substep: {r2}"
+        assert "FAIL_TAC" in r2, f"Trace mode should identify FAIL_TAC: {r2}"
     finally:
         await hol_stop(session=session)
 
