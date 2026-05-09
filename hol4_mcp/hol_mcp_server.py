@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from . import _mcp_cancel_patch  # noqa: F401 — patches mcp SDK on import
 from fastmcp import FastMCP
 
 from .hol_session import HOLSession, HOLDIR
