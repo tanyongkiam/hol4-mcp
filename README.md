@@ -113,7 +113,7 @@ hol4-mcp serve --transport http --port 8000
 
 | Tool | Description |
 |------|-------------|
-| `hol_send` | Send raw SML to HOL (for DB queries, type checking, term parsing) |
+| `hol_send` | Send raw SML to HOL — use freely for exploration, interactive proof attack, DB queries, term/type inspection. |
 | `hol_interrupt` | Send SIGINT to abort a runaway tactic |
 
 ### Build

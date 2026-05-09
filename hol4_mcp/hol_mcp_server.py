@@ -91,9 +91,12 @@ mcp = FastMCP("hol", instructions="""HOL4 theorem prover - proof development wor
 3. Repeat until proof complete
 4. holmake: Only at the end to verify the build
 
+hol_send is available for exploration and interactive proof attack — use it
+freely. For replaying tactics in a script file, hol_state_at is preferred
+because it handles checkpoints automatically.
+
 Do NOT:
 - Call hol_restart after file edits (state_at auto-detects changes)
-- Use hol_send for proof navigation (use hol_state_at instead)
 """)
 _sessions: dict[str, SessionEntry] = {}
 
@@ -391,17 +394,7 @@ async def hol_sessions() -> str:
     return "\n".join(lines)
 
 
-_PROOF_STATE_PATTERNS = [
-    (re.compile(r"^\s*e\s*\("), "e(...)"),
-    (re.compile(r"^\s*b\s*\(\s*\)"), "b()"),
-    (re.compile(r"^\s*drop\s*\(\s*\)"), "drop()"),
-    (re.compile(r"^\s*top_goal\s*\(\s*\)"), "top_goal()"),
-    (re.compile(r"^\s*g\s*[`(]"), "g()/g`...`"),
-    (re.compile(r"^\s*p\s*\(\s*\)"), "p()"),
-    (re.compile(r"^\s*r\s*\(\s*\)"), "r()"),
-    (re.compile(r"^\s*prove\s*\("), "prove(...)"),
-    (re.compile(r"proofManagerLib\."), "proofManagerLib.*"),
-]
+_PROOF_STATE_PATTERNS = []
 
 
 def _check_proof_state_command(command: str) -> str | None:
@@ -430,15 +423,15 @@ def _check_proof_state_command(command: str) -> str | None:
 async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX_OUTPUT, session: str = "default") -> str:
     """Send raw SML command to HOL session.
 
-    WARNING: Do NOT use for proof navigation - use hol_state_at instead.
-    hol_state_at handles file changes, checkpoints, and tactic replay automatically.
+    Use freely for exploration and interactive proof attack — try tactic
+    chains, inspect terms, check rewrites, evaluate expressions, query the
+    database. Persist successful chains back into the script file once they
+    work.
 
-    Only use hol_send for:
-      - Database queries: DB.match [], ``add _ _``
-      - Type checking: type_of ``expr``
-      - Term parsing: Term `expr`
-      - One-off SML evaluation
-      - Debugging session state
+    For navigating an existing script file (replaying tactics from theorem
+    start to a position), prefer hol_state_at — it handles file changes,
+    checkpoints, and tactic replay automatically. hol_send is the right tool
+    for everything else, including stepping through partial tactics ad hoc.
 
     Args:
         command: SML command to execute
