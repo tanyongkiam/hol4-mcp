@@ -1,4 +1,4 @@
-"""Tests for proof verification (hol_file_status, verify_all_proofs)."""
+"""Tests for proof verification (cursor status, verify_all_proofs)."""
 
 import pytest
 from pathlib import Path

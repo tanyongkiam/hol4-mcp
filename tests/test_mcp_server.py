@@ -18,7 +18,6 @@ from hol4_mcp.hol_mcp_server import (
     holmake as _holmake,
     _init_file_cursor,  # Internal helper (not MCP tool)
     hol_state_at as _hol_state_at,
-    hol_file_status as _hol_file_status,
     hol_check_proof as _hol_check_proof,
     _kill_process_group,
     _sessions,
@@ -38,7 +37,6 @@ holmake = _holmake
 hol_file_init = _init_file_cursor
 hol_state_at = _hol_state_at
 hol_check_proof = _hol_check_proof
-hol_file_status = _hol_file_status
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -253,25 +251,6 @@ async def test_file_init_lists_theorems(tmp_path):
         assert "partial_proof" in result
     finally:
         await hol_stop(session="file_init_test")
-
-
-async def test_file_status_shows_cheats(tmp_path):
-    """Test hol_file_status lists cheats and active theorem."""
-    test_file = tmp_path / "testScript.sml"
-    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
-
-    try:
-        await hol_file_init(file=str(test_file), session="status_test")
-        result = await hol_file_status(session="status_test")
-
-        # Should show file info
-        assert "File:" in result
-        assert "Progress:" in result
-        # Should list cheats
-        assert "needs_proof" in result
-        assert "partial_proof" in result
-    finally:
-        await hol_stop(session="status_test")
 
 
 async def test_file_init_restarts_on_workdir_change(tmp_path):

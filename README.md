@@ -107,7 +107,6 @@ hol4-mcp serve --transport http --port 8000
 |------|-------------|
 | `hol_state_at` | Get proof state at a file position (line/col). Auto-inits session and cursor from `file=` parameter. |
 | `hol_check_proof` | Check if a theorem's proof completes. Reports pass/fail, timing, and failure location. |
-| `hol_file_status` | Get file overview: theorem list, cheat count, per-proof timing. |
 
 ### Raw interaction
 
