@@ -1142,6 +1142,36 @@ async def hol_state_at(
         lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
                      f"method={method}]")
+        # Cache-state diagnostics: show what _pos was BEFORE the call,
+        # the target, and what got reused vs replayed. Useful for
+        # reproducing cache bugs.
+        before_idx = t.get('pos_before_idx', None)
+        if before_idx is not None:
+            before_offset = t.get('pos_before_offset', -1)
+            before_init = t.get('pos_before_init', 0)
+            hash_match = t.get('pos_hash_match', 0)
+            target_idx = t.get('target_idx', '?')
+            target_partial = t.get('target_partial', 0)
+            file_changed = t.get('file_changed', 0)
+            offset_str = f",off={before_offset}" if before_offset >= 0 else ""
+            init_str = "init" if before_init else "uninit"
+            hash_str = "hash=match" if hash_match else "hash=miss"
+            partial_str = "partial" if target_partial else "boundary"
+            changed_str = "changed" if file_changed else "unchanged"
+            parts = [
+                f"pos_before=(idx={before_idx}{offset_str},{init_str},{hash_str})",
+                f"target=(idx={target_idx},{partial_str})",
+                f"file={changed_str}",
+                f"replayed={result.tactics_replayed}/{result.tactics_total}",
+            ]
+            if 'incr_first_diff' in t:
+                parts.append(
+                    f"incr=(first_diff={t['incr_first_diff']},"
+                    f"old_idx={t['incr_old_idx']})"
+                )
+            if result.inside_by:
+                parts.append("inside_by=true")
+            lines.append(f"[Cache: {', '.join(parts)}]")
 
     _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)

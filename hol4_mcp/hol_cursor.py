@@ -1910,9 +1910,18 @@ class FileProofCursor:
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
 
+        # Snapshot cache state BEFORE any work — for diagnostics
+        timings['pos_before_idx'] = self._pos.tactic_idx
+        timings['pos_before_offset'] = -1
+        timings['pos_before_init'] = 1 if self._pos.initialized else 0
+        timings['pos_hash_match'] = (
+            1 if self._pos.content_hash == self._content_hash else 0
+        )
+
         changed = await self._prepare_session(line, col, timings)
         if isinstance(changed, StateAtResult):
             return changed
+        timings['file_changed'] = 1 if changed else 0
 
         thm = self._active_theorem_info()
         if isinstance(thm, StateAtResult):
@@ -1921,6 +1930,12 @@ class FileProofCursor:
         target = await self._compute_target(thm, line, col, changed)
         if isinstance(target, StateAtResult):
             return target
+
+        timings['target_idx'] = target.tactic_idx
+        timings['target_partial'] = -1
+        if target.incremental_update is not None:
+            timings['incr_first_diff'] = target.incremental_update[0]
+            timings['incr_old_idx'] = target.incremental_update[1]
 
         t3 = time.perf_counter()
         nav = await self._navigate_to_target(target)
