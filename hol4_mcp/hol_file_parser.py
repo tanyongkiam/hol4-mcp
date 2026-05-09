@@ -75,7 +75,13 @@ def _find_json_line(output: str, context: str) -> dict:
         # Try exact line match first (most common case)
         if stripped.startswith('{'):
             try:
-                return json.loads(stripped)
+                parsed = json.loads(stripped)
+                # Skip warning lines (e.g. {"warning":"..."} from
+                # tactic_prefix.sml's reexpand_group_atoms). Only return
+                # ok/err results.
+                if isinstance(parsed, dict) and ('ok' in parsed or 'err' in parsed):
+                    return parsed
+                # Otherwise (warning, etc.) keep scanning for the real result.
             except json.JSONDecodeError:
                 pass
         # Then look for embedded JSON after other output

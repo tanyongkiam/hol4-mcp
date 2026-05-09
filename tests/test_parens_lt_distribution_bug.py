@@ -1,36 +1,33 @@
-"""Failing tests for the open MCP step-plan bug:
+"""Regression tests for the parens-around-LT distribution bug:
 
-  Group(span, ThenLT(_, [LThen1 _]))   — i.e. parens around `>-`
-  Group(span, ThenLT(_, [LTacsToLT _])) — i.e. parens around `>|`
+  Group(span, ThenLT(_, [LThen1 _]))    — parens around `>-`
+  Group(span, ThenLT(_, [LNullOk (LTacsToLT _)])) — parens around `>|`
 
 When the parenthesised form sits inside a `\\` chain, Holmake distributes
-the parenthesised tactic per-goal of the outer `\\`. The MCP's
-`reexpand_group_atoms` re-expands the Group, producing the same flat
-fragment sequence as the un-parenthesised form, so the MCP runs
-`open_then1` (or the `>|` equivalent) GLOBALLY against the first goal,
-not per-source.
+the parenthesised tactic per source goal of the outer `\\`. Without the
+fix, `reexpand_group_atoms` would re-expand the Group, producing the same
+flat fragment sequence as the un-parenthesised form, so the MCP would
+run `open_then1` (or the `>|` equivalent) GLOBALLY against the first
+goal, not per-source.
 
-Verified empirically against a running HOL4 session:
+Fix (commit on this branch): `isComposable` excludes ThenLT whose ls
+contains a goal-positional LT operator (LThen1 / LFirst / LTacsToLT /
+LSplit, including those wrapped in LNullOk / LRepeat / LTry / LFirstLT).
+The Group stays as a single FAtom and goalFrag.expand runs the whole
+parenthesised tactic atomically per source goal — matches Holmake.
 
-  goal: `(T /\\ T) /\\ (T /\\ T)`
-  parens   : `conj_tac \\\\ (conj_tac >- ACCEPT_TAC TRUTH)`        → 2 goals
-  no-parens: `conj_tac \\\\ conj_tac >- ACCEPT_TAC TRUTH`          → 3 goals
-  MCP plan : [expand conj_tac, expand conj_tac, open_then1,
-              expand ACCEPT_TAC TRUTH, close_paren]                → 3 goals
+Trade-off: lose mid-arm navigation INSIDE parens-grouped LT chains
+(can't place cursor between TAC1 and TAC2 inside `(TAC1 >- TAC2)`).
+The un-parenthesised form retains its decomposition and full navigation.
 
-The MCP plan matches the no-parens semantics for both source forms,
-breaking the parens case.
+Empirical verification (against `(T /\\ T) /\\ (T /\\ T)`):
 
-These tests are marked xfail until the fix lands. The fix needs to
-either:
-  (a) keep `Group(_, ThenLT(_, [LThen1 _ | LTacsToLT _ | LFirst _]))`
-      atoms opaque (no re-expansion), losing mid-arm navigation but
-      preserving correctness, OR
-  (b) emit merge-group annotations and use a runtime fallback in the
-      executor (preserves navigation in single-goal contexts).
+  parens  `conj_tac \\\\ (conj_tac >- ACCEPT_TAC TRUTH)`  → 2 goals (correct)
+  unparens `conj_tac \\\\ conj_tac >- ACCEPT_TAC TRUTH`   → 3 goals (correct)
 
-See CakeML cake-while branch evaluate_sf_gc_consts[Call] for the
-real-world trigger. Holmake builds; hol_check_proof reports residue.
+Real-world trigger: cake-while `evaluate_sf_gc_consts[Call]` after
+inlining Resume[Result]. Pre-fix: Holmake builds, hol_check_proof
+reports residue. Post-fix: both agree.
 """
 
 import pytest
@@ -76,11 +73,6 @@ async def goal_count(session):
     raise AssertionError(f"no goal count in: {r!r}")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Open MCP bug: Group around `>-` re-expanded, loses parens semantics. "
-           "Currently produces identical step plans for both source forms.",
-)
 async def test_parens_then1_step_plan_distinct_from_unparens(hol_session):
     """The parens form `(TAC1 >- TAC2)` should produce a DIFFERENT step
     plan from the no-parens `TAC1 >- TAC2` form, because they have
@@ -111,10 +103,6 @@ async def test_parens_then1_step_plan_distinct_from_unparens(hol_session):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Open MCP bug: `\\\\ (TAC1 >- TAC2)` runs >- globally, not per-goal.",
-)
 async def test_parens_then1_executes_per_goal_under_then(hol_session):
     """End-to-end execution: source form `conj_tac \\\\ (conj_tac >- ACCEPT_TAC TRUTH)`
     on `(T /\\ T) /\\ (T /\\ T)` should leave 2 goals (each source `T /\\ T`
@@ -136,11 +124,6 @@ async def test_parens_then1_executes_per_goal_under_then(hol_session):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Open MCP bug: `\\\\ (TAC >| [t1, t2])` runs >| globally, "
-           "throwing arity-mismatch.",
-)
 async def test_parens_thenL_executes_per_goal_under_then(hol_session):
     """Same mechanism for `>|` (LTacsToLT). Source form
     `conj_tac \\\\ (conj_tac >| [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH])`

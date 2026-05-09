@@ -238,27 +238,33 @@ class TestBackupN:
 # =============================================================================
 
 class TestThenLTReexpand:
-    """ThenLT inside >> chains: reexpand to get open/close decomposition.
+    """ThenLT inside >> chains: KEPT OPAQUE so per-goal vs global semantics
+    of the inner `>-` are preserved.
 
-    linearize's `asTac` skips bracketing when `one=true` (inside Then list),
-    collapsing >- into a single FAtom. reexpand_group_atoms detects these
-    and re-linearizes the ThenLT AST at the top level to get proper decomposition.
+    The parser emits `Group(true, ..., ThenLT(_, [LThen1 _]))` for any
+    precedence-grouped `tac1 >- tac2` sub-expression — including cases
+    without source parens (left-associative grouping is implicit). My
+    isComposable check excludes these Groups from re-expansion because
+    re-expanding them would emit `[expand tac1, open_then1, expand tac2,
+    close_paren]` fragments where `open_then1` runs GLOBALLY across the
+    goalstate, diverging from Holmake's per-goal semantics whenever the
+    Group sits inside an outer per-goal-distributing context.
 
-    Subgoal-based ThenLT (by/sg) is NOT re-expanded because `Subgoal \`Q\``
-    is not a standalone tactic — only the full `\`Q\` by tac` expression is valid.
-    For by inside >> chains, navigation stays at the atomic step level.
+    Trade-off: lose mid-arm navigation between `tac1` and `tac2`. The
+    whole `tac1 >- tac2` runs as one atomic expand step.
+
+    Subgoal-based ThenLT (by/sg) is similarly atomic — the merged form
+    `\`Q\` by tac` runs per-goal correctly via goalFrag.expand.
     """
 
     async def test_thenlt_in_then_chain(self, hol_session):
-        """>- inside >> chain decomposes into expand/open/expand/close steps."""
+        """`tac1 >- tac2 >> tac3` precedence-groups as
+        `((tac1 >- tac2) >> tac3)`. The inner `>-` Group stays opaque; the
+        outer `>>` chain is two expand steps."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[] >> fs[]")
-        # conj_tac, open_then1, simp[], close_paren, fs[]
-        assert len(result) == 5, f"Expected 5 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].kind == "expand" and "conj_tac" in result[0].text
-        assert result[1].kind == "open" and result[1].text == "open_then1"
-        assert result[2].kind == "expand" and "simp" in result[2].text
-        assert result[3].kind == "close" and result[3].text == "close_paren"
-        assert result[4].kind == "expand" and result[4].text == "fs[]"
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and result[0].text == "conj_tac >- simp[]"
+        assert result[1].kind == "expand" and result[1].text == "fs[]"
 
     async def test_by_in_then_chain(self, hol_session):
         """`P` by tac inside >> chain merges into a SINGLE atomic step.
@@ -277,24 +283,29 @@ class TestThenLTReexpand:
         assert result[2].kind == "expand" and result[2].text == "fs[]"
 
     async def test_by_tactic_base_no_sg_prefix(self, hol_session):
-        """`by` with tactic base (not term quotation) keeps base text unchanged.
-
-        Tactic-base `by` is not a Subgoal-from-term-quote pattern, so it does
-        not get the sg-prefix and does NOT trigger merge_by_steps. It keeps
-        the old decomposition (which is rare and benign in practice)."""
+        """Top-level `tac1 by tac2` (no surrounding chain): the parser
+        produces a top-level ThenLT WITHOUT a Group wrapper. Linearize
+        decomposes it directly into [expand, open_then1, expand, close_paren].
+        Mid-arm navigation IS preserved at top level (no per-goal context
+        above to worry about)."""
         result = await call_step_plan(hol_session, "strip_tac by simp[]")
-        # strip_tac (not "sg strip_tac"), open_then1, simp[], close_paren
         assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].text == "strip_tac", f"Tactic base should not get sg: {result[0].text}"
+        assert result[0].text == "strip_tac"
+        assert result[1].kind == "open" and result[1].text == "open_then1"
+        assert result[2].text == "simp[]"
+        assert result[3].kind == "close" and result[3].text == "close_paren"
 
     async def test_sg_in_then_chain_merges(self, hol_session):
-        """Explicit `sg `Q` >- tac` is semantically identical to ``Q` by tac`
-        and is merged the same way."""
+        """`strip_tac >> sg \`Q\` >- simp[] >> fs[]`: precedence-groups as
+        `((((strip_tac >> sg \`Q\`) >- simp[]) >> fs[])`. The whole
+        `((strip_tac >> sg \`Q\`) >- simp[])` is the Group-wrapped left
+        operand of the outer `>>`. Atomic step + fs[] = 2 steps."""
         result = await call_step_plan(hol_session, r"strip_tac >> sg `Q` >- simp[] >> fs[]")
-        # strip_tac, `Q` by simp[], fs[]
-        assert len(result) == 3, f"Expected 3 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[1].kind == "expand"
-        assert "by" in result[1].text and "`Q`" in result[1].text
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand"
+        for tok in ("strip_tac", "`Q`", "simp[]"):
+            assert tok in result[0].text, f"Missing {tok!r}: {result[0].text!r}"
+        assert result[1].kind == "expand" and result[1].text == "fs[]"
 
     async def test_by_term_base_merges(self, hol_session):
         """Standalone `P` by tac (no enclosing chain) merges into one step."""
@@ -317,25 +328,25 @@ class TestThenLTReexpand:
             f"Compound body must be parenthesized after `by`: {text!r}"
 
     async def test_thenlt_bare_decomposes(self, hol_session):
-        """Standalone >- (top level, not in >> chain) decomposes correctly."""
+        """Standalone `tac1 >- tac2` (no surrounding chain) — the parser
+        emits the ThenLT directly without a Group wrapper, so the
+        decomposition still happens. Mid-arm navigation IS preserved here."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[]")
         assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
         assert result[1].kind == "open"
 
     async def test_thenlt_multi_step_arm_in_chain(self, hol_session):
-        """>- with multi-step arm inside >> chain decomposes fully."""
+        """`tac1 >- (multi-step arm) >> tac3`: parser groups the LHS as
+        Group(_, ThenLT(tac1, [LThen1 (multi-step)])). My fix keeps it
+        opaque — atomic expand step containing the whole `tac1 >- (...)`."""
         result = await call_step_plan(
             hol_session,
             "conj_tac >- (simp[] >> ACCEPT_TAC) >> fs[]"
         )
-        # conj_tac, open_then1, simp[], ACCEPT_TAC, close_paren, fs[]
-        assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].kind == "expand" and "conj_tac" in result[0].text
-        assert result[1].kind == "open"
-        assert result[2].kind == "expand" and "simp" in result[2].text
-        assert result[3].kind == "expand" and "ACCEPT" in result[3].text
-        assert result[4].kind == "close"
-        assert result[5].kind == "expand" and result[5].text == "fs[]"
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand"
+        assert result[0].text == "conj_tac >- (simp[] >> ACCEPT_TAC)"
+        assert result[1].kind == "expand" and result[1].text == "fs[]"
 
     async def test_then_chain_without_thenlt_unchanged(self, hol_session):
         """Pure >> chain without >-/by is not affected by reexpand."""
@@ -344,37 +355,49 @@ class TestThenLTReexpand:
         assert all(s.kind == "expand" for s in result)
 
     async def test_nested_thenlt_with_then_chain(self, hol_session):
-        """>- inside >- with >> chain decomposes recursively."""
+        """`tac1 >- (chain with nested >- inside)`. The OUTER `>-` Group
+        stays opaque (LThen1). The arm body has its own Group wrapping the
+        inner `>-`, also kept opaque. Top-level pattern: `conj_tac >- (...)`
+        decomposes the outer arm body via open/close, and the inner `>-`
+        appears as one merged expand step inside the arm."""
         result = await call_step_plan(
             hol_session,
             "conj_tac >- (strip_tac >> simp[] >> strip_tac >- conj_tac)"
         )
-        # conj_tac, open, strip_tac, simp[], strip_tac, open, conj_tac, close, close
-        assert len(result) == 9, f"Expected 9 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].kind == "expand" and "conj_tac" in result[0].text
-        assert result[1].kind == "open"
-        assert result[2].text == "strip_tac"
-        assert result[3].text == "simp[]"
-        assert result[4].text == "strip_tac"
-        assert result[5].kind == "open"  # inner >- open
-        assert result[6].text == "conj_tac"
-        assert result[7].kind == "close"  # inner >- close
-        assert result[8].kind == "close"  # outer >- close
+        kinds = [s.kind for s in result]
+        texts = [s.text for s in result]
+        # Outer `>-` arm decomposes: expand conj_tac, open_then1, then arm
+        # body atoms, close_paren. Arm body contains the inner merged `>-`.
+        assert "open" in kinds and "close" in kinds, (
+            f"Outer arm should still decompose: {kinds}"
+        )
+        # Inner `>-` is merged into a single atom containing both atoms.
+        assert any("strip_tac >- conj_tac" in t for t in texts), (
+            f"Inner `>-` should be merged: {texts}"
+        )
 
     async def test_thenlt_at_start_of_chain(self, hol_session):
-        """>- as the first element in a >> chain decomposes."""
+        """`tac1 >- tac2 >> tac3` — same precedence-grouped form as
+        test_thenlt_in_then_chain. Outer Group stays opaque; chain is 2 steps."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[] >> fs[]")
-        # conj_tac, open_then1, simp[], close_paren, fs[]
-        assert len(result) == 5
-        assert result[1].kind == "open"
+        assert len(result) == 2
+        assert result[0].text == "conj_tac >- simp[]"
 
     async def test_multiple_thenlt_in_chain(self, hol_session):
-        """Multiple >- in the same >> chain each decompose."""
+        """`tac1 >- tac2 >> tac3 >- tac4`: parses as
+        `(((tac1 >- tac2) >> tac3) >- tac4)`. The outer-most ThenLT is at
+        TOP LEVEL (no Group wrapper around it), so it decomposes into
+        [base..., open_then1, expand fs[], close_paren]. The base
+        `((tac1 >- tac2) >> tac3)` is a Then containing a Group-wrapped
+        inner `>-` (kept opaque) and `tac3`. Total: 5 steps."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[] >> conj_tac >- fs[]")
-        # conj_tac, open, simp[], close, conj_tac, open, fs[], close
-        assert len(result) == 8, f"Expected 8 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[1].kind == "open"
-        assert result[5].kind == "open"
+        # Expected: [merged inner, conj_tac, open_then1, fs[], close_paren]
+        assert len(result) == 5, f"Expected 5 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and result[0].text == "conj_tac >- simp[]"
+        assert result[1].kind == "expand" and result[1].text == "conj_tac"
+        assert result[2].kind == "open" and result[2].text == "open_then1"
+        assert result[3].kind == "expand" and result[3].text == "fs[]"
+        assert result[4].kind == "close" and result[4].text == "close_paren"
 
     async def test_end_offsets_correct_after_reexpand(self, hol_session):
         """End offsets for reexpanded fragments use original proof body positions."""

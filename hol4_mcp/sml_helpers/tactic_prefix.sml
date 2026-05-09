@@ -227,10 +227,62 @@ fun reexpand_group_atoms frags =
     fun ltElemIsStructuralOnly TacticParse.LReverse = true
       | ltElemIsStructuralOnly _ = false
     fun lsHasStructuralOnly ls = List.exists ltElemIsStructuralOnly ls
+    (* Goal-position-sensitive LT operators. When present in a Group's body,
+       the Group must NOT be re-expanded — re-expansion produces flat
+       fragments matching the un-parenthesised semantics (e.g. open_then1
+       focuses goal 1 GLOBALLY). HOL4 source semantics for the parenthesised
+       form distributes the whole tactic per source goal under outer THEN,
+       running the LT op once per source. The two diverge in multi-goal
+       contexts. Keep Group opaque so goalFrag.expand runs the whole tactic
+       atomically per source goal — matches Holmake. *)
+    (* Mutually recursive: an LT element is goal-positional if it's a direct
+       goal-positional op (LThen1/LFirst/LTacsToLT/LSplit) OR a wrapper
+       (LNullOk/LRepeat/LTry/LFirstLT) around an expression that itself
+       contains goal-positional structure. Empirically `>|` parses as
+       `ThenLT(_, [LNullOk (LTacsToLT _)])` so the wrapper form matters. *)
+    fun ltElemIsGoalPositional (TacticParse.LThen1 _) = true
+      | ltElemIsGoalPositional (TacticParse.LFirst _) = true
+      | ltElemIsGoalPositional (TacticParse.LTacsToLT _) = true
+      | ltElemIsGoalPositional (TacticParse.LSplit _) = true
+      | ltElemIsGoalPositional (TacticParse.LNullOk e) = exprHasGoalPositional e
+      | ltElemIsGoalPositional (TacticParse.LRepeat e) = exprHasGoalPositional e
+      | ltElemIsGoalPositional (TacticParse.LTry e) = exprHasGoalPositional e
+      | ltElemIsGoalPositional (TacticParse.LFirstLT e) = exprHasGoalPositional e
+      | ltElemIsGoalPositional _ = false
+    and lsHasGoalPositional ls = List.exists ltElemIsGoalPositional ls
+    (* Recursive: any nested sub-expression contains a goal-positional LT
+       operator? Used to issue a WARNING when a Group is re-expanded but
+       its body contains a deeper sub-expression with goal-positional LT —
+       those inner LT ops would still execute globally inside the
+       re-expanded fragments, diverging from Holmake if the Group is in a
+       per-goal context. The static composability check only catches the
+       case where the Group's body is DIRECTLY a goal-positional ThenLT. *)
+    and exprHasGoalPositional (TacticParse.Then es) =
+          List.exists exprHasGoalPositional es
+      | exprHasGoalPositional (TacticParse.ThenLT (e, ls)) =
+          exprHasGoalPositional e orelse lsHasGoalPositional ls
+      | exprHasGoalPositional (TacticParse.LThenLT ls) = lsHasGoalPositional ls
+      | exprHasGoalPositional (TacticParse.Group (_, _, e)) =
+          exprHasGoalPositional e
+      (* These tac_expr constructors are goal-positional themselves when
+         they appear as expressions (not just as LT-elements inside a
+         ThenLT). LTacsToLT/LSplit/etc. can be wrapped by LNullOk and
+         appear as the inner expression of an LT-element. *)
+      | exprHasGoalPositional (TacticParse.LThen1 _) = true
+      | exprHasGoalPositional (TacticParse.LFirst _) = true
+      | exprHasGoalPositional (TacticParse.LTacsToLT _) = true
+      | exprHasGoalPositional (TacticParse.LSplit _) = true
+      | exprHasGoalPositional (TacticParse.LRepeat e) = exprHasGoalPositional e
+      | exprHasGoalPositional (TacticParse.LTry e) = exprHasGoalPositional e
+      | exprHasGoalPositional (TacticParse.LNullOk e) = exprHasGoalPositional e
+      | exprHasGoalPositional (TacticParse.LFirstLT e) = exprHasGoalPositional e
+      | exprHasGoalPositional _ = false
     fun isComposable (TacticParse.Then _) = true
-      | isComposable (TacticParse.ThenLT (_, ls)) = not (lsHasStructuralOnly ls)
+      | isComposable (TacticParse.ThenLT (_, ls)) =
+          not (lsHasStructuralOnly ls) andalso not (lsHasGoalPositional ls)
       | isComposable (TacticParse.LThen1 _) = true
-      | isComposable (TacticParse.LThenLT ls) = not (lsHasStructuralOnly ls)
+      | isComposable (TacticParse.LThenLT ls) =
+          not (lsHasStructuralOnly ls) andalso not (lsHasGoalPositional ls)
       | isComposable (TacticParse.Group _) = true  (* peels outer wrapper; inner expr is checked by recursion *)
       | isComposable _ = false
     fun isGroupAtom (TacticParse.FAtom (TacticParse.Group (_, _, e))) =
@@ -238,9 +290,30 @@ fun reexpand_group_atoms frags =
       | isGroupAtom _ = false
     fun getGroupExpr (TacticParse.FAtom (TacticParse.Group (_, _, e))) = e
       | getGroupExpr _ = raise Match
+    fun getGroupSpan (TacticParse.FAtom (TacticParse.Group (_, span, _))) = SOME span
+      | getGroupSpan _ = NONE
+    fun spanString (s, e) = Int.toString s ^ ".." ^ Int.toString e
+    fun warn_nested_goal_positional spanOpt =
+      let val loc = case spanOpt of SOME sp => " at span " ^ spanString sp
+                                  | NONE => ""
+      in
+        (* Emit a structured WARNING line on stdout. Hol_send captures
+           stdout. The step-plan JSON parser only consumes lines starting
+           with `{"ok":...}`; warning lines are visible to humans inspecting
+           the raw output. *)
+        print ("{\"warning\":\"reexpanded Group" ^ loc ^
+               " contains nested >- / >| / etc. inside a sub-expression; " ^
+               "if this Group runs in a per-goal context (e.g. inside a " ^
+               "\\\\ chain), the inner LT operator may execute GLOBALLY " ^
+               "rather than per-source-goal, diverging from Holmake — " ^
+               "parenthesise the inner LT subexpression itself.\"}\n")
+      end
     fun reexpand f =
           let
             val expr = getGroupExpr f
+            val _ = if exprHasGoalPositional expr
+                    then warn_nested_goal_positional (getGroupSpan f)
+                    else ()
             fun isAtom e = Option.isSome (TacticParse.topSpan e)
             val subFrags = TacticParse.linearize isAtom expr
           in reexpand_group_atoms (flatten_frags subFrags) end
