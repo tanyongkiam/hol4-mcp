@@ -30,7 +30,7 @@ from .hol_file_parser import HOLParseError, step_line_numbers, format_steps, for
 DEFAULT_MAX_OUTPUT = 4096
 
 # Server-level tactic timeout (set via --tactic-timeout CLI flag or HOL_TACTIC_TIMEOUT env)
-TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "5.0"))
+TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "60.0"))
 
 
 def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
