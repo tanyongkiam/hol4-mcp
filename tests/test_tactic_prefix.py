@@ -569,6 +569,145 @@ class TestGoalfragSelectGoalDecomposition:
 
 
 # =============================================================================
+# Step Plan: >~ [pat] >- (compound body, possibly with NESTED >-)
+#
+# REGRESSION: merge_select_steps' walkArm previously bailed on ANY nested
+# open inside the body of `>~ [pat] >- (...)`, and the "no bracket
+# consumed" branch then silently DROPPED the SELECT step. Result:
+# `>~ [pat]` never executed, the following `>-` focused the wrong goal,
+# and the proof either misexecuted or failed many steps later for
+# unrelated-looking reasons. Hit on cake-while when inlining a
+# Resume[Result] body that contained
+#     `\\ reverse TOP_CASE_TAC >- (rw [] \\ rw [])`
+# inside `>~ [`Result`] >- (body)`.
+#
+# Fix: parseBody walks nested brackets recursively, parenthesising nested
+# `>-` groups so SML precedence (>- vs surrounding >>) is preserved.
+# =============================================================================
+
+
+class TestSelectGoalNestedBody:
+    """`>~ [pat] >- (body with nested >-)` must merge into a single
+    expand_list step, not silently drop the SELECT pattern."""
+
+    async def test_nested_then1_inside_select_body_merges(self, hol_session):
+        """Body of `>~ [pat] >- (... >- ...)` is reconstructed with nested
+        >- properly parenthesised so the SELECT_GOAL_LT prefix survives."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- (a >> b >- c >> d)"
+        )
+        assert len(result) == 2, (
+            f"Expected 2 steps (Cases_on, expand_list); got "
+            f"{[(s.kind, s.text) for s in result]}"
+        )
+        assert result[0].kind == "expand"
+        assert result[1].kind == "expand_list", (
+            f"Compound body with nested >- must yield expand_list, "
+            f"not bare expand or dropped select: {result[1].kind}"
+        )
+        text = result[1].text
+        assert "Q.SELECT_GOAL_LT" in text, (
+            f"SELECT_GOAL_LT prefix dropped: {text!r}"
+        )
+        for tok in ("`Foo`", "a", "b", "c", "d"):
+            assert tok in text, f"Token {tok!r} missing from {text!r}"
+
+    async def test_double_nested_then1_inside_select_body(self, hol_session):
+        """Two nested >- arms in body still merge correctly."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- (a >- b >- c)"
+        )
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        text = result[1].text
+        assert "Q.SELECT_GOAL_LT" in text
+        for tok in ("`Foo`", "a", "b", "c"):
+            assert tok in text, f"Token {tok!r} missing from {text!r}"
+
+    async def test_nested_paren_inside_select_body(self, hol_session):
+        """Plain (...) nesting inside select body merges correctly."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- (a >> (b >> c) >> d)"
+        )
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        for tok in ("`Foo`", "a", "b", "c", "d"):
+            assert tok in result[1].text
+
+    async def test_select_no_nested_unchanged(self, hol_session):
+        """Existing flat-body case still merges as before (regression guard)."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- simp[]"
+        )
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        assert "Q.SELECT_GOAL_LT" in result[1].text
+        assert "simp[]" in result[1].text
+
+
+# =============================================================================
+# Step Plan: `reverse TAC` is preserved (not stripped to bare TAC)
+#
+# REGRESSION: TacticParse parses `reverse TAC` as
+#     Group(span, ThenLT(TAC, [LReverse]))
+# reexpand_group_atoms previously re-expanded ANY ThenLT-containing Group,
+# producing flat frags [FAtom TAC, FAtom LReverse]. LReverse has no span,
+# so frag_text returned "" and assignEnds dropped it — losing the `reverse`
+# wrapper entirely. The decomposed step ran TAC alone, with the wrong
+# goal-stack ordering vs `reverse TAC`.
+#
+# Fix: lsHasStructuralOnly excludes ThenLTs whose list-tactic part has
+# LReverse (or other span-less LT-elements) from re-expansion. The Group
+# stays as a single FAtom whose text is the full `reverse TAC` source.
+# =============================================================================
+
+
+class TestReverseTactical:
+    """`reverse TAC` must survive linearization as a single atomic step."""
+
+    async def test_reverse_preserved_in_step_text(self, hol_session):
+        """Step plan for `reverse TOP_CASE_TAC` keeps the `reverse` prefix."""
+        result = await call_step_plan(hol_session, "reverse TOP_CASE_TAC")
+        assert len(result) == 1, (
+            f"Expected one atomic step for `reverse TOP_CASE_TAC`; got "
+            f"{[(s.kind, s.text) for s in result]}"
+        )
+        assert result[0].kind == "expand"
+        assert result[0].text == "reverse TOP_CASE_TAC", (
+            f"`reverse` prefix dropped: {result[0].text!r}"
+        )
+
+    async def test_reverse_in_then_chain_keeps_prefix(self, hol_session):
+        """`reverse TOP_CASE_TAC` inside a >> chain still keeps `reverse`."""
+        result = await call_step_plan(
+            hol_session, "strip_tac >> reverse TOP_CASE_TAC >> simp[]"
+        )
+        assert len(result) == 3
+        assert result[1].text == "reverse TOP_CASE_TAC", (
+            f"`reverse` prefix dropped in chain: {result[1].text!r}"
+        )
+
+    async def test_reverse_with_then1_arm(self, hol_session):
+        """`reverse TAC >- arm` keeps `reverse` and decomposes the >-."""
+        result = await call_step_plan(
+            hol_session, "reverse TOP_CASE_TAC >- simp[]"
+        )
+        # Expect: expand "reverse TOP_CASE_TAC", open_then1, expand simp[], close_paren
+        assert len(result) == 4, (
+            f"Expected 4 steps; got {[(s.kind, s.text) for s in result]}"
+        )
+        assert result[0].kind == "expand"
+        assert result[0].text == "reverse TOP_CASE_TAC"
+        assert result[1].kind == "open"
+        assert result[2].text == "simp[]"
+        assert result[3].kind == "close"
+
+
+# =============================================================================
 # Resume goal extraction
 #
 # Regression tests for a bug where `resume_goal_terms` referenced
