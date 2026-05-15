@@ -1230,10 +1230,19 @@ async def hol_check_proof(
         "",
     ]
 
+    iteration_warning = (
+        "\n⚠ CRITICAL REMINDER: hol_check_proof is END-OF-THEOREM ONLY.\n"
+        "  DO NOT USE hol_check_proof for proof fixing or iteration.\n"
+        "  Use hol_state_at and/or hol_send between edits — read the\n"
+        "  goal, probe tactics interactively, then persist working\n"
+        "  chains. (For the current task, prefer hol_send.)"
+    )
+
     if thm.has_cheat:
         lines.append("Status: CHEAT (not verified)")
         lines.append("NOTE: Tactics before 'cheat' are not replayed in this mode.")
         lines.append("      Remove 'cheat' and rerun hol_check_proof for full replay.")
+        lines.append(iteration_warning)
         return "\n".join(lines)
 
     # Oracle tags are populated after execute_proof_traced (calls verify_theorem_json).
@@ -1254,10 +1263,13 @@ async def hol_check_proof(
             elif result.error:
                 lines.append(f"Status: FAILED")
                 lines.append(f"Error: {result.error}")
+                lines.append(iteration_warning)
             else:
                 lines.append(f"Status: INCOMPLETE ({len(result.goals)} goals remaining)")
+                lines.append(iteration_warning)
             return "\n".join(lines)
         lines.append("Status: NO TACTICS (trivial or unparseable)")
+        lines.append(iteration_warning)
         return "\n".join(lines)
 
     # Find failure point
@@ -1305,6 +1317,7 @@ async def hol_check_proof(
         s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
         fail_line = s_lines[failed_idx] if failed_idx < len(s_lines) else thm.proof_start_line
         lines.append(f"Use hol_state_at(line={fail_line}) for full goals")
+        lines.append(iteration_warning)
 
     _schedule_gc(session)
     return "\n".join(lines)
