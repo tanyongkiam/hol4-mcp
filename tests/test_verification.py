@@ -1111,3 +1111,166 @@ val _ = export_theory();
     result2 = await cursor.state_at(thm.proof_start_line, 1)
     assert not result2.error or "no goals" in result2.error.lower(), \
         f"state_at after edit failed: {result2.error}"
+
+
+@pytest.mark.asyncio
+async def test_resume_goal_matches_marker_canonical(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Regression: cursor must set up the Resume goal directly from the suspension
+    store (markerLib.set_suspended_goal), not via a term_to_string/Parse.Term
+    round-trip. The round-trip can rename bound variables under a clashing
+    parse context, so tactics in the Resume body see a goal with different
+    bound names than what Holmake actually runs them against.
+
+    Strong invariant: after cursor.state_at enters a Resume block, the goal
+    on the proof manager must be byte-identical (under term_to_string) to
+    the goal markerLib.set_suspended_goal would produce. Alpha-equivalence
+    isn't enough — bound names must match.
+    """
+    script = tmp_path / "testResumeCanonicalScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testResumeCanonical";
+
+Theorem foo:
+  (!n. n + 0 = n) /\\ (!n. 0 + n = n)
+Proof
+  conj_tac >- suspend "case1"
+  >> simp[]
+QED
+
+Resume foo[case1]:
+  simp[]
+QED
+
+Finalise foo
+
+val _ = export_theory();
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Drive the cursor to enter the Resume block (calls _setup_proof_goal).
+    thm = cursor._get_theorem("foo[case1]")
+    assert thm is not None
+    result = await cursor.state_at(thm.proof_start_line, 1)
+    assert not result.error or "no goals" in result.error.lower(), \
+        f"state_at failed: {result.error}"
+
+    # Capture the goal currently on the proof manager (set up by _setup_proof_goal).
+    cursor_goal_out = await hol_session_tmpdir.send(
+        'print ("CURSOR_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    cursor_goal = _extract_marker(cursor_goal_out, "CURSOR_GOAL=", "==END")
+
+    # Now compute the canonical goal via markerLib.set_suspended_goal directly.
+    await hol_session_tmpdir.send('proofManagerLib.drop_all();', timeout=5)
+    marker_goal_out = await hol_session_tmpdir.send(
+        'markerLib.set_suspended_goal {suspension_name = "foo", label_name = "case1"};'
+        'print ("MARKER_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    marker_goal = _extract_marker(marker_goal_out, "MARKER_GOAL=", "==END")
+
+    assert cursor_goal == marker_goal, (
+        "Resume goal-setup path is not canonical: cursor view diverges from "
+        "markerLib.set_suspended_goal view. This indicates a term_to_string/"
+        f"Parse.Term round-trip is renaming bound vars.\n"
+        f"  cursor: {cursor_goal!r}\n"
+        f"  marker: {marker_goal!r}"
+    )
+
+
+def _extract_marker(output: str, start: str, end: str) -> str:
+    """Pull out the substring between `start` and `end` markers from raw HOL output."""
+    i = output.find(start)
+    assert i >= 0, f"Marker {start!r} not found in output:\n{output[-500:]}"
+    i += len(start)
+    j = output.find(end, i)
+    assert j >= 0, f"End marker {end!r} not found after {start!r}:\n{output[-500:]}"
+    return output[i:j].strip()
+
+
+@pytest.mark.asyncio
+async def test_resume_state_at_with_free_var_constant_clash(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """Regression: cursor must enter a Resume body whose stored goal has a free
+    variable later shadowed by a constant of *different type*.
+
+    Concrete bug class: the OLD code path serialised the suspended goal via
+    term_to_string (with show_types=true), then re-parsed via Parse.Term.
+    When the parse context contains a constant whose name matches a free
+    variable in the goal — but with a different type — the re-parse crashes
+    with a Type constraint failure. The fix passes the term directly to
+    proofManagerLib.set_goalfrag, bypassing the parse round-trip entirely.
+
+    Demonstrates the bug fix concretely: under the OLD path, this test would
+    fail at state_at with a "Type constraint failure" error. Under the new
+    path it succeeds.
+    """
+    script = tmp_path / "testRenameClashScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testRenameClash";
+
+Theorem bar:
+  !w:num. w + 1 > 0
+Proof
+  gen_tac >>
+  Q.SPEC_THEN `v + w` MP_TAC arithmeticTheory.LESS_EQ_REFL >>
+  strip_tac >>
+  suspend "case_v"
+QED
+
+Definition v_def:
+  v = (T:bool)
+End
+
+Resume bar[case_v]:
+  decide_tac
+QED
+
+Finalise bar
+
+val _ = export_theory();
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    init = await cursor.init()
+    assert "error" not in init, f"init failed: {init.get('error')}"
+
+    thm = cursor._get_theorem("bar[case_v]")
+    assert thm is not None, "Resume block bar[case_v] should be detected"
+
+    # Navigate into the Resume block. _setup_proof_goal must use the direct
+    # suspension-store path; the term-to-string + Parse.Term round-trip would
+    # crash here because v is now a :bool constant in the parse context but
+    # the stored term has v as a :num Var.
+    result = await cursor.state_at(thm.proof_start_line, 1)
+    assert result.error is None or "no goals" in (result.error or "").lower(), (
+        f"state_at into Resume body failed; this indicates a regression to "
+        f"the string-roundtrip goal-setup path: {result.error}"
+    )
+
+    # The captured goal should match what markerLib.set_suspended_goal produces.
+    cursor_goal_out = await hol_session_tmpdir.send(
+        'print ("CURSOR_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    cursor_goal = _extract_marker(cursor_goal_out, "CURSOR_GOAL=", "==END")
+
+    await hol_session_tmpdir.send('proofManagerLib.drop_all();', timeout=5)
+    marker_goal_out = await hol_session_tmpdir.send(
+        'markerLib.set_suspended_goal {suspension_name = "bar", label_name = "case_v"};'
+        'print ("MARKER_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    marker_goal = _extract_marker(marker_goal_out, "MARKER_GOAL=", "==END")
+
+    assert cursor_goal == marker_goal, (
+        f"Resume goal-setup diverged from markerLib.set_suspended_goal:\n"
+        f"  cursor: {cursor_goal!r}\n"
+        f"  marker: {marker_goal!r}"
+    )

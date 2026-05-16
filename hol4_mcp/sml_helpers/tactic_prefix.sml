@@ -740,3 +740,20 @@ fun verify_resume_json suspension_name label_name name tactics store timeout_sec
     verify_core name tactics store timeout_sec
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* Set up a Resume goal on the proof manager directly from the suspension
+   store. Used by hol_state_at navigation: avoids a term->string->term
+   round-trip via term_to_string + Parse.Term, which can rename bound
+   variables under a clashing parse context. The terms here come straight
+   from markerLib.lookup_suspension / extract_suspended_goal — identical
+   to what Holmake's Resume processing uses.  Uses set_goalfrag for ef()
+   compatibility with the rest of the navigation machinery. *)
+fun set_resume_goalfrag_json suspension_name label_name =
+  let
+    val _ = drop_all ()
+    val (asms, concl) = resume_goal_terms suspension_name label_name
+    val _ = proofManagerLib.set_goalfrag (asms, concl)
+  in
+    print (json_ok "true" ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");

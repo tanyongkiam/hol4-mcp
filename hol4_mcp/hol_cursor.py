@@ -1452,22 +1452,25 @@ class FileProofCursor:
             await self._extract_tc_goal(thm)
 
         if thm.kind == "Resume":
-            if thm.name not in self._resume_goals:
-                return f"Failed to extract Resume goal for '{thm.name}'"
-            rg = self._resume_goals[thm.name]
-            asms = rg.get('asms', [])
-            goal_str = rg.get('goal', '')
-            if asms:
-                asm_terms = ", ".join(
-                    f'Parse.Term [QUOTE "{escape_sml_string(a)}"]' for a in asms
-                )
-                gt_result = await self.session.send(
-                    f'proofManagerLib.set_goalfrag([{asm_terms}], '
-                    f'Parse.Term [QUOTE "{escape_sml_string(goal_str)}"]);',
-                    timeout=30
-                )
-            else:
-                gt_result = await self.session.send(f'gf `{goal_str}`;', timeout=30)
+            if not thm.suspension_name or thm.label_name is None:
+                return f"Resume '{thm.name}' has no suspension info"
+            # Set the goal directly from the suspension store via an SML helper.
+            # Avoids a term->string->term round-trip (term_to_string +
+            # Parse.Term) which can rename bound variables under a clashing
+            # parse context. Mirrors markerLib.set_suspended_goal so the goal
+            # presented here is identical to what Holmake runs the Resume
+            # body against.
+            susp = escape_sml_string(thm.suspension_name)
+            label = escape_sml_string(thm.label_name)
+            gt_result = await self.session.send(
+                f'set_resume_goalfrag_json "{susp}" "{label}";',
+                timeout=30,
+            )
+            # Surface helper-level errors (e.g. missing suspension) clearly.
+            data = _try_find_json_line(gt_result)
+            if 'err' in data:
+                self._pos = SessionPosition()
+                return f"Failed to set up Resume goal: {data['err']}"
         elif thm.kind == "Definition" and thm.name in self._tc_goals:
             tc_goal = self._tc_goals[thm.name]
             gt_result = await self.session.send(f'gf `{tc_goal}`;', timeout=30)
