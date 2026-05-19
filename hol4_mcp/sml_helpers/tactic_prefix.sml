@@ -730,7 +730,16 @@ fun extract_resume_goal_json suspension_name label_name =
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
-(* Verify a Resume block. Uses GOALFRAG (set_goalfrag) for ef() compatibility. *)
+(* Verify a Resume block. Uses GOALFRAG (set_goalfrag) for ef() compatibility
+   with the step-plan / navigation machinery.
+
+   IMPORTANT: this path does NOT record resumption deltas for any sub-suspends
+   issued inside the Resume body — only markerLib.resume records them.  Use
+   verify_resume_json for one-shot verification (hol_check_proof, where
+   per-tactic timing matters); use run_resume_canonical_json below for file
+   replay (where sub-suspensions must register for downstream Resume blocks
+   to look them up — symptom: "No such label" when navigating into a deeper
+   Resume body). *)
 fun verify_resume_json suspension_name label_name name tactics store timeout_sec =
   let
     val _ = drop_all ()
@@ -755,5 +764,62 @@ fun set_resume_goalfrag_json suspension_name label_name =
     val _ = proofManagerLib.set_goalfrag (asms, concl)
   in
     print (json_ok "true" ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* Run a Resume block canonically via markerLib.resume.  This is the same
+   code path Holmake executes when it processes `Resume thm[label]: tacs QED`
+   in a script file: it runs the combined tactic via prove_goal (NOT the
+   proof manager) and records resumption deltas for EACH suspendlabel
+   hypothesis remaining in the proven theorem — including sub-suspends
+   issued inside the Resume body's tactics.
+
+   This is the only path that preserves the sub-suspension lifecycle.  Use
+   it for file replay where downstream Resume blocks may need to look up
+   sub-suspensions produced by this body.  Per-tactic timing trace is NOT
+   available — the tactics combine into a single call.
+
+   tactics: list of SML tactic strings, combined left-associatively with
+   THEN.  An empty list runs the identity tactic (ALL_TAC) — closes nothing,
+   so used only when the Resume body is itself empty. *)
+fun run_resume_canonical_json suspension_name label_name name tactics store timeout_sec =
+  let
+    val _ = drop_all ()
+    val combined =
+        case tactics of
+            [] => "ALL_TAC"
+          | _ => "(" ^ String.concatWith ") \\\\ (" tactics ^ ")"
+    val save_decl =
+        if store then
+          "val _ = save_thm(\"" ^ String.toString name ^ "\", hol4mcp_resume_thm) "
+        else ""
+    val cmd =
+        "let val hol4mcp_tac = (" ^ combined ^ ") " ^
+        "    val hol4mcp_resume_thm = markerLib.resume " ^
+        "{suspension_name = \"" ^ String.toString suspension_name ^
+        "\", label_name = \"" ^ String.toString label_name ^ "\"} hol4mcp_tac " ^
+        save_decl ^
+        "in () end"
+    val start = Timer.startRealTimer ()
+    val ok = smlTimeout.timeout timeout_sec
+               (fn () => smlExecute.quse_string cmd) ()
+    val real_ms = Time.toMilliseconds (Timer.checkRealTimer start)
+    val oracles =
+      if ok andalso store then
+        Lib.set_diff (fst (Tag.dest_tag (Thm.tag (DB.fetch "-" name))))
+                     ["DISK_THM"]
+        handle _ => []
+      else []
+    val oracles_json = "[" ^ String.concatWith "," (map json_string oracles) ^ "]"
+    val trace_json =
+      "[{\"real_ms\":" ^ LargeInt.toString real_ms ^
+      ",\"goals_before\":0,\"goals_after\":" ^ (if ok then "0" else "1") ^
+      (if ok then "" else ",\"err\":\"markerLib.resume failed\"") ^ "}]"
+  in
+    print (json_ok (
+      "{\"stored\":" ^ (if ok andalso store then "true" else "false") ^
+      ",\"name\":" ^ json_string name ^
+      ",\"oracles\":" ^ oracles_json ^
+      ",\"trace\":" ^ trace_json ^ "}") ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");

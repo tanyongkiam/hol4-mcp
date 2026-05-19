@@ -2284,8 +2284,21 @@ class FileProofCursor:
             tactic_timeout = self._tactic_timeout or 60.0
             python_timeout = tactic_timeout * len(tactics) + 10
             if is_resume:
+                # File replay MUST use the canonical markerLib.resume path so
+                # any sub-suspends issued inside the Resume body are recorded
+                # as resumption deltas — otherwise downstream Resume blocks
+                # looking up those sub-labels fail with "No such label".
+                # Trade-off: per-tactic timing is collapsed into a single
+                # trace entry; for per-tactic timing on a single Resume body,
+                # use execute_proof_traced (hol_check_proof) which still uses
+                # verify_resume_json.
+                #
+                # markerLib.resume takes a single tactic, so we pass the raw
+                # proof_body (NOT the ef()-wrapped step plan, which produces
+                # `unit` values rather than tactics).
+                resume_body_sml = f'"{escape_sml_string(thm.proof_body)}"'
                 result = await self.session.send(
-                    f'verify_resume_json "{escape_sml_string(thm.suspension_name or "")}" "{escape_sml_string(thm.label_name or "")}" "{thm.name}" {tactics_sml} {store} {tactic_timeout:.1f};',
+                    f'run_resume_canonical_json "{escape_sml_string(thm.suspension_name or "")}" "{escape_sml_string(thm.label_name or "")}" "{thm.name}" [{resume_body_sml}] {store} {tactic_timeout:.1f};',
                     timeout=max(30, python_timeout)
                 )
             else:
