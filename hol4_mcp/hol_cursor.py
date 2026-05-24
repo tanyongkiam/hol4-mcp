@@ -1399,14 +1399,16 @@ class FileProofCursor:
         if not self._base_checkpoint_saved:
             await self._save_base_checkpoint()
 
-        # Parse step plan from proof body using TacticParse
+        # Parse step plan from proof body using TacticParse.
+        # Pass the body so byte→char offset conversion happens at the
+        # parse boundary — SML emits byte positions, Python uses chars.
         if thm.proof_body:
             escaped_body = escape_sml_string(thm.proof_body)
             step_result = await self.session.send(
                 f'goalfrag_step_plan_json "{escaped_body}";', timeout=30
             )
             try:
-                self._step_plan = parse_step_plan_output(step_result)
+                self._step_plan = parse_step_plan_output(step_result, thm.proof_body)
             except HOLParseError as e:
                 return {"error": f"Failed to parse step plan: {e}"}
         else:
@@ -1815,7 +1817,7 @@ class FileProofCursor:
                 f'goalfrag_step_plan_json "{escaped_body}";', timeout=30
             )
             try:
-                self._step_plan = parse_step_plan_output(step_result)
+                self._step_plan = parse_step_plan_output(step_result, thm.proof_body)
             except HOLParseError as e:
                 return StateAtResult(
                     goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
@@ -2195,7 +2197,7 @@ class FileProofCursor:
                     f'goalfrag_step_plan_json "{escaped_body}";', timeout=30
                 )
                 try:
-                    step_plan = parse_step_plan_output(step_result)
+                    step_plan = parse_step_plan_output(step_result, thm.proof_body)
                 except HOLParseError:
                     step_plan = []
             else:

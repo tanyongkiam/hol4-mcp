@@ -327,20 +327,57 @@ def format_step_context(
     return out
 
 
-def parse_step_plan_output(output: str) -> list[StepPlan]:
+def _byte_to_char_offset(body_bytes: bytes, byte_offset: int) -> int:
+    """Convert a UTF-8 byte offset into ``body_bytes`` to a character offset.
+
+    HOL4's TacticParse / HOLSourceParser uses BYTE positions internally
+    (SML strings are byte arrays under Poly/ML; multibyte UTF-8 chars
+    like ``‘`` (U+2018, 3 bytes) advance the parser position by 3).
+    Python comparisons against ``len(body)`` and ``content`` use CHAR
+    positions, so we must convert at the parse boundary.
+
+    If ``byte_offset`` falls in the middle of a multibyte sequence (which
+    should not happen for parser-emitted positions), decode is permissive
+    and the partial sequence is dropped — same effect as clamping to the
+    nearest preceding char boundary.
+    """
+    if byte_offset <= 0:
+        return 0
+    if byte_offset >= len(body_bytes):
+        # Beyond body — return full char length (which is what callers
+        # treat as "past end").
+        return len(body_bytes.decode('utf-8', errors='replace'))
+    return len(body_bytes[:byte_offset].decode('utf-8', errors='replace'))
+
+
+def parse_step_plan_output(output: str, body: str | None = None) -> list[StepPlan]:
     """Parse JSON output from step_plan_json.
 
     Expects: {"ok":[{"end":N,"type":"expand","text":"..."}, ...]} or {"err":"message"}
     Returns: list of StepPlan objects, one per executable step.
+
+    When ``body`` is provided, ``end`` offsets are converted from the
+    SML/UTF-8 BYTE positions emitted by the HOL4 parser to Python
+    CHARACTER positions in ``body``. Callers that compare ``step.end``
+    against ``len(body)`` or use it as an offset into ``content`` (a
+    Python str) must pass ``body`` to get correct positions on inputs
+    containing non-ASCII characters like ``‘`` / ``’``.
+
+    Tests that only inspect counts / structure may omit ``body``; their
+    ``end`` values will be byte offsets (matching the SML side).
+
     Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
     result = _find_json_line(output, "goalfrag_step_plan_json")
 
     if 'ok' in result:
         try:
+            body_bytes = body.encode('utf-8') if body is not None else None
             steps = []
             for item in result['ok']:
                 end = int(item['end'])
+                if body_bytes is not None:
+                    end = _byte_to_char_offset(body_bytes, end)
                 kind = str(item['type'])
                 text = str(item['text'])
                 steps.append(StepPlan(end=end, kind=kind, text=text))
