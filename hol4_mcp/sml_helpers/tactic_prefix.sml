@@ -832,3 +832,52 @@ fun run_resume_canonical_json suspension_name label_name name tactics store time
       ",\"trace\":" ^ trace_json ^ "}") ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* ----------------------------------------------------------------------
+   e-mode safety.
+
+   hol_state_at navigates with a GOALFRAG (needed for ef()/open/close
+   fine-grained stepping). But on a GOALFRAG, proofManagerLib.e/expand apply a
+   tactic to ALL goals in the current Base (THEN / `>>` semantics), whereas on
+   a GOALSTACK they apply to the FIRST goal only (classic HOL `e`). So manually
+   driving a navigated proof with `e` silently misfires per-goal (`>-`/THEN1)
+   tactics across sibling goals (typically Lib.assert: predicate not true).
+
+   Fix: a `safe_e` driver that, on a GOALFRAG, applies the tactic to the FIRST
+   goal only (via enth/NTH_GOAL goal 1) — matching classic first-goal `e`. NO
+   goalstate conversion: the proof stays a GOALFRAG and all other goals stay
+   exactly in place. On a GOALSTACK (or no live proof) behaviour is the stock
+   proofManagerLib.e.
+
+   We install safe_e two ways so BOTH common driving forms are covered:
+     (1) shadow the structure `proofManagerLib` (re-export everything, override
+         only e/expand) so QUALIFIED `proofManagerLib.e`/`.expand` are safe;
+     (2) shadow the top-level `e`/`expand`.
+   The navigation machinery uses proofManagerLib.expand_frag / ef / expand_list
+   (all re-exported unchanged), never .e/.expand, so it is untouched.
+   Low-level escape hatches (Manager.expand, goalFrag.expand, eall/eta) are NOT
+   guarded — they are explicit/low-level, not the silent footgun. *)
+local
+  val orig_e    = proofManagerLib.e
+  val orig_enth = proofManagerLib.enth
+  val orig_p    = proofManagerLib.p
+in
+  fun safe_e tac =
+    let
+      val on_frag =
+        (case orig_p () of Manager.PF (Manager.GOALFRAG _, _) => true | _ => false)
+        handle _ => false
+    in
+      if on_frag then orig_enth tac 1 else orig_e tac
+    end
+end
+
+structure proofManagerLib =
+struct
+  open proofManagerLib
+  val e = safe_e
+  val expand = safe_e
+end
+
+val e = safe_e
+val expand = safe_e
