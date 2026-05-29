@@ -1274,3 +1274,119 @@ val _ = export_theory();
         f"  cursor: {cursor_goal!r}\n"
         f"  marker: {marker_goal!r}"
     )
+
+
+# --- Oracle/cheat-dependency detection in single checks (store=false) ---
+# Regression: hol_check_proof / verify_all_proofs read oracle tags from the
+# proved theorem (top_thm() / the resume thm) BEFORE dropping it, not via
+# DB.fetch on a stored theorem. Previously oracles were gated behind
+# `stored = proof_ok andalso store`, so store=false paths (single
+# hol_check_proof; Resume blocks in verify_all_proofs) silently failed to
+# report that a checked theorem depended on an auto-cheated lemma.
+
+@pytest.mark.asyncio
+async def test_check_proof_reports_cheat_dependency(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """execute_proof_traced (store=false) must report a cheat oracle when the
+    checked theorem depends on a cheated lemma (verify_core / top_thm fix)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Theorem cheated_lemma:
+  (5:num) = 6
+Proof
+  cheat
+QED
+
+Theorem uses_cheat:
+  (5:num) = 6
+Proof
+  ACCEPT_TAC cheated_lemma
+QED
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    res = await cursor.init()
+    assert not res.get("error"), f"init failed: {res.get('error')}"
+
+    trace = await cursor.execute_proof_traced("uses_cheat")
+    assert trace and trace[-1].goals_after == 0 and trace[-1].error is None, (
+        f"uses_cheat did not close: {trace!r}"
+    )
+    oracles = cursor._theorem_oracles.get("uses_cheat", [])
+    assert any("cheat" in o for o in oracles), (
+        f"expected depends-on-cheat oracle for uses_cheat (store=false), "
+        f"got {oracles!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_proof_clean_theorem_no_cheat_oracle(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """A cheat-free theorem must NOT report a cheat oracle (no false positive
+    from reading top_thm()'s tag)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Theorem clean_thm:
+  !a b:bool. a /\\ b ==> b /\\ a
+Proof
+  rpt strip_tac >> fs[]
+QED
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    res = await cursor.init()
+    assert not res.get("error"), f"init failed: {res.get('error')}"
+
+    trace = await cursor.execute_proof_traced("clean_thm")
+    assert trace and trace[-1].goals_after == 0 and trace[-1].error is None, (
+        f"clean_thm did not close: {trace!r}"
+    )
+    assert not cursor._theorem_oracles.get("clean_thm"), (
+        f"clean theorem falsely reported oracles: "
+        f"{cursor._theorem_oracles.get('clean_thm')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_all_proofs_resume_reports_cheat_dependency(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """Resume blocks run via run_resume_canonical_json with store=false in
+    verify_all_proofs; the cheat oracle must still be reported (read from the
+    resume thm via a ref, not via DB.fetch on a stored theorem)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+open markerLib;
+
+Theorem cheated_lemma:
+  p ==> p /\\ p
+Proof
+  cheat
+QED
+
+Theorem disp:
+  p ==> p /\\ p
+Proof
+  suspend "only"
+QED
+
+Resume disp[only]:
+  ACCEPT_TAC cheated_lemma
+QED
+
+Finalise disp
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    res = await cursor.init()
+    assert not res.get("error"), f"init failed: {res.get('error')}"
+
+    await cursor.verify_all_proofs()
+
+    resume_names = [t.name for t in cursor._theorems if t.kind == "Resume"]
+    assert resume_names, "no Resume theorem was parsed"
+    rn = resume_names[0]
+    oracles = cursor._theorem_oracles.get(rn, [])
+    assert any("cheat" in o for o in oracles), (
+        f"resume {rn} (store=false) did not report cheat oracle; "
+        f"all oracles={cursor._theorem_oracles!r}"
+    )

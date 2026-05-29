@@ -637,16 +637,21 @@ fun verify_core name tactics store timeout_sec =
     val goals_remaining = length (top_goals()) handle _ => 0
     val proof_ok = goals_remaining = 0
 
+    (* Read oracle tags from the proved theorem directly (top_thm()) BEFORE
+       drop_all discards it, so cheat-dependency detection works whether or not
+       we store. Previously oracles were read via DB.fetch only when stored, so
+       store=false checks (single hol_check_proof) never reported a dependency
+       on an auto-cheated lemma. *)
+    val oracles =
+      if proof_ok then
+        Lib.set_diff (fst (Tag.dest_tag (Thm.tag (top_thm())))) ["DISK_THM"]
+        handle _ => []
+      else []
+
     val stored = proof_ok andalso store
     val _ = if stored
             then (smlExecute.quse_string ("val " ^ name ^ " = save_thm(\"" ^ name ^ "\", top_thm());"); ())
             else (drop_all (); ())
-
-    val oracles =
-      if stored then
-        Lib.set_diff (fst (Tag.dest_tag (Thm.tag (DB.fetch "-" name)))) ["DISK_THM"]
-        handle _ => []
-      else []
 
     val oracles_json = "[" ^ String.concatWith "," (map json_string oracles) ^ "]"
     val trace_json = "[" ^ String.concatWith "," trace_entries ^ "]"
@@ -782,6 +787,11 @@ fun set_resume_goalfrag_json suspension_name label_name =
    tactics: list of SML tactic strings, combined left-associatively with
    THEN.  An empty list runs the identity tactic (ALL_TAC) — closes nothing,
    so used only when the Resume body is itself empty. *)
+(* Captures oracle tags of the most recently run Resume theorem (set inside
+   the quse_string'd command, read back after), so cheat-dependency detection
+   works for store=false single checks too. *)
+val hol4mcp_resume_oracles = ref ([]: string list)
+
 fun run_resume_canonical_json suspension_name label_name name tactics store timeout_sec =
   let
     val _ = drop_all ()
@@ -793,23 +803,22 @@ fun run_resume_canonical_json suspension_name label_name name tactics store time
         if store then
           "val _ = save_thm(\"" ^ String.toString name ^ "\", hol4mcp_resume_thm) "
         else ""
+    val () = hol4mcp_resume_oracles := []
     val cmd =
         "let val hol4mcp_tac = (" ^ combined ^ ") " ^
         "    val hol4mcp_resume_thm = markerLib.resume " ^
         "{suspension_name = \"" ^ String.toString suspension_name ^
         "\", label_name = \"" ^ String.toString label_name ^ "\"} hol4mcp_tac " ^
         save_decl ^
+        "    val () = hol4mcp_resume_oracles := ((Lib.set_diff (fst (Tag.dest_tag (Thm.tag hol4mcp_resume_thm))) [\"DISK_THM\"]) handle _ => []) " ^
         "in () end"
     val start = Timer.startRealTimer ()
     val ok = smlTimeout.timeout timeout_sec
                (fn () => smlExecute.quse_string cmd) ()
     val real_ms = Time.toMilliseconds (Timer.checkRealTimer start)
-    val oracles =
-      if ok andalso store then
-        Lib.set_diff (fst (Tag.dest_tag (Thm.tag (DB.fetch "-" name))))
-                     ["DISK_THM"]
-        handle _ => []
-      else []
+    (* Read oracle tags captured inside the command (works whether or not we
+       store; DB.fetch only works post-save). *)
+    val oracles = if ok then !hol4mcp_resume_oracles else []
     val oracles_json = "[" ^ String.concatWith "," (map json_string oracles) ^ "]"
     val trace_json =
       "[{\"real_ms\":" ^ LargeInt.toString real_ms ^
