@@ -41,8 +41,10 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H14 | ✅     | PreToolUse            | `Bash`                  | Block destructive git ops without literal `git ok` in the latest user message (transcript-aware; fail-open if transcript unreadable) |
 | H15 | ⏭     | PreToolUse            | `Write`                 | ~~On `~/.claude/plans/` writes, advise if "Operating principles" section is missing~~ — skipped (high FP on non-proof plans; marker regex fragile; plan template is the better forcing function) |
 | H16 | ✅     | PostToolUse           | `mcp__hol4__hol_state_at\|mcp__hol4__hol_send\|mcp__hol4__hol_check_proof` | Inject advisory when goal display contains `⅋ᵣ` / `resconj` — the canonical indicator that multiple subgoals were bundled into one Resume body via a shared `suspend` label (CLAUDE.md "one label = one goal" violation) |
+| H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored THEN-form `suspend` (`>>` / `\\` / `THEN` then `suspend "..."`) in `*Script.sml` edits — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects) |
+| H18 | ✅     | PreToolUse            | `mcp__hol4__hol_send\|Edit\|Write\|MultiEdit` | Block the `markerLib` suspension-lookup query (the `(string*thm) option` one — returns NONE in a bare session, tempts guessing the suspended goal); point to `set_suspended_goal` to actually load it |
 
-Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16. (H2, H3, H5, H9, H11, H12, H13, H15 skipped.)
+Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18. (H2, H3, H5, H9, H11, H12, H13, H15 skipped.)
 
 ## H1 — banned-tactics scanner
 
@@ -439,6 +441,75 @@ Fix:
   field-name fallback as H6/H8; uses `ensure_ascii=False` so the U+214B
   marker survives dict serialisation.
 
+## H17 — THEN-form `suspend` blocker
+
+**File**: `h17_then_suspend.py`
+**Event**: `PreToolUse`
+**Matcher**: `Edit|Write|MultiEdit`
+**Effect**: blocks (exit 2) if the new content of a `*Script.sml` edit contains a
+THEN-form combinator (`>>`, `\\`, or the word `THEN`) immediately followed by
+`suspend "..."`.
+
+### Why
+
+`suspend "L"` is a single-goal tactic; THEN distributes its right operand across
+ALL residual goals, tagging each with the same label. At Resume time those goals
+are merged via `resconj` into one unprovable bundled goal — the runtime failure
+H16 detects. The canonical form is THEN1 (`>-`) immediately before every
+`suspend`. H17 catches the mistake at edit time so it never reaches live state.
+
+### What counts
+
+Regex `(?:>>(?!~)|\\\\|\bTHEN(?![1L_]))\s*suspend\s*"..."`:
+- `>>` — negative lookahead excludes `>>~` / `>>~-` (different combinators).
+- `\\` — CakeML preamble synonym for THEN.
+- the word `THEN` — word-boundary; `THEN1` / `THENL` / `THEN_LT` excluded.
+
+Fires anywhere in the edit text, including inside parens
+(`>- (... >> suspend "L")`).
+
+### Correct forms (not blocked)
+
+`>- suspend "L"` · `>- suspend "L1" >- suspend "L2"` ·
+`tac1 >> tac2 >- suspend "L"` (THEN for the transforms, THEN1 only at the
+boundary) · `>~ [pat] >- suspend "L"`.
+
+## H18 — suspension-lookup ban
+
+**File**: `h18_ban_lookup_suspension.py`
+**Event**: `PreToolUse`
+**Matcher**: `mcp__hol4__hol_send|Edit|Write|MultiEdit`
+**Effect**: blocks (exit 2) if a `hol_send` command (or an Edit/Write/MultiEdit
+body) contains the banned `markerLib` suspension-lookup token (regex
+`\blookup_` + `suspension\b`).
+
+### Why
+
+That query is the wrong tool for inspecting a suspended goal. Its type is
+`(string * thm) option`, and in a bare MCP session it returns NONE — the
+suspension store is populated by file replay, not by a lone `hol_send`. A NONE
+return tempts guessing the suspended goal's assumptions instead of reading them,
+a RULE F / RULE D violation that has cost real session time.
+
+### What it points to
+
+To READ a suspended goal, LOAD it and inspect normally:
+
+    markerLib.set_suspended_goal {suspension_name = "<thm>", label_name = "<label>"};
+    val (asl,w) = proofManagerLib.top_goal();
+    List.app (fn t => print (term_to_string t ^ "\n")) asl;
+
+The parent Theorem must be processed up to its QED first — navigate
+`hol_state_at` to the dispatcher's QED so the suspension is in the store. In a
+script, write the body inside `Resume thm[Label]: ... QED` and navigate with
+`hol_state_at`.
+
+### Limitation
+
+Fires on any occurrence of the banned token, including in a memory note or
+comment about the ban itself (this README phrases around it for that reason).
+Acceptable — the token has no legitimate use in committed proof work.
+
 ## Installing the full suite
 
 The scripts in this directory are dormant until wired into Claude Code's
@@ -480,6 +551,24 @@ hooks block disappears with no warning if you slip one in).
           {
             "type": "command",
             "command": "/home/yongkiam/hol4-mcp/hooks/h14_git_destructive_consent.py"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/yongkiam/hol4-mcp/hooks/h17_then_suspend.py"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__hol4__hol_send|Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/yongkiam/hol4-mcp/hooks/h18_ban_lookup_suspension.py"
           }
         ]
       }
