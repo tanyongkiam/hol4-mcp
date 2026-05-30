@@ -349,6 +349,12 @@ class FileProofCursor:
         # updates _content_hash without re-running goalfrag_step_plan_json.
         self._step_plan_hash: str = ""
         self._pos = SessionPosition()  # Where HOL session is (updated atomically by state_at)
+        # Set when a hol_send command may have mutated the live proofManager out
+        # from under our position cache (set_goal/e/b/drop_all/set_suspended_goal/…).
+        # While true, the next state_at MUST NOT take the `reused` fast path
+        # (which blindly returns the live goal) — it re-establishes the goal via
+        # checkpoint/replay (cheap: current theorem only) and clears this flag.
+        self._session_dirty: bool = False
 
         # What's been loaded into HOL
         self._loaded_to_line: int = 0
@@ -1548,6 +1554,10 @@ class FileProofCursor:
 
         Returns True if session is now at target position.
         """
+        if self._session_dirty:
+            # A hol_send may have mutated the live proofManager; the reuse path
+            # would return the wrong (polluted) goal. Force re-setup instead.
+            return False
         if not self._pos.can_reuse(self._content_hash):
             return False
 
@@ -1876,6 +1886,9 @@ class FileProofCursor:
         if nav.error_msg is not None:
             return
         self._pos = self._pos.at_step(target.tactic_idx, self._content_hash)
+        # The session is now re-synced with the cache at this position; any
+        # prior hol_send pollution has been discarded by the checkpoint/replay.
+        self._session_dirty = False
 
     async def _build_result(
         self, target: _TargetInfo, nav: _NavResult, timings: dict[str, float],

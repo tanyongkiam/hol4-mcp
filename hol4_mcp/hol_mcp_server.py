@@ -397,6 +397,31 @@ async def hol_sessions() -> str:
 _PROOF_STATE_PATTERNS = []
 
 
+# Commands that may mutate the live proofManager / goal stack. A hol_send of any
+# of these desyncs hol_state_at's position cache (its `reused` fast path returns
+# the live goal without re-establishing it). When matched, we taint the session's
+# cursor so the NEXT hol_state_at re-establishes the goal via checkpoint/replay
+# (cheap — current theorem only, prefix checkpoints untouched) instead of reusing
+# the polluted state. Errs toward over-matching: a false positive only costs one
+# cheap re-setup; a false negative reintroduces the silent-desync bug.
+_PROOFMGR_MUTATING_RE = re.compile(
+    r'\b(?:'
+    r'drop_all|backup_n|new_goalstack'
+    r'|set_goal|set_goalfrag|set_suspended_goal|set_resume_goalfrag\w*'
+    r'|verify_resume\w*|run_resume\w*|verify_core'
+    r'|markerLib\.resume|bossLib\.sg'
+    r'|proofManagerLib\.(?:e|b|r|g|gf|ef|eall|ee|expand|expandf|expand_list'
+    r'|expand_frag|rotate|restart|drop|dropn|backup|add|split)'
+    r')\b'
+    # bare top-level proof drivers (tactic_prefix shadows e/expand/ef at top level)
+    r'|(?<![\w.])(?:e|ef|expand|expandf|expand_list|sg|g|gf|b|r)\s*[(`]'
+)
+
+
+def _command_mutates_proof_state(command: str) -> bool:
+    return _PROOFMGR_MUTATING_RE.search(command) is not None
+
+
 def _check_proof_state_command(command: str) -> str | None:
     """Block hol_send commands that interact with proof state.
 
@@ -463,6 +488,15 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     t0 = time.monotonic()
     result = await s.send(command, timeout=timeout)
     elapsed = time.monotonic() - t0
+
+    # If this command may have mutated the live proofManager, taint the cursor so
+    # the next hol_state_at re-establishes its goal instead of reusing the now-
+    # desynced cached position (see _PROOFMGR_MUTATING_RE).
+    if _command_mutates_proof_state(command):
+        entry = _sessions.get(session)
+        if entry and entry.cursor:
+            entry.cursor._session_dirty = True
+
     _schedule_gc(session)
     timing = f"\n[{elapsed:.3f}s]"
     return _truncate_output(result, max_output, footer=timing)
