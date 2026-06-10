@@ -334,16 +334,22 @@ def _session_age(name: str) -> str:
 
 
 @mcp.tool()
-async def hol_start(workdir: str, name: str = "default", env: dict = None) -> str:
+async def hol_start(workdir: str, name: str = "default", env: dict = None,
+                    force: bool = False) -> str:
     """Start a HOL4 REPL session.
 
     Idempotent - returns existing session if already running.
     Usually called automatically by hol_state_at (via file= parameter).
 
+    Refuses to start a SECOND concurrent session (RULE J: one session at a
+    time — a second session can resolve bare theorem names against a built
+    ancestor's old version and falsely pass). Pass force=True to override.
+
     Args:
         workdir: Working directory (should contain Holmakefile for dependencies)
         name: Session identifier (e.g., "main")
         env: Optional environment variables (e.g. {"VFMDIR": "/path/to/vfm"})
+        force: Allow a second concurrent session despite RULE J (default False)
 
     Returns: Session status
     """
@@ -356,6 +362,25 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None) -> st
             return f"Session '{name}' already running.\n\n=== Goals ===\n{goals}"
         # Dead session - clean up
         del _sessions[name]
+
+    # RULE J: one HOL session at a time. A second concurrent session resolves
+    # bare theorem names against stale built ancestors and can falsely pass.
+    others = [
+        (n, e) for n, e in _sessions.items()
+        if n != name and e.session.is_running
+    ]
+    if others and not force:
+        listing = "\n".join(
+            f"  {n}  (workdir {e.workdir})" for n, e in others
+        )
+        return (
+            f"ERROR: refusing to start session '{name}' — other HOL "
+            f"session(s) already running:\n{listing}\n"
+            f"RULE J: one session at a time; a second session can resolve "
+            f"bare theorem names\nagainst stale built ancestors and falsely "
+            f"pass. Stop the other session\n(hol_stop(session=...)) or pass "
+            f"force=True if you really need both."
+        )
 
     # Validate workdir
     workdir_path = Path(workdir).resolve()
@@ -455,6 +480,27 @@ def _command_mutates_proof_state(command: str) -> bool:
     return _PROOFMGR_MUTATING_RE.search(command) is not None
 
 
+# `val gs = ...` etc. shadows a HOL primitive/tactic for the REST of the
+# session — later tactics and probes using the name silently misbehave.
+_SHADOW_BINDING_RE = re.compile(
+    r'\bval\s+(gs|fs|rw|simp|e|b|g|it|concl|hyp|dest_thm|tag|aconv|drop)\s*='
+)
+
+
+def _check_shadow_binding(command: str) -> str | None:
+    """Reject hol_send commands that shadow HOL primitives. None if allowed."""
+    m = _SHADOW_BINDING_RE.search(command)
+    if not m:
+        return None
+    nm = m.group(1)
+    return (
+        f"ERROR: hol_send BLOCKED — `val {nm} = ...` shadows the HOL4 "
+        f"primitive/tactic `{nm}` for the rest of the session; later tactics "
+        f"and probes that use `{nm}` will silently misbehave.\n"
+        f"Bind a prefixed name instead, e.g. `val my_{nm} = ...`."
+    )
+
+
 def _check_proof_state_command(command: str) -> str | None:
     """Block hol_send commands that interact with proof state.
 
@@ -501,6 +547,10 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     Returns: HOL output (may include errors), truncated if exceeds max_output
     """
     blocked = _check_proof_state_command(command)
+    if blocked:
+        return blocked
+
+    blocked = _check_shadow_binding(command)
     if blocked:
         return blocked
 
@@ -1099,12 +1149,22 @@ async def _init_file_cursor(
     entry = _sessions.get(session)
 
     if s and s.is_running:
-        # Check if workdir differs - need to restart
+        # Workdir mismatch: refuse instead of silently rebasing the session
+        # (RULE J trap: a session mid-proof in clone A, a file= from clone B —
+        # the old silent restart destroyed open suspensions/loaded context).
         if entry and entry.workdir != target_workdir:
-            await hol_stop(session)
-            s = None
+            return (
+                f"ERROR: session '{session}' is bound to workdir "
+                f"{entry.workdir},\nbut {file_path} resolves to workdir "
+                f"{target_workdir}.\n"
+                f"RULE J: one session per workdir/theory — switching "
+                f"workdirs mid-session would\nsilently drop the session's "
+                f"loaded context and open suspensions.\n"
+                f"Stop it first (hol_stop(session='{session}')) and re-run "
+                f"with file= to re-init\ninto the new workdir."
+            )
         # Check if file content changed - session has stale definitions
-        elif entry and entry.cursor:
+        if entry and entry.cursor:
             old_cursor = entry.cursor
             if Path(old_cursor.file).resolve() == file_path:
                 # Same file - check if content changed

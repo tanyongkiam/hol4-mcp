@@ -90,9 +90,10 @@ async def test_sigint_during_command():
 
 async def test_sigint_handler_interrupts_all_sessions():
     """Test that SIGINT handler interrupts all running sessions."""
-    # Start two sessions
+    # Start two sessions (force: deliberately testing parallel sessions,
+    # which the RULE J guard otherwise refuses)
     await hol_start(workdir="/tmp", name="test_sigint_1")
-    await hol_start(workdir="/tmp", name="test_sigint_2")
+    await hol_start(workdir="/tmp", name="test_sigint_2", force=True)
     
     try:
         # Verify both sessions exist

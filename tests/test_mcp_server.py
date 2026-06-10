@@ -254,11 +254,13 @@ async def test_file_init_lists_theorems(tmp_path):
         await hol_stop(session="file_init_test")
 
 
-async def test_file_init_restarts_on_workdir_change(tmp_path):
-    """Test hol_file_init restarts session when workdir changes.
+async def test_file_init_refuses_on_workdir_change(tmp_path):
+    """hol_file_init refuses a file from a different workdir (RULE J).
 
-    Regression test for BUG_workdir_mismatch: when hol_file_init was called
-    with a different workdir, the session kept using the old workdir.
+    History: originally the session silently kept the OLD workdir
+    (BUG_workdir_mismatch), then silently restarted into the new one.
+    Both lose state invisibly; the contract is now an explicit refusal —
+    stop the session first, then re-init.
     """
     # Create two directories with test files
     dir_a = tmp_path / "dirA"
@@ -280,15 +282,23 @@ async def test_file_init_restarts_on_workdir_change(tmp_path):
         sessions = await hol_sessions()
         assert "dirA" in sessions
 
-        # Now init for file in dir_b - should restart session
-        result = await hol_file_init(file=str(file_b), session="workdir_test", workdir=str(dir_b))
-        assert "Theorems:" in result
+        # Init for a file in dir_b: refused, session untouched
+        result = await hol_file_init(
+            file=str(file_b), session="workdir_test", workdir=str(dir_b)
+        )
+        assert result.startswith("ERROR")
+        assert "bound to workdir" in result
+        sessions = await hol_sessions()
+        assert "dirA" in sessions  # still the old session
 
-        # Check workdir changed
+        # Explicit stop + re-init into dir_b works
+        await hol_stop(session="workdir_test")
+        result = await hol_file_init(
+            file=str(file_b), session="workdir_test", workdir=str(dir_b)
+        )
+        assert "Theorems:" in result
         sessions = await hol_sessions()
         assert "dirB" in sessions
-        # Old workdir should not be present (session was restarted)
-        assert "dirA" not in sessions or "workdir_test" not in sessions.split("dirA")[0]
     finally:
         await hol_stop(session="workdir_test")
 
