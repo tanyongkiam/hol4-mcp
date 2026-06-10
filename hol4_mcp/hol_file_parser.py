@@ -182,6 +182,25 @@ def _offset_to_line(offset: int, content: str) -> int:
     return content[:offset].count('\n') + 1
 
 
+def step_text_start(
+    step_plan: list[StepPlan], idx: int, proof_body: str
+) -> int:
+    """Offset of step idx's own tactic text within proof_body.
+
+    A step's span [prev.end, step.end) includes the combinator and
+    whitespace that follow the previous tactic; this returns where the
+    step's own text begins (falling back to the span start when the raw
+    text cannot be located, e.g. structural goalFrag steps).
+    """
+    span_start = step_plan[idx - 1].end if idx > 0 else 0
+    step = step_plan[idx]
+    if step.kind in ("expand", "expand_list") and step.text:
+        found = proof_body.find(step.text, span_start, step.end)
+        if found >= 0:
+            return found
+    return span_start
+
+
 # Display names for structural step kinds (hide SML plumbing)
 _STEP_DISPLAY = {
     "open": ">-",

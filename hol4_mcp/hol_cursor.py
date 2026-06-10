@@ -10,7 +10,7 @@ from pathlib import Path
 from .hol_file_parser import (
     TheoremInfo, parse_theorems, LocalBlock, parse_local_blocks,
     build_line_starts, line_col_to_offset, HOLParseError,
-    parse_step_plan_output, StepPlan,
+    parse_step_plan_output, StepPlan, step_text_start,
     _find_json_line,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
@@ -46,6 +46,39 @@ def _try_find_json_line(output: str, context: str = "") -> dict:
         return _find_json_line(output, context)
     except HOLParseError:
         return {}
+
+
+def _error_reason(output: str, limit: int = 120) -> str:
+    """Compact one-line reason from HOL error output (for _failed_proofs).
+
+    Picks the first line that looks like the actual error (TIMEOUT marker,
+    'error'/'exception' mention), falling back to the first non-empty line.
+    """
+    first_nonempty = None
+    for line in output.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if first_nonempty is None:
+            first_nonempty = s
+        if s.startswith("TIMEOUT"):
+            return s[:limit]
+        if "error" in s.lower() or "exception" in s.lower():
+            return f"error: {s[:limit]}"
+    return f"error: {(first_nonempty or 'proof failed')[:limit]}"
+
+
+def _trace_reason(trace: list["TraceEntry"], limit: int = 120) -> str:
+    """Compact reason from a verify trace (for _failed_proofs)."""
+    for i, entry in enumerate(trace):
+        if entry.error:
+            e = entry.error.strip()
+            kind = "timeout" if e.upper().startswith("TIMEOUT") else "error"
+            at = f" at step {i + 1}" if entry.cmd else ""
+            return f"{kind}{at}: {e[:limit]}"
+    if trace and trace[-1].goals_after not in (0, None):
+        return f"proof incomplete ({trace[-1].goals_after} goals remaining)"
+    return "proof failed"
 
 
 def _is_hol_error(output: str) -> bool:
@@ -247,6 +280,8 @@ class StateAtResult:
     error: str | None = None  # Error message if replay failed
     timings: dict[str, float] | None = None  # Timing breakdown (ms)
     inside_by: bool = False   # Position is inside a decomposed by/>- subproof (between open/close)
+    inside_step_idx: int | None = None  # Step index when position is strictly INSIDE
+                                        # an opaque step (state shown = step entry)
 
 
 @dataclass
@@ -257,6 +292,7 @@ class _TargetInfo:
     total_tactics: int        # Total steps in step_plan
     incremental_update: tuple[int, int] | None  # (first_diff, old_tactic_idx) or None
     changed: bool             # Whether file content changed
+    proof_offset: int = 0     # Target offset within the proof body
 
 
 @dataclass
@@ -385,8 +421,9 @@ class FileProofCursor:
         self._tc_goals: dict[str, str] = {}
 
         # Theorems whose proofs failed during content loading and were
-        # auto-cheated to prevent cascading compile errors. Cleared on file change.
-        self._failed_proofs: set[str] = set()
+        # auto-cheated to prevent cascading compile errors, mapped to a short
+        # reason ("timeout >60s …" / "error: …"). Cleared on file change.
+        self._failed_proofs: dict[str, str] = {}
 
         # Oracle tags per theorem from verify_all_proofs.
         # e.g. {"thm_c": ["cheat"]} means thm_c transitively depends on a cheat.
@@ -1048,11 +1085,16 @@ class FileProofCursor:
         if 'ok' in data:
             self._resume_goals[thm.name] = data['ok']
 
-    async def _cheat_failed_theorem(self, thm: TheoremInfo) -> str | None:
+    async def _cheat_failed_theorem(
+        self, thm: TheoremInfo, reason: str = "proof failed"
+    ) -> str | None:
         """After a proof failure, re-send the theorem with cheat to bind its name.
 
         Without this, later theorems that reference the failed one get a fatal
         Poly/ML compile error ("Value or constructor not declared").
+
+        ``reason`` is recorded in _failed_proofs so outputs can name WHY the
+        dependency was auto-cheated.
 
         Returns error string if the cheat itself fails, else None.
         """
@@ -1067,7 +1109,7 @@ class FileProofCursor:
                     f"Resume '{thm.name}' failed (line {thm.start_line}) "
                     f"and could not be cheated: {result}"
                 )
-            self._failed_proofs.add(thm.name)
+            self._failed_proofs[thm.name] = reason
             return None
 
         attrs = f"[{','.join(thm.attributes)}]" if thm.attributes else ""
@@ -1080,14 +1122,14 @@ class FileProofCursor:
         # (residual output from the original failed proof can pollute the result,
         # so checking for errors is unreliable — check for success instead)
         if f"val {thm.name}" in result:
-            self._failed_proofs.add(thm.name)
+            self._failed_proofs[thm.name] = reason
             return None
         if _is_hol_error(result):
             return (
                 f"Proof of '{thm.name}' failed (line {thm.start_line}) "
                 f"and could not be cheated: {result[-500:]}"
             )
-        self._failed_proofs.add(thm.name)
+        self._failed_proofs[thm.name] = reason
         return None
 
     def _local_block_at(self, line: int) -> LocalBlock | None:
@@ -1127,7 +1169,7 @@ class FileProofCursor:
         """Handle HOL error from a theorem send. Returns error string or None."""
         if thm.kind == "Definition":
             return f"Definition '{thm.name}' failed (line {thm.start_line}): {result}"
-        return await self._cheat_failed_theorem(thm)
+        return await self._cheat_failed_theorem(thm, _error_reason(result))
 
     async def _extract_goals_for(self, theorems: list[TheoremInfo]) -> None:
         """Extract Definition/Resume goals before theorems are processed."""
@@ -1177,7 +1219,9 @@ class FileProofCursor:
                     if result.startswith("TIMEOUT") and thm.kind != "Definition":
                         self.session.interrupt()
                         await asyncio.sleep(0.5)
-                        err = await self._cheat_failed_theorem(thm)
+                        err = await self._cheat_failed_theorem(
+                            thm, "timeout >60s loading whole proof"
+                        )
                         if err:
                             return f"Error executing file content: {_format_context_error(result)}"
                     elif _is_fatal_hol_error(result):
@@ -1787,6 +1831,7 @@ class FileProofCursor:
         return _TargetInfo(
             thm=thm, tactic_idx=tactic_idx, total_tactics=total_tactics,
             incremental_update=incremental_update, changed=changed,
+            proof_offset=proof_body_offset,
         )
 
     def _line_col_to_proof_offset(self, thm: TheoremInfo, line: int, col: int) -> int:
@@ -1918,7 +1963,31 @@ class FileProofCursor:
             error=error_msg,
             timings=timings,
             inside_by=self._detect_inside_by(target.tactic_idx),
+            inside_step_idx=self._detect_inside_step(target),
         )
+
+    def _detect_inside_step(self, target: _TargetInfo) -> int | None:
+        """Step index when the target offset is strictly INSIDE a step.
+
+        The replay can only land on step boundaries, so a position inside a
+        lumped/parenthesized chain shows the chain's ENTRY state. "Inside"
+        means strictly past the step's own tactic text start (a target on
+        the combinator/whitespace prefix is the same replay position as the
+        text start, which is what the user expects). Returns the 0-based
+        step index, or None when the target sits on a boundary.
+        """
+        idx = target.tactic_idx
+        if idx >= len(self._step_plan):
+            return None
+        step = self._step_plan[idx]
+        if step.kind not in ("expand", "expand_list"):
+            return None
+        text_start = step_text_start(
+            self._step_plan, idx, target.thm.proof_body or ""
+        )
+        if text_start < target.proof_offset < step.end:
+            return idx
+        return None
 
     async def state_at(self, line: int, col: int = 1) -> StateAtResult:
         """Get proof state at file position using prefix-based replay.
@@ -2232,7 +2301,9 @@ class FileProofCursor:
                             )]
                             current_line = thm.proof_end_line - 1
                             continue
-                        cheat_err = await self._cheat_failed_theorem(thm)
+                        cheat_err = await self._cheat_failed_theorem(
+                            thm, _error_reason(result)
+                        )
                         if cheat_err:
                             return {}
                 results[thm.name] = []
@@ -2255,7 +2326,9 @@ class FileProofCursor:
                     if thm_content.strip():
                         resume_result = await self.session.send(thm_content, timeout=60)
                         if _is_hol_error(resume_result):
-                            cheat_err = await self._cheat_failed_theorem(thm)
+                            cheat_err = await self._cheat_failed_theorem(
+                                thm, _error_reason(resume_result)
+                            )
                             if cheat_err:
                                 return {}
                     results[thm.name] = []
@@ -2372,7 +2445,9 @@ class FileProofCursor:
                 if thm_content.strip():
                     resume_result = await self.session.send(thm_content, timeout=60)
                     if _is_hol_error(resume_result):
-                        cheat_err = await self._cheat_failed_theorem(thm)
+                        cheat_err = await self._cheat_failed_theorem(
+                            thm, _error_reason(resume_result)
+                        )
                         if cheat_err:
                             return {}
             elif thm.kind == "Definition":
@@ -2394,7 +2469,9 @@ class FileProofCursor:
             elif not stored:
                 # Proof failed/incomplete and name is unbound.
                 # Cheat to bind the name so later theorems can reference it.
-                cheat_err = await self._cheat_failed_theorem(thm)
+                cheat_err = await self._cheat_failed_theorem(
+                    thm, _trace_reason(trace)
+                )
                 if cheat_err:
                     return {}
 
@@ -2409,3 +2486,91 @@ class FileProofCursor:
             self._loaded_content_hash = self._content_hash
 
         return results
+
+    async def diagnose_resume_failure(self, name: str) -> str | None:
+        """Diagnose a Resume whose suspension label could not be found.
+
+        The usual cause: the dispatcher theorem or an earlier Resume of the
+        same suspension failed during loading (and was auto-cheated), so the
+        suspension delta carrying this label was never recorded.
+
+        Reports the ancestor chain (dispatcher + intervening Resumes of the
+        same suspension, in file order), marks members already known broken
+        (from _failed_proofs, with reasons), and — when none is known broken —
+        replays each ancestor in file order until the first failure.
+
+        Returns a multi-line diagnosis string, or None if not applicable.
+        """
+        thm = self._get_theorem(name)
+        if not thm or thm.kind != "Resume" or not thm.suspension_name:
+            return None
+        susp = thm.suspension_name
+        ancestors = [
+            t for t in self._theorems
+            if t.start_line < thm.start_line
+            and (t.name == susp
+                 or (t.kind == "Resume" and t.suspension_name == susp))
+        ]
+        if not ancestors:
+            return (
+                f"No dispatcher theorem or earlier Resume for suspension "
+                f"'{susp}' appears in this file before line {thm.start_line} "
+                f"— the suspension was never created here."
+            )
+
+        out = [f"Ancestor chain for suspension '{susp}' (file order):"]
+        first_broken: TheoremInfo | None = None
+        for t in ancestors:
+            if t.name in self._failed_proofs:
+                out.append(
+                    f"  ✗ {t.kind} {t.name} (line {t.start_line}) — "
+                    f"auto-cheated: {self._failed_proofs[t.name]}"
+                )
+                if first_broken is None:
+                    first_broken = t
+            else:
+                out.append(f"  • {t.kind} {t.name} (line {t.start_line})")
+
+        if first_broken is not None:
+            out.append(
+                f"first broken ancestor: {first_broken.kind} "
+                f"{first_broken.name} (line {first_broken.start_line}) — its "
+                f"auto-cheat skipped the suspend/Resume that records this "
+                f"label. Fix it and retry."
+            )
+            return "\n".join(out)
+
+        # No ancestor known broken — replay each in file order to find the
+        # first failure (bounded to this suspension's chain).
+        for t in ancestors:
+            trace = await self.execute_proof_traced(t.name)
+            if not trace and t.kind == "Resume":
+                out.append(
+                    f"first broken ancestor: Resume {t.name} (line "
+                    f"{t.start_line}) — its own suspension goal could not be "
+                    f"extracted (label missing for it too); the break is at "
+                    f"or before it."
+                )
+                return "\n".join(out)
+            err = next(
+                ((i, e) for i, e in enumerate(trace) if e.error), None
+            )
+            if err is not None:
+                i, e = err
+                out.append(
+                    f"first broken ancestor: {t.kind} {t.name} (line "
+                    f"{t.start_line}) — step {i + 1}: {e.error[:200]}"
+                )
+                return "\n".join(out)
+            if trace and trace[-1].goals_after not in (0, None):
+                out.append(
+                    f"first broken ancestor: {t.kind} {t.name} (line "
+                    f"{t.start_line}) — proof incomplete "
+                    f"({trace[-1].goals_after} goals remaining)"
+                )
+                return "\n".join(out)
+        out.append(
+            "All ancestors replay OK individually — the label may be "
+            "misspelled, or it is consumed/renamed by an intervening Resume."
+        )
+        return "\n".join(out)

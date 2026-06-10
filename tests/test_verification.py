@@ -708,7 +708,9 @@ val _ = export_theory();
     enter_result = await cursor.enter_theorem("ok2")
     assert "error" not in enter_result
 
-    assert cursor._failed_proofs == {"fail1", "fail2"}
+    assert set(cursor._failed_proofs) == {"fail1", "fail2"}
+    # Reasons are recorded for each auto-cheated proof
+    assert all(cursor._failed_proofs[n] for n in ("fail1", "fail2"))
 
     # ok2 references fail1 (cheated to TRUTH) — should still load
     status = cursor.status

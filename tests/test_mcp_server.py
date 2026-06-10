@@ -206,7 +206,8 @@ async def test_log_nonexistent(workdir):
     """Test hol_log for non-existent theory."""
     result = await hol_log(workdir=workdir, theory="nonexistent")
     assert "Log not found: nonexistent" in result
-    assert "Available:" in result
+    # Listing depends on whether prior builds left logs in the fixtures dir
+    assert "Available:" in result or "No logs in" in result
 
 
 async def test_holmake_env_in_output(isolated_workdir):
@@ -1293,7 +1294,10 @@ async def test_state_at_broken_two_step_qed_reports_stuck_location(tmp_path):
         assert "PROOF BROKEN" in r
         assert "ERROR" in r
         assert "=== Goals ===" not in r  # Goals section suppressed in strict mode
-        assert "hol_state_at" in r  # Suggests inspecting failure point
+        # Points at the failure: either a precise location to inspect
+        # (hol_state_at suggestion) or, for an opaque multi-line step,
+        # bisection advice over the reported line range.
+        assert "hol_state_at" in r or "To localize" in r
     finally:
         await hol_stop(session=session)
 
@@ -1831,9 +1835,11 @@ async def test_state_at_absolute_lines_with_blank_line(tmp_path):
         # Request state at QED line (line 18). Proof is broken, so PROOF BROKEN.
         r = await hol_state_at(session=session, line=18, col=1)
         assert "PROOF BROKEN" in r
-        # The failure location must be line 15 (rpt strip_tac), not line 14 (blank)
-        assert "line 15" in r, f"Expected failure at line 15, got: {r}"
-        assert "hol_state_at(line=15" in r, f"Suggested line should be 15: {r}"
+        # The failure location must start at line 15 (rpt strip_tac), not
+        # line 14 (blank). Opaque multi-line steps report a range whose
+        # start must still be the absolute line 15.
+        assert "line 15" in r or "lines 15-" in r, \
+            f"Expected failure at line 15, got: {r}"
     finally:
         await hol_stop(session=session)
 

@@ -24,7 +24,10 @@ from fastmcp import FastMCP
 
 from .hol_session import HOLSession, HOLDIR
 from .hol_cursor import FileProofCursor
-from .hol_file_parser import HOLParseError, step_line_numbers, format_steps, format_step_context
+from .hol_file_parser import (
+    HOLParseError, step_line_numbers, format_steps, format_step_context,
+    step_text_start,
+)
 
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -40,6 +43,20 @@ def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
     last_nl = before.rfind('\n')
     col = file_offset - last_nl if last_nl >= 0 else file_offset + 1
     return line, col
+
+
+def _auto_cheated_deps_lines(cursor) -> list[str]:
+    """Lines naming dependencies auto-cheated during loading, with reasons.
+
+    Auto-cheated deps silently weaken a per-theorem verification claim (the
+    proof is checked against the dep's STATEMENT, not its proof), so outputs
+    name each one and why it was cheated.
+    """
+    failed = getattr(cursor, "_failed_proofs", None)
+    if not failed:
+        return []
+    deps = "; ".join(f"{name} ({reason})" for name, reason in failed.items())
+    return ["", f"[auto-cheated deps: {deps}]"]
 
 
 def _truncate_output(output: str, max_output: int, footer: str = "") -> str:
@@ -1145,6 +1162,18 @@ async def hol_state_at(
                     f"  hol_state_at(line={fail_loc[0]}, col={fail_loc[1]})"
                 )
 
+        # Timeout attribution: name the step's source span so the user can
+        # shrink the replayed unit instead of guessing which tactic is slow.
+        if result.error and "timed out" in result.error:
+            lines.append("")
+            lines.append(
+                f"TIMEOUT: step {fail_idx} ({fail_str}) exceeded the "
+                f"per-tactic timeout. If this span is a lumped chain, split "
+                f"it with `>- suspend` to shrink the replayed unit; a "
+                f"long-running but correct tactic needs a higher "
+                f"--tactic-timeout."
+            )
+
         if result.goals:
             # Always show goals at failure point (useful for debugging)
             # show_partial controls whether ALL goals or just the first are shown
@@ -1208,11 +1237,50 @@ async def hol_state_at(
             lines.append("=== Goals ===")
             lines.append("No goals (proof complete)")
 
+        # Chain-entry landing: the requested position is strictly inside one
+        # opaque step (lumped/parenthesized chain). The state shown is the
+        # step's ENTRY, which is easy to misread as the state at that line.
+        if (result.inside_step_idx is not None and not result.error
+                and thm and thm.proof_body):
+            k = result.inside_step_idx
+            step_plan = cursor._step_plan
+            if k < len(step_plan):
+                text_start = step_text_start(step_plan, k, thm.proof_body)
+                start_line = _file_offset_to_line_col(
+                    thm.proof_body_offset + text_start, cursor._content)[0]
+                end_line = _file_offset_to_line_col(
+                    thm.proof_body_offset + step_plan[k].end,
+                    cursor._content)[0]
+                if end_line > start_line:
+                    lines.append("")
+                    lines.append(
+                        f"NOTE: target line {line} is INSIDE step {k} "
+                        f"(lumped/parenthesized chain, lines {start_line}-"
+                        f"{end_line}); the state shown is this step's ENTRY "
+                        f"at line {start_line}, not the state at line {line}. "
+                        f"To navigate inside, split the arm with `>- suspend` "
+                        f"into a Resume body."
+                    )
+
     # Suggest extracting by/>- subproof into a suspend/Resume block
     if result.inside_by and not result.error:
         lines.append("")
         lines.append("[Inside by/>- subproof. Consider extracting into a suspend/Resume block "
                      "for independent verification and easier editing.]")
+
+    # Lost-suspension diagnosis: a Resume whose label cannot be found usually
+    # means an ancestor (dispatcher or earlier Resume) broke during loading.
+    if result.error and active_theorem and (
+            "No such label" in result.error
+            or "Failed to set up Resume goal" in result.error):
+        diag = await cursor.diagnose_resume_failure(active_theorem)
+        if diag:
+            lines.append("")
+            lines.append(diag)
+
+    # Name any deps auto-cheated while loading the file prefix (the state
+    # shown was computed with those theorems replaced by `cheat`).
+    lines.extend(_auto_cheated_deps_lines(cursor))
 
     # Add timing info if available
     if result.timings:
@@ -1344,6 +1412,15 @@ async def hol_check_proof(
             else:
                 lines.append(f"Status: INCOMPLETE ({len(result.goals)} goals remaining)")
             return "\n".join(lines)
+        if thm.kind == "Resume":
+            # Empty trace on a Resume almost always means the suspension
+            # goal could not be extracted (label missing from the store).
+            lines.append("Status: CANNOT CHECK (Resume suspension goal unavailable)")
+            diag = await cursor.diagnose_resume_failure(theorem)
+            if diag:
+                lines.append("")
+                lines.append(diag)
+            return "\n".join(lines)
         lines.append("Status: NO TACTICS (trivial or unparseable)")
         return "\n".join(lines)
 
@@ -1363,10 +1440,27 @@ async def hol_check_proof(
     if final.error:
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")
         lines.append(f"Error: {final.error}")
+        # Timeout attribution: name the step's source span so the user can
+        # shrink the lump instead of guessing which tactic is slow.
+        fe = trace_data[failed_idx]
+        if fe.error and "timeout" in fe.error.lower():
+            so = fe.start_offset or 0
+            sl = _file_offset_to_line_col(
+                thm.proof_body_offset + so, cursor._content)[0]
+            el = (_file_offset_to_line_col(
+                thm.proof_body_offset + fe.end_offset, cursor._content)[0]
+                if fe.end_offset is not None else sl)
+            span = f"line {sl}" if el <= sl else f"lines {sl}-{el}"
+            lines.append(
+                f"TIMEOUT: step {failed_idx + 1} spans {span} — split this "
+                f"span with `>- suspend` to shrink the lump, or raise the "
+                f"per-tactic timeout for a long-running but correct tactic."
+            )
     elif final.goals_after == 0:
         oracles = cursor._theorem_oracles.get(theorem, [])
         if oracles:
             lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps) ⚠ depends on cheat")
+            lines.extend(_auto_cheated_deps_lines(cursor))
         else:
             lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps)")
         if not trace and not oracles:
