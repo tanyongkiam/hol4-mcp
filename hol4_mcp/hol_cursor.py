@@ -1065,16 +1065,17 @@ class FileProofCursor:
         if 'ok' in tc_data and tc_data['ok']:
             self._tc_goals[thm.name] = tc_data['ok']
 
-    async def _extract_resume_goal(self, thm: TheoremInfo) -> None:
+    async def _extract_resume_goal(self, thm: TheoremInfo) -> str | None:
         """Extract goal for a Resume block from the suspension DB.
-        
+
         Must be called AFTER the original Theorem with suspend has been loaded,
         but BEFORE the Resume block itself is loaded.
-        
+
         Results are cached in self._resume_goals[thm.name].
+        Returns the extraction error (e.g. label not found), or None on success.
         """
         if not thm.suspension_name or thm.label_name is None:
-            return
+            return None
         escaped_susp = escape_sml_string(thm.suspension_name)
         escaped_label = escape_sml_string(thm.label_name)
         result = await self.session.send(
@@ -1084,6 +1085,8 @@ class FileProofCursor:
         data = _try_find_json_line(result)
         if 'ok' in data:
             self._resume_goals[thm.name] = data['ok']
+            return None
+        return data.get('err', f'unexpected output: {result[:200]}')
 
     async def _cheat_failed_theorem(
         self, thm: TheoremInfo, reason: str = "proof failed"
@@ -1177,7 +1180,17 @@ class FileProofCursor:
             if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
                 await self._extract_tc_goal(thm)
             if thm.kind == "Resume" and thm.name not in self._resume_goals:
-                await self._extract_resume_goal(thm)
+                err = await self._extract_resume_goal(thm)
+                if err is not None:
+                    # HOL processes a Resume whose label is missing as a
+                    # SILENT no-op (no output, nothing runs). Record it so
+                    # outputs can name the skipped block instead of letting
+                    # it masquerade as loaded.
+                    self._failed_proofs.setdefault(
+                        thm.name,
+                        f"label not found at load — Resume block "
+                        f"SKIPPED, never ran ({_error_reason(err)})"
+                    )
 
     async def _load_remaining_content(self) -> str | None:
         """Load remaining file content, theorem-by-theorem.
@@ -2524,7 +2537,7 @@ class FileProofCursor:
             if t.name in self._failed_proofs:
                 out.append(
                     f"  ✗ {t.kind} {t.name} (line {t.start_line}) — "
-                    f"auto-cheated: {self._failed_proofs[t.name]}"
+                    f"failed at load: {self._failed_proofs[t.name]}"
                 )
                 if first_broken is None:
                     first_broken = t
@@ -2534,9 +2547,9 @@ class FileProofCursor:
         if first_broken is not None:
             out.append(
                 f"first broken ancestor: {first_broken.kind} "
-                f"{first_broken.name} (line {first_broken.start_line}) — its "
-                f"auto-cheat skipped the suspend/Resume that records this "
-                f"label. Fix it and retry."
+                f"{first_broken.name} (line {first_broken.start_line}) — the "
+                f"suspend/Resume that records this label never ran. Fix it "
+                f"and retry."
             )
             return "\n".join(out)
 
