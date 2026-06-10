@@ -124,9 +124,26 @@ mcp = FastMCP("hol", instructions="""HOL4 theorem prover - proof development wor
 3. Repeat until proof complete
 4. holmake: Only at the end to verify the build
 
+Information tools (prefer these over hol_send probes):
+- hol_search(query=, pattern=): theorem database search (DB.find/DB.match)
+- hol_goals(): goal count + headlines; n=k for one goal, n=k asm=j for one
+  assumption — replaces top_goals() dumps and length(top_goals()) probes
+
 hol_send is available for exploration and interactive proof attack — use it
 freely. For replaying tactics in a script file, hol_state_at is preferred
 because it handles checkpoints automatically.
+
+Output notes:
+- "[auto-cheated deps: ...]" names prefix theorems that failed/timed out at
+  load and were replaced by cheat — the shown state/verification rests on
+  their STATEMENTS only. Fix them before trusting an OK.
+- A NOTE about a target "INSIDE step k" means the state shown is that
+  opaque step's ENTRY; split the arm with `>- suspend` to navigate inside.
+
+Guard rails (server-enforced):
+- One HOL session at a time (RULE J): hol_start refuses a second concurrent
+  session (force=True overrides); switching workdirs needs hol_stop first.
+- hol_send rejects `val gs/fs/rw/simp/e/... = ...` shadow bindings.
 
 Do NOT:
 - Call hol_restart after file edits (state_at auto-detects changes)
@@ -534,8 +551,13 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
 
     For navigating an existing script file (replaying tactics from theorem
     start to a position), prefer hol_state_at — it handles file changes,
-    checkpoints, and tactic replay automatically. hol_send is the right tool
+    checkpoints, and tactic replay automatically. For goal counts/slices use
+    hol_goals; for DB searches use hol_search. hol_send is the right tool
     for everything else, including stepping through partial tactics ad hoc.
+
+    Rejected mechanically: `val gs/fs/rw/simp/e/b/g/it/concl/hyp/dest_thm/
+    tag/aconv/drop = ...` (shadows a HOL primitive for the rest of the
+    session — bind a prefixed name like `val my_gs = ...` instead).
 
     Args:
         command: SML command to execute
@@ -1277,6 +1299,21 @@ async def hol_state_at(
       - close: close_paren — marks end of a >- / by group
     The failing step is marked with "<-- FAILED" in the steps section.
 
+    Diagnostic lines to read, not ignore:
+      - "[auto-cheated deps: name (reason); ...]" — prefix theorems that
+        failed/timed out at load were replaced by cheat; the state shown
+        rests on their STATEMENTS only. Verify them before trusting an OK.
+      - "NOTE: target line N is INSIDE step k ..." — the position is inside
+        one opaque (lumped/parenthesized) step; the state shown is that
+        step's ENTRY, not the state at line N. Split the arm with
+        `>- suspend` to navigate inside.
+      - "TIMEOUT: step k (lines A-B) ..." — the failing step's source span;
+        split it with `>- suspend` or raise the per-tactic timeout.
+      - "Ancestor chain for suspension '...'" — a Resume's label was missing;
+        the chain names the first broken ancestor to fix.
+      - "unmatched smart quote at line L col C" — likely cause of a parse
+        error; fix with the printed command.
+
     Returns: Proof position, goals at that position, errors if any
     """
     cursor = await _get_cursor(session)
@@ -1611,6 +1648,15 @@ async def hol_check_proof(
 
     Returns: Whether proof completes, failure location, brief goal summary.
              With trace=True, also includes per-step timing and goal counts.
+
+    Status values: OK / FAILED / INCOMPLETE / CHEAT / NO TACTICS, plus
+    CANNOT CHECK for a Resume whose suspension goal is unavailable (comes
+    with an ancestor-chain diagnosis naming the first broken ancestor).
+    "Status: OK ... ⚠ depends on cheat" is followed by
+    "[auto-cheated deps: name (reason); ...]" naming WHICH prefix theorems
+    were auto-cheated at load and why — the OK rests on their statements
+    only. A timeout failure adds "TIMEOUT: step k spans lines A-B" naming
+    the span to split with `>- suspend`.
     """
     cursor = await _get_cursor(session)
 

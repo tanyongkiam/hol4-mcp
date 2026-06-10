@@ -17,15 +17,24 @@ for this clone. Each commit is one logical change; see `git log` /
 | b43c34c | Fix parens-around-LT distribution bug + warning for nested cases |
 | 67b6e2e | Append iteration-discipline warning to every non-OK `hol_check_proof` output (names `hol_state_at` and `hol_send` as the iteration tools) |
 | 44d8fc5 | Fix Resume goal-setup to pull terms directly from the suspension store (no `term_to_string` → `Parse.Term` round-trip); adds `set_resume_goalfrag_json` SML helper and two regression tests |
-| _new_  | Route file-replay (`verify_all_proofs`) Resume processing through canonical `markerLib.resume` so sub-suspends emitted inside Resume bodies register as resumption deltas. Adds `run_resume_canonical_json` SML helper and four regression tests (nested-Resume fixture). Symptom fixed: "No such label" when navigating into deeper Resume bodies after a file-level check |
+| d3d290b | Route file-replay (`verify_all_proofs`) Resume processing through canonical `markerLib.resume` so sub-suspends emitted inside Resume bodies register as resumption deltas. Adds `run_resume_canonical_json` SML helper and four regression tests (nested-Resume fixture). Symptom fixed: "No such label" when navigating into deeper Resume bodies after a file-level check |
+| abccf27 | Report cheat-dependency oracles for store=false checks (`⚠ depends on cheat` marker) |
+| 582f8cc | hol_state_at: report opaque multi-line step failures as a line range with cheat-bisection advice |
+| c3a7712 | Hooks H19/H20/H22; citations retargeted to the hol4-proving skill |
+| 379e054 | Diagnostics: auto-cheated deps NAMED with reasons (`[auto-cheated deps: ...]` in state_at/check_proof; `_failed_proofs` is now name→reason); chain-entry landing NOTE when the target is strictly inside a multi-line opaque step; timeout step attribution with source line span + shrink-the-lump advice; lost-suspension ancestor diagnosis (`diagnose_resume_failure`: chain listing, known-broken marking, replay-to-first-failure) |
+| cfe858e | Information tools: `hol_search` (DB.find/DB.match via new `db_search_json` SML helper); `hol_goals` (goal count/headlines/slices, replaces `top_goals()` dumps); smart-quote diagnosis on parse-flavoured error paths (`hol4_mcp/quote_check.py`, `check_quotes.py` is now a shim) |
+| 79b575f | Guard rails: RULE J server-side (`hol_start` refuses a second concurrent session unless `force=True`; `hol_file_init` refuses workdir switches — explicit `hol_stop` first); `hol_send` rejects `val gs/fs/rw/... = ...` shadow bindings |
+| 4ed8a2a | Resume loading: unknown-label Resume blocks (silent no-ops in HOL) are detected at load and recorded as SKIPPED in `_failed_proofs`; the planned `skip_broken_resumes` flag was found unnecessary (broken Resume bodies are already auto-cheated canonically and downstream content stays reachable — see tests/test_p4_resume_navigation.py); mid-arm parens navigation documented infeasible-within-timebox in PARENS_NAVIGATION_NOTES.md |
+| _docs_ | Server instructions + tool docstrings for the new tools, output lines, and guards (the commit adding this row) |
 
-## Untracked
+## Notes files
 
-- `LOCAL_CHANGES.md` — this file.
-- `check_quotes.py` — personal one-off Unicode-quote-fixing utility.
+- `LOCAL_CHANGES.md` — this file (tracked since 37e03a0).
 - `HOL_STATE_AT_RESUME_BUG_NOTES.md` — investigation notes for the Resume
-  goal-setup fix; kept for historical reference, see commit for the actual
-  change.
+  goal-setup fix; historical reference.
+- `PARENS_NAVIGATION_NOTES.md` — why mid-arm navigation inside
+  parens-grouped LT chains stays off (b43c34c trade-off), and the one
+  feasible single-goal path if it's ever needed.
 
 ## Upstreaming notes
 
