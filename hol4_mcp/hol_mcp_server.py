@@ -1067,50 +1067,97 @@ async def hol_state_at(
         lines.append(f"Theorem: {active_theorem}")
     
     if is_broken:
-        # Proof is broken before the requested position
+        # Proof is broken before the requested position.
         stuck_loc = tactic_to_loc(result.tactics_replayed)
         stuck_str = f"line {stuck_loc[0]} col {stuck_loc[1]}" if stuck_loc else ""
-        # Compute where the failed tactic starts (next step after last success)
-        fail_idx = result.tactics_replayed  # 0-indexed: the step that failed
-        fail_loc = tactic_to_loc(fail_idx)
+        # 0-indexed: the step the replay could not get past.
+        fail_idx = result.tactics_replayed
+        fail_loc = tactic_to_loc(fail_idx)          # START of that step
+        fail_end_loc = tactic_to_loc(fail_idx + 1)  # END of that step
         fail_str = f"line {fail_loc[0]} col {fail_loc[1]}" if fail_loc else ""
 
-        lines.append(
-            f"PROOF BROKEN at {fail_str}"
-        )
-
-        # Step plan context shows which tactic failed — raw Poly/ML error is redundant
-        lines.append(f"ERROR: Tactic failed at step {fail_idx}")
-
-        # Show failing tactic and optional step plan context
         step_plan = cursor._step_plan if cursor else []
-        if fail_idx < len(step_plan) and thm:
-            s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
-            lines.extend(format_step_context(
-                step_plan, fail_idx, s_lines,
-                context_before=context_before, context_after=context_after,
-            ))
+        fail_step = step_plan[fail_idx] if 0 <= fail_idx < len(step_plan) else None
 
-        lines.append("")
-        lines.append(
-            f"Replay cannot reach the requested position because an earlier "
-            f"tactic failed. The proof is sequential — later goals depend on "
-            f"earlier tactics succeeding."
+        # An opaque leaf step (`expand`/`expand_list`) that spans MULTIPLE source
+        # lines cannot be inspected inside: the real failure is somewhere within
+        # its line range, NOT at its first line. This is common when a `\\`-chain
+        # feeds a `>- (parenthesized arm)` / `>|` / other goal-positional
+        # combinator — the step decomposer (reexpand_group_atoms) keeps the whole
+        # construct as one opaque Group, swallowing the chain that precedes it.
+        # Report the RANGE honestly instead of pinning (and blaming) the start line.
+        opaque_multiline = (
+            fail_step is not None
+            and fail_step.kind in ("expand", "expand_list")
+            and fail_loc is not None and fail_end_loc is not None
+            and fail_end_loc[0] > fail_loc[0]
         )
-        if fail_loc:
+
+        if opaque_multiline:
+            range_str = f"lines {fail_loc[0]}-{fail_end_loc[0]}"
+            fail_str = range_str  # footer uses this too
+            lines.append(f"PROOF BROKEN somewhere in the opaque step at {range_str}")
             lines.append(
-                f"Fix the broken tactic, or inspect the failure point with:\n"
-                f"  hol_state_at(line={fail_loc[0]}, col={fail_loc[1]})"
+                f"ERROR: the failing step is a SINGLE opaque tactic spanning "
+                f"{range_str}; the replay cannot localize WHERE inside it the "
+                f"failure is — the line shown is the step's START, not the "
+                f"failure. (Cause: a `\\\\`-chain feeding a `>- (parenthesized "
+                f"arm)` / `>|` / similar goal-positional combinator is kept opaque "
+                f"by the step decomposer, swallowing the whole preceding chain.)"
             )
+            lines.append("")
+            lines.append(
+                f"To localize: put `\\\\ cheat` partway through {range_str} and move "
+                f"it until the proof passes — the failure is in the last region the "
+                f"cheat covered. Or split the `>-`/`>|` arm into a Suspend/Resume so "
+                f"each piece is navigable. The goal shown below is the state "
+                f"ENTERING this opaque step, not the failure point."
+            )
+            if thm:
+                s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
+                lines.extend(format_step_context(
+                    step_plan, fail_idx, s_lines,
+                    context_before=context_before, context_after=context_after,
+                ))
+        else:
+            lines.append(f"PROOF BROKEN at {fail_str}")
+
+            # Step plan context shows which tactic failed — raw Poly/ML error is redundant
+            lines.append(f"ERROR: Tactic failed at step {fail_idx}")
+
+            # Show failing tactic and optional step plan context
+            if fail_idx < len(step_plan) and thm:
+                s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
+                lines.extend(format_step_context(
+                    step_plan, fail_idx, s_lines,
+                    context_before=context_before, context_after=context_after,
+                ))
+
+            lines.append("")
+            lines.append(
+                f"Replay cannot reach the requested position because an earlier "
+                f"tactic failed. The proof is sequential — later goals depend on "
+                f"earlier tactics succeeding."
+            )
+            if fail_loc:
+                lines.append(
+                    f"Fix the broken tactic, or inspect the failure point with:\n"
+                    f"  hol_state_at(line={fail_loc[0]}, col={fail_loc[1]})"
+                )
 
         if result.goals:
             # Always show goals at failure point (useful for debugging)
             # show_partial controls whether ALL goals or just the first are shown
             display_goals = result.goals if all_goals else result.goals[:1]
             total = len(result.goals)
-            goal_label = f"Goals at failure point" if all_goals else f"Goal at failure point (1 of {total})"
+            if opaque_multiline:
+                goal_label = "Goals entering the opaque step" if all_goals else f"Goal entering the opaque step (1 of {total})"
+                goal_loc_str = ""
+            else:
+                goal_label = f"Goals at failure point" if all_goals else f"Goal at failure point (1 of {total})"
+                goal_loc_str = f" ({stuck_str})"
             lines.append("")
-            lines.append(f"=== {goal_label} ({stuck_str}) ===")
+            lines.append(f"=== {goal_label}{goal_loc_str} ===")
             for i, g in enumerate(display_goals):
                 if i > 0:
                     lines.append("")
@@ -1121,10 +1168,16 @@ async def hol_state_at(
                 lines.append(f"  {g['goal']}")
 
         # Error footer for truncation safety
-        error_footer = (
-            f"ERROR: PROOF BROKEN at {fail_str}. "
-            f"Fix the broken tactic before inspecting later positions."
-        )
+        if opaque_multiline:
+            error_footer = (
+                f"ERROR: PROOF BROKEN somewhere in the opaque step at {fail_str}. "
+                f"The line shown is the step's start, not the failure — bisect with `cheat`."
+            )
+        else:
+            error_footer = (
+                f"ERROR: PROOF BROKEN at {fail_str}. "
+                f"Fix the broken tactic before inspecting later positions."
+            )
     else:
         # Normal path: replay succeeded (or position is at/before the failure)
         loc = tactic_to_loc(result.tactic_idx)
