@@ -6,13 +6,13 @@ hol_state_at call whose tactic-replay time crosses the threshold.
 Stateless: each call judged on its own. Reads PostToolUse JSON on stdin,
 extracts `replay=(\\d+)ms` from the tool output. If replay >= 30s, emits a
 `hookSpecificOutput.additionalContext` reminder framed for the repeated-use
-anti-pattern (CLAUDE.md cost-discipline trigger). Never blocks.
+anti-pattern (hol4-proving skill cost-discipline trigger). Never blocks.
 
 Skips:
   - Cache hits (`replayed=0/N`) -- replay didn't actually run.
   - Missing `[Timing:` line -- error-path return, no replay happened.
 
-CLAUDE.md source: 'HOL4 - iteration loop' / Cost-discipline trigger.
+Rule source: hol4-proving skill 'HOL4 - iteration loop' / Cost-discipline trigger.
 """
 import json
 import re
@@ -28,7 +28,7 @@ REMINDER_TEMPLATE = """\
 hol4-hook H8: hol_state_at replay took {replay_s:.1f}s on {file}.
 
 A single slow replay can be legitimate (cold cache, first call on a large
-file, no incremental reuse available). The anti-pattern flagged by CLAUDE.md
+file, no incremental reuse available). The anti-pattern flagged by the hol4-proving skill
 cost-discipline trigger is REPEATEDLY running expensive hol_state_at calls
 on the same body -- that's "burning replay time".
 

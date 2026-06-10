@@ -13,7 +13,7 @@ Diff-aware on theorem NAMES (not labels): adding a sub-Resume like
 `Resume foo[A_subarm]:` to a file that already has `Resume foo[A]:` and
 `Finalise foo;` is silent -- no new theorem name introduced.
 
-CLAUDE.md source: '⛔ Post-discharge audit Gate 2' /
+Rule source: hol4-proving skill '⛔ Post-discharge audit Gate 2' /
 'HOL4 - suspend/Resume/Finalise'.
 """
 import json
@@ -83,13 +83,13 @@ def main():
         n = missing[0]
         msg = (
             f"hol4-hook H10: Resume {n} added; insert `Finalise {n};` "
-            f"after the last Resume block now (CLAUDE.md Gate 2)."
+            f"after the last Resume block now (hol4-proving skill Gate 2)."
         )
     else:
         names = ", ".join(missing)
         msg = (
             f"hol4-hook H10: Resume blocks for {names} added without Finalise. "
-            f"Insert `Finalise <thm>;` placeholders now (CLAUDE.md Gate 2)."
+            f"Insert `Finalise <thm>;` placeholders now (hol4-proving skill Gate 2)."
         )
     print(json.dumps({
         "hookSpecificOutput": {

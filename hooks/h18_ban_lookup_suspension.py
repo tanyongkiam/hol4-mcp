@@ -10,16 +10,18 @@ NONE (the suspension store is populated by file replay, not by a lone
 instead of reading them -- a RULE F / RULE D violation that has cost real
 session time.
 
-To READ a suspended goal, LOAD it into the proofManager and inspect normally:
+To READ a suspended goal, PREFER `hol_state_at`: navigate to a line inside the
+`Resume thm[Label]: ... QED` body (or to the dispatcher's QED first). That
+replays the FULL prefix in file order, so the goal shown is exactly the one
+Holmake sees -- an accurate, file-faithful state. Only if you must inspect
+interactively (e.g. a quick assumption read) fall back to loading it:
 
     markerLib.set_suspended_goal {suspension_name = "<thm>", label_name = "<label>"};
     val (asl,w) = proofManagerLib.top_goal();
     List.app (fn t => print (term_to_string t ^ "\\n")) asl;   (* the real assumptions *)
 
-The parent Theorem must have been processed up to its QED so the suspension is
-in the store (navigate `hol_state_at` to the dispatcher's QED first). In a
-script file, just write the body inside `Resume thm[Label]: ... QED` and
-navigate with `hol_state_at`.
+(The parent Theorem must be processed up to its QED so the suspension is in
+the store -- `hol_state_at` to the dispatcher's QED first.)
 
 Block fires on any occurrence of `lookup_suspension` in the hol_send command
 (or in Edit/Write/MultiEdit new content). Stateless.
@@ -39,16 +41,17 @@ suspension store is filled by file replay, not a lone hol_send). Using it
 tempts you to GUESS the suspended goal's assumptions instead of reading
 them -- a RULE F / RULE D violation.
 
-To READ a suspended goal, LOAD it and inspect normally:
+To READ a suspended goal, PREFER `hol_state_at`: navigate to a line inside
+the `Resume thm[Label]: ... QED` body (it replays the full prefix in file
+order, so the goal is exactly what Holmake sees). Only if you must inspect
+interactively fall back to loading it:
 
   markerLib.set_suspended_goal {suspension_name = "<thm>", label_name = "<label>"};
   val (asl,w) = proofManagerLib.top_goal();
   List.app (fn t => print (term_to_string t ^ "\\n")) asl;
 
-(The parent Theorem must be processed up to its QED first: navigate
-`hol_state_at` to the dispatcher's QED so the suspension is in the store.
-In a script, write the body inside `Resume thm[Label]: ... QED` and
-navigate with `hol_state_at`.)"""
+(The parent Theorem must be processed up to its QED first: `hol_state_at`
+to the dispatcher's QED so the suspension is in the store.)"""
 
 
 def extract_texts(payload):

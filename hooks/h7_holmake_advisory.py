@@ -7,7 +7,7 @@ iteration-discipline reminder; the wording is calibrated so a legitimate
 end-of-file holmake (after the per-theorem verification ladder passed) can
 disregard.
 
-CLAUDE.md source: '⛔ RULE A' / 'HOL4 - iteration loop'.
+Rule source: hol4-proving skill '⛔ RULE A' / 'HOL4 - iteration loop'.
 """
 import json
 import sys
@@ -15,7 +15,7 @@ import sys
 REMINDER_TEMPLATE = """\
 hol4-hook H7: Holmake ran on {target}.
 
-Per CLAUDE.md RULE A: holmake is the FILE-BUILD GATE only -- not for
+Per hol4-proving skill RULE A: holmake is the FILE-BUILD GATE only -- not for
 iteration, not for "see if it builds", not for proof discovery.
 
 If you reached for holmake to check progress mid-proof, STOP. Use the

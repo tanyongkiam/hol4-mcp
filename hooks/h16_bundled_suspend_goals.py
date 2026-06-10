@@ -7,7 +7,7 @@ Trigger: tool output contains the U+214B + U+1D63 sequence (printed as
 `⅋ᵣ`) OR the bare constant name `resconj`. Either symptom means the
 proof state at a Resume body holds a `resconj`-merged goal -- the canonical
 indicator that the parent dispatcher used ONE suspend label across MULTIPLE
-arms (or bundled goals via `>>`), violating the CLAUDE.md rule
+arms (or bundled goals via `>>`), violating the hol4-proving skill rule
 "one label = one goal".
 
 Stateless, advisory only. Never blocks. Matches:
@@ -15,7 +15,7 @@ Stateless, advisory only. Never blocks. Matches:
   - mcp__hol4__hol_send
   - mcp__hol4__hol_check_proof
 
-CLAUDE.md source: 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal'.
+Rule source: hol4-proving skill 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal'.
 """
 import json
 import re
@@ -40,7 +40,7 @@ Cause is one of:
   - A `>~ [pat] >- suspend "Label"` pattern matched and fired more than
     once because subsequent dispatcher arms have the same pattern shape.
 
-Fix (CLAUDE.md 'HOL4 - suspend/Resume/Finalise'):
+Fix (hol4-proving skill 'HOL4 - suspend/Resume/Finalise'):
   - Split the suspended arms by giving each its OWN label
     (`suspend "Label_NONE"`, `suspend "Label_Break"`, ...), and write a
     Resume body per label. The bundled `resconj` goal then decomposes

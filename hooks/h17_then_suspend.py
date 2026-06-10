@@ -22,7 +22,7 @@ Correct forms:
 Block fires on any `(>>|\\\\|THEN)\\s+suspend\\s*"..."` in the
 Edit/Write/MultiEdit new content. Stateless, no transcript read.
 
-CLAUDE.md source: 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal'.
+Rule source: hol4-proving skill 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal'.
 """
 import json
 import re
@@ -47,7 +47,7 @@ distributes the suspend across ALL remaining goals under ONE label,
 bundling them via `resconj` into an unprovable merged goal at the
 Resume body.
 
-CLAUDE.md 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal':
+hol4-proving skill 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal':
 ALWAYS THEN1 (i.e. `>-`) immediately before every `suspend`, even
 inside parentheses. THEN in ANY of its surface forms -- `>>`, `\\\\`
 (CakeML synonym), or the literal word `THEN` -- followed by `suspend`

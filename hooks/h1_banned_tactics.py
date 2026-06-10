@@ -14,7 +14,7 @@ before scan to avoid false positives.
 Exit 2 + stderr -> tool call is blocked; the model sees the explanation and
 must restructure.
 
-CLAUDE.md source: ~/.claude/CLAUDE.md 'HOL4 - banned tactics' section,
+Rule source: hol4-proving skill 'HOL4 - banned tactics' section,
 Post-discharge Gate 5.
 """
 import json
@@ -79,7 +79,7 @@ def main():
     for name, count in introduced.items():
         print(f"  - {name} (+{count} new occurrence(s))", file=sys.stderr)
     print("", file=sys.stderr)
-    print("CLAUDE.md 'HOL4 - banned tactics':", file=sys.stderr)
+    print("hol4-proving skill 'HOL4 - banned tactics':", file=sys.stderr)
     print("  TRY/ORELSE/FIRST hide failure -> restructure as `>~ [pat] >- suspend \"X\"`.", file=sys.stderr)
     print("  >| (THENL) is position-keyed -> split per subgoal via suspend/Resume.", file=sys.stderr)
     print("", file=sys.stderr)

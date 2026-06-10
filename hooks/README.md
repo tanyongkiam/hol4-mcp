@@ -12,7 +12,7 @@ just references them.
 
 ## Why hooks
 
-CLAUDE.md rules are advisory — the model can violate them and rely on the
+CLAUDE.md / skill rules are advisory — the model can violate them and rely on the
 audit gates to catch it later. Hooks are **runtime-enforced**: a PreToolUse
 hook returning exit 2 blocks the tool call entirely, with the stderr message
 surfaced to the model as a tool error. This forecloses entire failure modes
@@ -40,11 +40,17 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H13 | ⏭     | PreToolUse            | `mcp__hol4__holmake`    | ~~Gate 5 cross-check: scan git-modified theorems for banned tactics~~ — skipped (subsumed by H1 at write-time; safety-net value low) |
 | H14 | ✅     | PreToolUse            | `Bash`                  | Block destructive git ops without literal `git ok` in the latest user message (transcript-aware; fail-open if transcript unreadable) |
 | H15 | ⏭     | PreToolUse            | `Write`                 | ~~On `~/.claude/plans/` writes, advise if "Operating principles" section is missing~~ — skipped (high FP on non-proof plans; marker regex fragile; plan template is the better forcing function) |
-| H16 | ✅     | PostToolUse           | `mcp__hol4__hol_state_at\|mcp__hol4__hol_send\|mcp__hol4__hol_check_proof` | Inject advisory when goal display contains `⅋ᵣ` / `resconj` — the canonical indicator that multiple subgoals were bundled into one Resume body via a shared `suspend` label (CLAUDE.md "one label = one goal" violation) |
+| H16 | ✅     | PostToolUse           | `mcp__hol4__hol_state_at\|mcp__hol4__hol_send\|mcp__hol4__hol_check_proof` | Inject advisory when goal display contains `⅋ᵣ` / `resconj` — the canonical indicator that multiple subgoals were bundled into one Resume body via a shared `suspend` label (hol4-proving skill "one label = one goal" violation) |
 | H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored THEN-form `suspend` (`>>` / `\\` / `THEN` then `suspend "..."`) in `*Script.sml` edits — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects) |
 | H18 | ✅     | PreToolUse            | `mcp__hol4__hol_send\|Edit\|Write\|MultiEdit` | Block the `markerLib` suspension-lookup query (the `(string*thm) option` one — returns NONE in a bare session, tempts guessing the suspended goal); point to `set_suspended_goal` to actually load it |
+| H19 | ✅     | PreToolUse            | `mcp__hol4__hol_restart` | Block `hol_restart` without literal `restart ok` in the latest user message (RULE J / "effectively never"; transcript-aware, fail-open, same consent design as H14) |
+| H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥12 THEN-combinators, or ≥15 non-blank lines with ≥4 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
+| H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work (the HOL4 ruleset moved out of global CLAUDE.md into the skill, June 2026) |
 
-Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18. (H2, H3, H5, H9, H11, H12, H13, H15 skipped.)
+Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
+
+The live wiring is `~/.claude/settings.json` (source of truth); the sample
+JSON at the bottom of this file may lag it.
 
 ## H1 — banned-tactics scanner
 
@@ -58,7 +64,7 @@ etc.) are exempt — they legitimately define `TRY` / `ORELSE` as identifiers.
 
 ### What counts as banned
 
-From `~/.claude/CLAUDE.md` (`HOL4 — banned tactics` section):
+From the `hol4-proving` skill (`HOL4 — banned tactics` section; formerly in `~/.claude/CLAUDE.md`):
 
 - `TRY` — hides failure.
 - `ORELSE` — hides failure.
@@ -142,14 +148,14 @@ Hit → inject reminder via `hookSpecificOutput.additionalContext`. Miss → sil
 exit 0.
 
 `Status: CHEAT (not verified)` is intentionally **not** a trigger — that's a
-legitimate cheat-probing return per CLAUDE.md cheat-probing pattern.
+legitimate cheat-probing return per the cheat-probing pattern (feedback_hol4_mcp_proving).
 
 ### What the reminder says
 
 ```
 hol4-hook H6: hol_check_proof returned FAILED / TIMEOUT.
 
-Per CLAUDE.md RULE C: do NOT re-run hol_check_proof to diagnose.
+Per hol4-proving skill RULE C: do NOT re-run hol_check_proof to diagnose.
   - Read the failing goal with `hol_state_at` (or `hol_send` / `expandf` if
     the failure sits inside a `THEN1 (...)` / `>- (...)` chain).
   - If this is the second failed attempt on the same theorem, sub-suspend
@@ -179,7 +185,7 @@ is a RULE C violation: ...
 **Matcher**: `mcp__hol4__hol_state_at`
 **Effect**: never blocks. On a `hol_state_at` call whose `replay` time crossed
 30s, injects a system reminder framed for the *repeated-use* anti-pattern from
-CLAUDE.md cost-discipline trigger.
+the hol4-proving skill cost-discipline trigger.
 
 ### What triggers it
 
@@ -200,7 +206,7 @@ Skips (silent exit 0):
 hol4-hook H8: hol_state_at replay took <N.N>s on <file>.
 
 A single slow replay can be legitimate (cold cache, first call on a large
-file, no incremental reuse available). The anti-pattern flagged by CLAUDE.md
+file, no incremental reuse available). The anti-pattern flagged by the hol4-proving skill
 cost-discipline trigger is REPEATEDLY running expensive hol_state_at calls
 on the same body -- that's "burning replay time".
 
@@ -217,7 +223,7 @@ a per-call accusation.
 
 ### Threshold rationale
 
-30s matches the CLAUDE.md cost-discipline trigger text verbatim. `replay` is
+30s matches the skill's cost-discipline trigger text verbatim. `replay` is
 used in preference to `total` because hol_send / sub-suspend address replay
 overhead specifically; if `total` were dominated by file load (`replay` low),
 neither tactic would help and the nudge would be misleading.
@@ -256,46 +262,6 @@ state machinery; the advisory-only form was chosen as adequate.
 **Event**: `PreToolUse`
 **Matcher**: `Edit|Write|MultiEdit`
 **Effect**: never blocks. When an Edit/Write/MultiEdit on a `Script.sml`
-file introduces a new `Resume <thm>[...]:` block whose theorem doesn't yet
-have a `Finalise <thm>;` line in the post-edit content, injects a one-line
-`additionalContext` reminder.
-
-### Diff-aware detection
-
-The hook computes pre-edit and post-edit content (reads the file from disk,
-applies the edit virtually) and only fires when a Resume theorem name is
-**newly added** in this edit (`post - pre`). Subsequent edits to a file with
-an existing imbalanced theorem do not re-fire — the reminder is timed to the
-moment of introduction.
-
-### Reminder content
-
-Single missing theorem:
-```
-hol4-hook H10: Resume <thm> added; insert `Finalise <thm>;` after the last
-Resume block now (CLAUDE.md Gate 2).
-```
-
-Multiple:
-```
-hol4-hook H10: Resume blocks for <thm1>, <thm2> added without Finalise.
-Insert `Finalise <thm>;` placeholders now (CLAUDE.md Gate 2).
-```
-
-### Why diff-aware
-
-A pre-existing Resume-without-Finalise imbalance in a file may be deliberate
-work-in-progress that I'm not responsible for at this turn. Firing on every
-edit to such a file would be spammy. Diff-aware scope means the reminder
-appears at the precise moment of authoring — which is exactly when the rule
-says to insert the Finalise placeholder.
-
-## H10 — Resume-needs-Finalise reminder
-
-**File**: `h10_resume_needs_finalise.py`
-**Event**: `PreToolUse`
-**Matcher**: `Edit|Write|MultiEdit`
-**Effect**: never blocks. When an Edit/Write/MultiEdit on a `Script.sml`
 file introduces a new Resume theorem whose `Finalise <thm>;` line is not in
 the post-edit content, injects a one-line `additionalContext` reminder.
 
@@ -317,13 +283,13 @@ applies the edit virtually) and fires only when a Resume theorem name is
 Single missing theorem:
 ```
 hol4-hook H10: Resume <thm> added; insert `Finalise <thm>;` after the last
-Resume block now (CLAUDE.md Gate 2).
+Resume block now (hol4-proving skill Gate 2).
 ```
 
 Multiple:
 ```
 hol4-hook H10: Resume blocks for <thm1>, <thm2> added without Finalise.
-Insert `Finalise <thm>;` placeholders now (CLAUDE.md Gate 2).
+Insert `Finalise <thm>;` placeholders now (hol4-proving skill Gate 2).
 ```
 
 ## H14 — destructive git ops require `git ok` consent
@@ -671,6 +637,7 @@ hook input. Cleanup: weekly `find ~/.claude/hook-state -mtime +7 -delete`.
 
 ## See also
 
-- `~/.claude/CLAUDE.md` — global behavioural rules (the rules these hooks enforce).
+- `~/.claude/skills/hol4-proving/SKILL.md` — the HOL4 proof-interaction rules these hooks enforce.
+- `~/.claude/CLAUDE.md` — generic behavioural rules (editing/git — H14's source — memory-writing, working principles).
 - `~/research/cakes/CLAUDE.md` — CakeML workspace orientation.
 - `~/hol4-mcp/LOCAL_CHANGES.md` — local divergences of the running MCP server.

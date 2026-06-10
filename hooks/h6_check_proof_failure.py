@@ -8,9 +8,9 @@ signature, emits a `hookSpecificOutput.additionalContext` system reminder
 visible to the model on the next turn. Never blocks; exit 0 always.
 
 CHEAT (not verified) output is intentionally NOT a trigger -- that's a
-legitimate cheat probe per CLAUDE.md cheat-probing pattern.
+legitimate cheat probe per the cheat-probing pattern (feedback_hol4_mcp_proving).
 
-CLAUDE.md source: RULE C (~/.claude/CLAUDE.md 'HOL4 - iteration loop').
+Rule source: hol4-proving skill RULE C ('HOL4 - iteration loop').
 """
 import json
 import re
@@ -29,7 +29,7 @@ FAILURE_PATTERNS = [
 REMINDER = """\
 hol4-hook H6: hol_check_proof returned FAILED / TIMEOUT.
 
-Per CLAUDE.md RULE C: do NOT re-run hol_check_proof to diagnose.
+Per hol4-proving skill RULE C: do NOT re-run hol_check_proof to diagnose.
   - Read the failing goal with `hol_state_at` (or `hol_send` / `expandf` if
     the failure sits inside a `THEN1 (...)` / `>- (...)` chain).
   - If this is the second failed attempt on the same theorem, sub-suspend
