@@ -22,12 +22,13 @@ from typing import Optional
 from . import _mcp_cancel_patch  # noqa: F401 — patches mcp SDK on import
 from fastmcp import FastMCP
 
-from .hol_session import HOLSession, HOLDIR
-from .hol_cursor import FileProofCursor
+from .hol_session import HOLSession, HOLDIR, escape_sml_string
+from .hol_cursor import FileProofCursor, _try_find_json_line
 from .hol_file_parser import (
     HOLParseError, step_line_numbers, format_steps, format_step_context,
     step_text_start,
 )
+from .quote_check import quote_diagnosis_lines
 
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -57,6 +58,21 @@ def _auto_cheated_deps_lines(cursor) -> list[str]:
         return []
     deps = "; ".join(f"{name} ({reason})" for name, reason in failed.items())
     return ["", f"[auto-cheated deps: {deps}]"]
+
+
+_PARSE_ERROR_RE = re.compile(r"parse|unknown character|lex", re.I)
+
+
+def _quote_diagnosis_if_parse_error(file_path, error_text: str) -> list[str]:
+    """On parse-flavoured errors, check the file for unmatched smart quotes.
+
+    Unmatched U+2018/U+2019 (e.g. a pasted right-quote where an ASCII
+    apostrophe belongs) are a recurring cause of opaque lexer errors.
+    """
+    if not error_text or not _PARSE_ERROR_RE.search(error_text):
+        return []
+    diag = quote_diagnosis_lines(file_path)
+    return [""] + diag if diag else []
 
 
 def _truncate_output(output: str, max_output: int, footer: str = "") -> str:
@@ -520,6 +536,184 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
 
 
 @mcp.tool()
+async def hol_search(
+    query: str = None,
+    pattern: str = None,
+    theory: str = None,
+    limit: int = 10,
+    max_statement: int = 200,
+    session: str = "default",
+) -> str:
+    """Search the theorem database by name and/or term pattern.
+
+    First-class replacement for hol_send DB.find/DB.match probes: results
+    come back as a compact `theory.name` + truncated-statement table.
+
+    Args:
+        query: Case-insensitive substring of the theorem name (DB.find).
+        pattern: Term pattern, e.g. "MEM _ (MAP _ _)" (DB.match). When both
+                 query and pattern are given, results must match both.
+        theory: Restrict results to one theory (e.g. "list").
+        limit: Max results shown (default 10; total count always reported).
+        max_statement: Truncate each statement to this many chars (default 200).
+        session: Session name (default: "default")
+
+    Returns: Matching theorems with statements, or an error.
+    """
+    if not query and not pattern:
+        return ("ERROR: provide query= (name substring) and/or "
+                "pattern= (term pattern).")
+    s = await _get_session(session)
+    if not s:
+        return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
+    if not s.is_running:
+        del _sessions[session]
+        return f"ERROR: Session '{session}' died. Use hol_start() to create a new session."
+
+    cmd = (
+        f'db_search_json "{escape_sml_string(query or "")}" '
+        f'"{escape_sml_string(pattern or "")}" '
+        f'"{escape_sml_string(theory or "")}" {int(limit)};'
+    )
+    output = await s.send(cmd, timeout=30)
+    data = _try_find_json_line(output)
+    if 'err' in data:
+        return f"ERROR: {data['err']}"
+    if 'ok' not in data:
+        return f"ERROR: unexpected db_search_json output: {output[:300]}"
+
+    total = data['ok'].get('total', 0)
+    results = data['ok'].get('results', [])
+    if total == 0:
+        return "No matches."
+    header = f"{total} match(es)"
+    if total > len(results):
+        header += f", showing first {len(results)} (raise limit= for more)"
+    lines = [header + ":"]
+    for r in results:
+        stmt = " ".join(str(r.get('statement', '')).split())
+        if len(stmt) > max_statement:
+            stmt = stmt[:max_statement] + " …"
+        lines.append(f"{r.get('theory')}.{r.get('name')}")
+        lines.append(f"  {stmt}")
+    _schedule_gc(session)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hol_goals(
+    n: int = None,
+    asm: int = None,
+    max_term: int = 300,
+    file: str = None,
+    line: int = None,
+    col: int = 1,
+    workdir: str = None,
+    session: str = "default",
+) -> str:
+    """Goal count and structured goal slices, without a full top_goals() dump.
+
+    Default: goal count plus a one-line headline per goal (truncated
+    conclusion, assumption count). Drill down with n= and asm=.
+
+    Args:
+        n: Show goal n (1-based, 1 = top goal) with numbered assumptions.
+        asm: With n, show assumption asm (1-based) of that goal in full.
+        max_term: Truncate each shown term to this many chars (default 300).
+        file: Script file — navigates like hol_state_at before reading goals
+              (auto-inits the cursor when needed).
+        line: With file (or an active cursor), position to navigate to first.
+              Without line, reads the LIVE session goal state (works for
+              hol_send-driven goals too).
+        col: 1-indexed column for line (default 1).
+        workdir: Working directory for HOL (used with file).
+        session: Session name (default: "default")
+
+    Returns: Goal count + headlines, one goal, or one assumption.
+    """
+    cursor = await _get_cursor(session)
+
+    if file:
+        file_path = Path(file).resolve()
+        if not cursor or Path(cursor.file).resolve() != file_path:
+            init_result = await _init_file_cursor(
+                file=file, session=session, workdir=workdir
+            )
+            if init_result.startswith("ERROR"):
+                return init_result
+            cursor = await _get_cursor(session)
+
+    if line is not None:
+        if not cursor:
+            return (f"ERROR: No cursor for session '{session}'. "
+                    f"Pass file= to auto-init.")
+        result = await cursor.state_at(line, col)
+        if result.error and not result.goals:
+            return f"ERROR: {result.error}"
+        goals = result.goals
+        origin = f"at line {line}"
+    else:
+        s = await _get_session(session)
+        if not s:
+            return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
+        if not s.is_running:
+            del _sessions[session]
+            return f"ERROR: Session '{session}' died. Use hol_start() to create a new session."
+        output = await s.send('goals_json();', timeout=10)
+        data = _try_find_json_line(output)
+        if 'err' in data:
+            return f"No live proof: {data['err']}"
+        if 'ok' not in data:
+            return f"ERROR: unexpected goals_json output: {output[:300]}"
+        goals = [
+            g if isinstance(g, dict) and 'goal' in g
+            else {"asms": [], "goal": str(g)}
+            for g in data['ok']
+        ]
+        origin = "live session"
+
+    _schedule_gc(session)
+
+    def trunc(s: str, limit: int, flatten: bool = True) -> str:
+        if flatten:
+            s = " ".join(s.split())
+        if len(s) > limit:
+            return s[:limit] + f" … [{len(s)} chars total]"
+        return s
+
+    if not goals:
+        return f"0 goals ({origin}) — proof complete."
+
+    if n is None:
+        lines = [f"{len(goals)} goal(s) ({origin}, goal 1 = top):"]
+        for i, g in enumerate(goals, start=1):
+            asms = g.get('asms', [])
+            lines.append(f"{i}: [{len(asms)} asm] {trunc(g['goal'], max_term)}")
+        if any(g.get('asms') for g in goals):
+            lines.append("Use n=k for goal k's assumptions; n=k, asm=j for one in full.")
+        return "\n".join(lines)
+
+    if n < 1 or n > len(goals):
+        return f"ERROR: n={n} out of range (1..{len(goals)})"
+    g = goals[n - 1]
+    asms = g.get('asms', [])
+
+    if asm is not None:
+        if asm < 1 or asm > len(asms):
+            return (f"ERROR: asm={asm} out of range "
+                    f"(goal {n} has {len(asms)} assumptions)")
+        return f"Goal {n} assumption {asm}:\n{asms[asm - 1]}"
+
+    lines = [f"Goal {n} of {len(goals)} ({len(asms)} asm):"]
+    for j, a in enumerate(asms, start=1):
+        lines.append(f"  asm {j}: {trunc(a, max_term)}")
+    if asms:
+        lines.append("  " + "-" * 40)
+    lines.append(f"  {trunc(g['goal'], max_term, flatten=False)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def hol_interrupt(session: str = "default") -> str:
     """Send SIGINT to abort runaway tactic.
 
@@ -944,7 +1138,11 @@ async def _init_file_cursor(
     _sessions[session].cursor = cursor
 
     if result.get("error"):
-        return f"ERROR: {result['error']}"
+        err_lines = [f"ERROR: {result['error']}"]
+        err_lines.extend(
+            _quote_diagnosis_if_parse_error(file_path, result['error'])
+        )
+        return "\n".join(err_lines)
 
     # Build status output
     lines = [
@@ -1070,6 +1268,7 @@ async def hol_state_at(
     # Structural error (not in theorem, etc.) - no goals to show
     if result.error and result.tactics_total == 0:
         lines.append(f"ERROR: {result.error}")
+        lines.extend(_quote_diagnosis_if_parse_error(cursor.file, result.error))
         return "\n".join(lines)
 
     # Detect broken proof: replay couldn't reach the requested position
@@ -1268,6 +1467,11 @@ async def hol_state_at(
         lines.append("[Inside by/>- subproof. Consider extracting into a suspend/Resume block "
                      "for independent verification and easier editing.]")
 
+    # Smart-quote diagnosis on parse/lex-flavoured errors (the raw replay
+    # error may carry lexer text the formatted output above does not show).
+    if result.error:
+        lines.extend(_quote_diagnosis_if_parse_error(cursor.file, result.error))
+
     # Lost-suspension diagnosis: a Resume whose label cannot be found usually
     # means an ancestor (dispatcher or earlier Resume) broke during loading.
     if result.error and active_theorem and (
@@ -1373,7 +1577,11 @@ async def hol_check_proof(
     # Enter theorem and get step plan
     enter_result = await cursor.enter_theorem(theorem)
     if "error" in enter_result:
-        return f"ERROR: {enter_result['error']}"
+        err_lines = [f"ERROR: {enter_result['error']}"]
+        err_lines.extend(
+            _quote_diagnosis_if_parse_error(cursor.file, enter_result['error'])
+        )
+        return "\n".join(err_lines)
 
     thm = cursor._get_theorem(theorem)
     if not thm:

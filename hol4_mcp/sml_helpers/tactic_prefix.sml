@@ -79,6 +79,45 @@ fun goals_json () =
   in print (json_ok (goals_to_json_array goals) ^ "\n") end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
+(* db_search_json: first-class DB search for the hol_search MCP tool.
+   query   - substring match on theorem name (DB.find), "" to skip
+   pattern - term pattern for DB.match (Parse.Term), "" to skip
+   thy     - restrict results to one theory, "" for all
+   limit   - max results in output (total match count still reported) *)
+fun db_search_json query pattern thy limit =
+  let
+    fun key ((t, n), _) = t ^ "$" ^ n
+    val found =
+      case (query, pattern) of
+        ("", "") => raise Fail "db_search_json: need a query or a pattern"
+      | (q, "") => DB.find q
+      | ("", p) => DB.match (if thy = "" then [] else [thy])
+                            (Parse.Term [QUOTE p])
+      | (q, p) =>
+          let
+            val keys = HOLset.addList (HOLset.empty String.compare,
+                                       map key (DB.find q))
+            val bypat = DB.match (if thy = "" then [] else [thy])
+                                 (Parse.Term [QUOTE p])
+          in
+            List.filter (fn d => HOLset.member (keys, key d)) bypat
+          end
+    val found = if thy = "" then found
+                else List.filter (fn ((t, _), _) => t = thy) found
+    val total = length found
+    val shown = if total > limit andalso limit >= 0
+                then List.take (found, limit) else found
+    fun entry ((t, n), (th, _, _)) =
+      "{\"theory\":" ^ json_string t ^
+      ",\"name\":" ^ json_string n ^
+      ",\"statement\":" ^ json_string (term_to_string (concl th)) ^ "}"
+  in
+    print (json_ok ("{\"total\":" ^ json_int total ^
+                    ",\"results\":[" ^
+                    String.concatWith "," (map entry shown) ^ "]}") ^ "\n")
+  end
+  handle e => print (json_err (exnMessage e) ^ "\n");
+
 (* =============================================================================
  * GOALFRAG step plan: Map linearize fragments 1:1 to ef() commands
  *
