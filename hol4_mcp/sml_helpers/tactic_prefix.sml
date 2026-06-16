@@ -205,6 +205,11 @@ fun frag_type (TacticParse.FAtom (TacticParse.LSelectGoal _)) = "select"
   | frag_type (TacticParse.FFClose _) = "close"
   | frag_type _ = ""
 
+(* Unwrap Group/RepairGroup wrappers to reach the underlying atom kind. *)
+fun unwrapAtom (TacticParse.Group (_, _, e)) = unwrapAtom e
+  | unwrapAtom (TacticParse.RepairGroup (_, _, e, _)) = unwrapAtom e
+  | unwrapAtom e = e
+
 (* Extract raw text from a fragment (no ef() wrapping).
    FAtom -> tactic text from proofBody substring.
    Subgoal atoms get "sg " prefix so `Q` becomes `sg `Q`` — a valid tactic.
@@ -217,12 +222,19 @@ fun frag_text proofBody (TacticParse.FAtom a) =
                      | (NONE, SOME (start, endPos)) =>
                          String.substring(proofBody, start, endPos - start)
                      | (NONE, NONE) => "")
-      in case a of
+      in case unwrapAtom a of
            TacticParse.Subgoal _ =>
              (* Subgoal from `by`: if text is a term quotation `...`, prefix with sg
                 so it becomes a valid tactic. If already a tactic name, keep as-is. *)
              if String.size raw > 0 andalso String.sub(raw, 0) = #"`"
              then "sg " ^ raw else raw
+         | TacticParse.Rename _ =>
+             (* Select pattern of `>>~- ([pat], tac)` (LSelectThen's first arm).
+                Between open_select_lt/next_select_lt it is applied as the
+                SELECT tactic, so it must be realized as RENAME_TAC, not handed
+                to goalFrag.expand as a bare term-quotation list (a type error:
+                expand : tactic -> ...). Mirrors TacticParse's Rename -> RENAME_TAC. *)
+             "Q.RENAME_TAC " ^ raw
          | _ => raw
       end
   | frag_text _ (TacticParse.FFOpen opn) = openFragName opn

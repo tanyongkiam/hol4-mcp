@@ -46,18 +46,116 @@ def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
     return line, col
 
 
-def _auto_cheated_deps_lines(cursor) -> list[str]:
-    """Lines naming dependencies auto-cheated during loading, with reasons.
+def _auto_cheated_deps_lines(cursor, target_name: str | None = None) -> list[str]:
+    """Lines naming DEPENDENCIES auto-cheated during loading, with reasons.
 
     Auto-cheated deps silently weaken a per-theorem verification claim (the
     proof is checked against the dep's STATEMENT, not its proof), so outputs
     name each one and why it was cheated.
+
+    ``target_name`` (the theorem currently being navigated/checked) is excluded:
+    a target that was itself auto-cheated is NOT a dependency, and listing it
+    here next to a green verdict is self-contradictory. The target-self-cheat
+    case is surfaced separately by _target_self_cheated_lines.
     """
     failed = getattr(cursor, "_failed_proofs", None)
     if not failed:
         return []
-    deps = "; ".join(f"{name} ({reason})" for name, reason in failed.items())
-    return ["", f"[auto-cheated deps: {deps}]"]
+    deps = {name: reason for name, reason in failed.items() if name != target_name}
+    if not deps:
+        return []
+    rendered = "; ".join(f"{name} ({reason})" for name, reason in deps.items())
+    return ["", f"[auto-cheated deps: {rendered}]"]
+
+
+def _target_self_cheated_reason(cursor, target_name: str | None) -> str | None:
+    """If the navigation/check TARGET was itself auto-cheated during load,
+    return its reason; else None.
+
+    When this fires, any 'No goals (proof complete)' / 'Status: OK' is a FALSE
+    GREEN — the target's own tactics never replayed (it was replaced by `cheat`,
+    because it timed out past the budget or genuinely errored). Callers must
+    refuse the green verdict and report this instead.
+    """
+    if not target_name:
+        return None
+    failed = getattr(cursor, "_failed_proofs", None)
+    if not failed:
+        return None
+    return failed.get(target_name)
+
+
+def _target_self_cheated_lines(reason: str) -> list[str]:
+    """Explicit 'this was NOT validated' verdict for a self-cheated target.
+
+    Names the cause (timeout vs error) and points ONLY at in-workflow remedies
+    (sub-suspend to shrink replay scope) — never at holmake, which is the
+    end-of-file gate, not a per-theorem validation step.
+    """
+    is_timeout = reason.lstrip().upper().startswith("TIMEOUT") or "timeout" in reason.lower()
+    if is_timeout:
+        cause = (f"its own proof exceeded the per-theorem replay budget "
+                 f"({reason}) and was replaced by `cheat` to load the rest of "
+                 f"the file")
+        remedy = ("Shrink the replay scope: split a slow arm with `>- suspend "
+                  "\"Label\"` + a `Resume` body so only that body replays, then "
+                  "re-check the (smaller) target.")
+    else:
+        cause = (f"its own proof failed during load ({reason}) and was replaced "
+                 f"by `cheat`")
+        remedy = ("Fix the failing tactic, or isolate the failing arm with "
+                  "`>- suspend \"Label\"` + a `Resume` body and re-check that body.")
+    return [
+        "",
+        "⚠ NOT VALIDATED — the result above is NOT a verification of this "
+        "theorem.",
+        f"  This theorem was auto-cheated: {cause}.",
+        f"  The goals shown were computed against its STATEMENT, not its proof.",
+        f"  {remedy}",
+    ]
+
+
+def _is_raised_exception(err: str | None) -> bool:
+    """True iff a replay error string is a RAISED EXCEPTION (HOL_ERR /
+    Exception- / 'raised exception') rather than a timeout or a clean
+    unsolved-goals failure.
+
+    A raised exception — classically a `qpat_x_assum`/`qmatch_*`/`rename1`
+    whose pattern no longer matches — fires from wherever that tactic sits,
+    which inside a lumped/opaque step is NOT necessarily the step the replay
+    stopped at. So the precise step pin must be softened in this case.
+    """
+    if not err:
+        return False
+    low = err.lower()
+    if "timed out" in low or err.lstrip().upper().startswith("TIMEOUT"):
+        return False
+    return ("HOL_ERR" in err or "Exception-" in err or "raised exception" in low)
+
+
+def _exception_advisory_lines(err: str | None) -> list[str]:
+    """Advisory shown when replay stopped on a raised exception: name the
+    exception and warn that the pinned step is only where replay STOPPED, the
+    true fault may be an earlier match-sensitive tactic."""
+    out = [
+        "",
+        "NOTE: replay stopped on a RAISED EXCEPTION, not an unsolved goal.",
+        "  The step/line shown is where replay halted — with a raised exception "
+        "(commonly a qpat_x_assum / qmatch_* / rename1 whose pattern no longer "
+        "matches) the TRUE fault is often an EARLIER match-sensitive tactic in "
+        "this region. Read those first; the pin is an upper bound, not the cause.",
+    ]
+    if err:
+        compact = err.strip().splitlines()[0][:200] if err.strip() else ""
+        if compact:
+            out.append(f"  Exception: {compact}")
+    return out
+
+
+_RAISED_FAIL_MARKER = (
+    "  <-- replay stopped here (raised exception; true fault may be earlier)"
+)
+_RAISED_FAIL_HEADER = "=== Where replay stopped (raised exception) ==="
 
 
 _PARSE_ERROR_RE = re.compile(r"parse|unknown character|lex", re.I)
@@ -1406,6 +1504,13 @@ async def hol_state_at(
             and fail_end_loc[0] > fail_loc[0]
         )
 
+        # A raised exception (HOL_ERR from a no-longer-matching qpat/qmatch/
+        # rename) can fire from anywhere inside a lumped/opaque step, so the
+        # pinned step is only where replay STOPPED, not a confident fault site.
+        is_exc = _is_raised_exception(result.error)
+        sc_marker = _RAISED_FAIL_MARKER if is_exc else "  <-- FAILED"
+        sc_header = _RAISED_FAIL_HEADER if is_exc else "=== Failing tactic ==="
+
         if opaque_multiline:
             range_str = f"lines {fail_loc[0]}-{fail_end_loc[0]}"
             fail_str = range_str  # footer uses this too
@@ -1418,6 +1523,8 @@ async def hol_state_at(
                 f"arm)` / `>|` / similar goal-positional combinator is kept opaque "
                 f"by the step decomposer, swallowing the whole preceding chain.)"
             )
+            if is_exc:
+                lines.extend(_exception_advisory_lines(result.error))
             lines.append("")
             lines.append(
                 f"To localize: put `\\\\ cheat` partway through {range_str} and move "
@@ -1431,12 +1538,15 @@ async def hol_state_at(
                 lines.extend(format_step_context(
                     step_plan, fail_idx, s_lines,
                     context_before=context_before, context_after=context_after,
+                    fail_marker=sc_marker, failing_header=sc_header,
                 ))
         else:
-            lines.append(f"PROOF BROKEN at {fail_str}")
-
-            # Step plan context shows which tactic failed — raw Poly/ML error is redundant
-            lines.append(f"ERROR: Tactic failed at step {fail_idx}")
+            if is_exc:
+                lines.append(f"PROOF BROKEN at {fail_str} (replay stopped on a raised exception)")
+            else:
+                lines.append(f"PROOF BROKEN at {fail_str}")
+                # Step plan context shows which tactic failed — raw error is redundant
+                lines.append(f"ERROR: Tactic failed at step {fail_idx}")
 
             # Show failing tactic and optional step plan context
             if fail_idx < len(step_plan) and thm:
@@ -1444,7 +1554,11 @@ async def hol_state_at(
                 lines.extend(format_step_context(
                     step_plan, fail_idx, s_lines,
                     context_before=context_before, context_after=context_after,
+                    fail_marker=sc_marker, failing_header=sc_header,
                 ))
+
+            if is_exc:
+                lines.extend(_exception_advisory_lines(result.error))
 
             lines.append("")
             lines.append(
@@ -1579,9 +1693,16 @@ async def hol_state_at(
             lines.append("")
             lines.append(diag)
 
+    # Refuse a false-green: if the TARGET theorem itself was auto-cheated
+    # during load, the goals/"No goals" above rest on its STATEMENT, not its
+    # replayed proof — say so loudly instead of letting it read as a pass.
+    self_cheat = _target_self_cheated_reason(cursor, active_theorem)
+    if self_cheat is not None:
+        lines.extend(_target_self_cheated_lines(self_cheat))
+
     # Name any deps auto-cheated while loading the file prefix (the state
     # shown was computed with those theorems replaced by `cheat`).
-    lines.extend(_auto_cheated_deps_lines(cursor))
+    lines.extend(_auto_cheated_deps_lines(cursor, active_theorem))
 
     # Add timing info if available
     if result.timings:
@@ -1771,10 +1892,18 @@ async def hol_check_proof(
                 f"per-tactic timeout for a long-running but correct tactic."
             )
     elif final.goals_after == 0:
+        self_cheat = _target_self_cheated_reason(cursor, theorem)
         oracles = cursor._theorem_oracles.get(theorem, [])
+        if self_cheat is not None:
+            # The target itself was auto-cheated during prefix load — the
+            # "0 goals" rests on its statement, not its replayed proof.
+            lines.append(f"Status: NOT VALIDATED ({total_ms}ms)")
+            lines.extend(_target_self_cheated_lines(self_cheat))
+            lines.extend(_auto_cheated_deps_lines(cursor, theorem))
+            return "\n".join(lines)
         if oracles:
             lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps) ⚠ depends on cheat")
-            lines.extend(_auto_cheated_deps_lines(cursor))
+            lines.extend(_auto_cheated_deps_lines(cursor, theorem))
         else:
             lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps)")
         if not trace and not oracles:

@@ -216,6 +216,7 @@ def format_steps(
     step_lines: list[int] | None = None,
     context_before: int = 0,
     context_after: int = 0,
+    fail_marker: str = "  <-- FAILED",
 ) -> list[str]:
     """Format step plan with indentation for >- arm nesting.
 
@@ -282,7 +283,7 @@ def format_steps(
             continue
 
         indent = "  " * depth
-        marker = "  <-- FAILED" if i == fail_idx else ""
+        marker = fail_marker if i == fail_idx else ""
         if k == "expand_list":
             # >~[pat] >- tac shown as single indented step
             display = step.text
@@ -315,10 +316,17 @@ def format_step_context(
     step_lines: list[int],
     context_before: int = 0,
     context_after: int = 0,
+    fail_marker: str = "  <-- FAILED",
+    failing_header: str = "=== Failing tactic ===",
 ) -> list[str]:
     """Format step plan context around a failing step.
 
     Thin wrapper around format_steps for backward compatibility.
+
+    ``fail_marker``/``failing_header`` are softened by callers when the failure
+    is a RAISED EXCEPTION (e.g. a qpat/qmatch no-match HOL_ERR): the step the
+    replay stopped at is then only an upper bound on the fault location, not a
+    confident pin, so the marker must not read as 'this tactic failed'.
     """
     if fail_idx < 0 or fail_idx >= len(step_plan):
         return []
@@ -327,7 +335,7 @@ def format_step_context(
     failing_kind = step_plan[fail_idx].kind
     # Use structural display name if it's an open/mid step
     failing_display = _STEP_DISPLAY.get(failing_kind, failing_text)
-    out = ["", "=== Failing tactic ===", failing_display]
+    out = ["", failing_header, failing_display]
     if failing_kind in ("expand", "expand_list"):
         out.append(f"Opaque tactic — cannot inspect inside of {failing_display}. Use Suspend/Resume or extract as a lemma.")
 
@@ -338,6 +346,7 @@ def format_step_context(
         step_plan, fail_idx=fail_idx,
         step_lines=step_lines,
         context_before=context_before, context_after=context_after,
+        fail_marker=fail_marker,
     )
     if steps:
         out.append("")

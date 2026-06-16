@@ -48,24 +48,57 @@ def _try_find_json_line(output: str, context: str = "") -> dict:
         return {}
 
 
+# Per-theorem whole-proof replay budget (seconds). Legitimately-slow proofs
+# (e.g. large induction bodies ~80-100s) must validate per-theorem rather than
+# being silently auto-cheated, so this is well above the 60s default.
+PER_THEOREM_TIMEOUT = 120
+
+
+def _line_is_error_marker(s: str) -> bool:
+    """True iff a single output line GENUINELY signals a HOL/Poly error.
+
+    Deliberately marker-based: it must NOT fire on a printed goal term merely
+    because it contains the substring 'error'/'exception' inside an identifier
+    or constructor (e.g. `Rerr`, `Rtype_error`, `no_ReturnException`). A failing
+    proof prints its goal — which routinely mentions such constructors — BEFORE
+    the real exception, so a substring match grabs the goal line and misreports
+    a slow/aborted proof as a tactic failure.
+    """
+    if s.startswith("TIMEOUT"):
+        return True
+    if s.startswith("Exception-") or s.startswith("Exception "):
+        return True
+    if "raised exception" in s.lower():
+        return True
+    if "HOL_ERR" in s:
+        return True
+    if "poly: : error:" in s.lower():
+        return True
+    if re.match(r'parse error at \d+:\d+', s):
+        return True
+    if s.startswith("Fail "):
+        return True
+    return False
+
+
 def _error_reason(output: str, limit: int = 120) -> str:
     """Compact one-line reason from HOL error output (for _failed_proofs).
 
-    Picks the first line that looks like the actual error (TIMEOUT marker,
-    'error'/'exception' mention), falling back to the first non-empty line.
+    Returns a TIMEOUT reason for budget timeouts, otherwise the first line
+    carrying a GENUINE error marker (see _line_is_error_marker). Never returns
+    a goal-term line just because it contains the substring 'error'/'exception'
+    — that misreported slow/aborted proofs as tactic failures (the
+    `[auto-cheated deps: foo (error: | (SOME (Rerr ...)) => T)]` bug).
     """
-    first_nonempty = None
+    stripped = output.lstrip()
+    if stripped.startswith("TIMEOUT"):
+        first = next((l.strip() for l in stripped.splitlines() if l.strip()), "TIMEOUT")
+        return first[:limit]
     for line in output.splitlines():
         s = line.strip()
-        if not s:
-            continue
-        if first_nonempty is None:
-            first_nonempty = s
-        if s.startswith("TIMEOUT"):
-            return s[:limit]
-        if "error" in s.lower() or "exception" in s.lower():
+        if s and _line_is_error_marker(s):
             return f"error: {s[:limit]}"
-    return f"error: {(first_nonempty or 'proof failed')[:limit]}"
+    return "could not validate (no recognizable error marker; proof likely aborted/timed out)"
 
 
 def _trace_reason(trace: list["TraceEntry"], limit: int = 120) -> str:
@@ -422,7 +455,7 @@ class FileProofCursor:
 
         # Theorems whose proofs failed during content loading and were
         # auto-cheated to prevent cascading compile errors, mapped to a short
-        # reason ("timeout >60s …" / "error: …"). Cleared on file change.
+        # reason ("timeout >Ns …" / "error: …"). Cleared on file change.
         self._failed_proofs: dict[str, str] = {}
 
         # Oracle tags per theorem from verify_all_proofs.
@@ -1228,12 +1261,12 @@ class FileProofCursor:
 
                 thm_content = '\n'.join(content_lines[self._line_to_idx(thm.start_line):self._line_to_idx(thm.proof_end_line)])
                 if thm_content.strip():
-                    result = await self.session.send(thm_content, timeout=60)
+                    result = await self.session.send(thm_content, timeout=PER_THEOREM_TIMEOUT)
                     if result.startswith("TIMEOUT") and thm.kind != "Definition":
                         self.session.interrupt()
                         await asyncio.sleep(0.5)
                         err = await self._cheat_failed_theorem(
-                            thm, "timeout >60s loading whole proof"
+                            thm, f"timeout >{PER_THEOREM_TIMEOUT}s loading whole proof"
                         )
                         if err:
                             return f"Error executing file content: {_format_context_error(result)}"
@@ -1259,7 +1292,7 @@ class FileProofCursor:
                 if block_end > self._loaded_to_line:
                     block_content = '\n'.join(content_lines[self._line_to_idx(self._loaded_to_line):self._line_to_idx(block_end)])
                     if block_content.strip():
-                        result = await self.session.send(block_content, timeout=60)
+                        result = await self.session.send(block_content, timeout=PER_THEOREM_TIMEOUT)
                         if _is_fatal_hol_error(result):
                             return f"Error executing file content: {_format_context_error(result)}"
                         if _is_hol_error(result):
@@ -2302,7 +2335,7 @@ class FileProofCursor:
                 # No tactics - load theorem as-is
                 thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                 if thm_content.strip():
-                    result = await self.session.send(thm_content, timeout=60)
+                    result = await self.session.send(thm_content, timeout=PER_THEOREM_TIMEOUT)
                     # If proof failed, cheat to bind name for later theorems
                     if _is_hol_error(result):
                         if thm.kind == "Definition":
@@ -2337,7 +2370,7 @@ class FileProofCursor:
                     # Resume goal extraction failed — load as-is
                     thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                     if thm_content.strip():
-                        resume_result = await self.session.send(thm_content, timeout=60)
+                        resume_result = await self.session.send(thm_content, timeout=PER_THEOREM_TIMEOUT)
                         if _is_hol_error(resume_result):
                             cheat_err = await self._cheat_failed_theorem(
                                 thm, _error_reason(resume_result)
@@ -2357,7 +2390,7 @@ class FileProofCursor:
                     # TC extraction failed — load as-is without timing
                     thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
                     if thm_content.strip():
-                        def_result = await self.session.send(thm_content, timeout=60)
+                        def_result = await self.session.send(thm_content, timeout=PER_THEOREM_TIMEOUT)
                         if _is_hol_error(def_result):
                             results[thm.name] = [TraceEntry(
                                 cmd="", real_ms=0, usr_ms=0, sys_ms=0,
