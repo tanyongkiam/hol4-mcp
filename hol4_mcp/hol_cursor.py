@@ -470,6 +470,15 @@ class FileProofCursor:
         # Such changes require rebuilding HOL session context from scratch.
         self._needs_session_reinit: bool = False
 
+        # Prefix-skip mode (state_at(skip_prefix=True)): when on, prefix theorems
+        # are bound via `cheat` (statement only) instead of being replayed, so
+        # navigation into a target theorem is instant even in a cold, unbuilt
+        # theory full of slow/looping proofs. _skipped_thms records which prefix
+        # theorems were cheated this way (reported, but NOT as per-theorem
+        # auto-cheat failures). Changing the mode forces a clean prefix reload.
+        self._skip_prefix: bool = False
+        self._skipped_thms: set[str] = set()
+
     def _compute_hash(self, content: str) -> str:
         """Compute SHA256 hash of content."""
         return hashlib.sha256(content.encode()).hexdigest()
@@ -1168,6 +1177,41 @@ class FileProofCursor:
         self._failed_proofs[thm.name] = reason
         return None
 
+    async def _cheat_skip_theorem(self, thm: TheoremInfo) -> bool:
+        """Bind a prefix theorem via `cheat` WITHOUT replaying its proof.
+
+        Used by prefix-skip navigation mode (state_at skip_prefix=True): rather
+        than replaying a (possibly very slow or non-terminating) prefix proof,
+        re-assert its STATEMENT with a cheat so its name is bound for later
+        theorems. The target theorem is still replayed for real, so its live
+        goal is exactly what holmake would see — only the prefix is trusted by
+        statement.
+
+        Returns True if the theorem was cheated; False if it isn't a cheatable
+        shape (Definition / Resume / suspend-dispatcher / no goal / already a
+        cheat) or the bare statement failed to re-parse — in which case the
+        caller must fall back to a normal replay.
+        """
+        if thm.kind not in ("Theorem", "Triviality"):
+            return False
+        # A suspend-dispatcher's separate Resume blocks would be orphaned if we
+        # cheated the dispatcher; an already-cheated body replays instantly
+        # anyway; an empty goal can't be re-asserted.
+        if (not thm.goal.strip() or thm.has_cheat
+                or re.search(r'\bsuspend\b', thm.proof_body)):
+            return False
+
+        attrs = f"[{','.join(thm.attributes)}]" if thm.attributes else ""
+        cheat_block = f'Theorem {thm.name}{attrs}:\n{thm.goal}\nProof\n  cheat\nQED'
+        result = await self.session.send(cheat_block, timeout=30)
+        if f"val {thm.name}" in result:
+            self._skipped_thms.add(thm.name)
+            return True
+        # Bare statement didn't re-parse standalone — drain any residual and let
+        # the caller replay the real proof so navigation stays correct.
+        await self.session._drain_pipe()
+        return False
+
     def _local_block_at(self, line: int) -> LocalBlock | None:
         """Return the local block containing the given line, or None."""
         for lb in self._local_blocks:
@@ -1386,15 +1430,19 @@ class FileProofCursor:
 
                     await self._extract_goals_for([thm])
 
-                    thm_content = '\n'.join(content_lines[self._line_to_idx(thm.start_line):self._line_to_idx(thm.proof_end_line)])
-                    if thm_content.strip():
-                        result = await self.session.send(thm_content, timeout=timeout)
-                        if _is_fatal_hol_error(result):
-                            return f"Error executing file content: {_format_context_error(result)}"
-                        if _is_hol_error(result):
-                            err = await self._handle_theorem_error(thm, result)
-                            if err:
-                                return err
+                    cheated = False
+                    if self._skip_prefix:
+                        cheated = await self._cheat_skip_theorem(thm)
+                    if not cheated:
+                        thm_content = '\n'.join(content_lines[self._line_to_idx(thm.start_line):self._line_to_idx(thm.proof_end_line)])
+                        if thm_content.strip():
+                            result = await self.session.send(thm_content, timeout=timeout)
+                            if _is_fatal_hol_error(result):
+                                return f"Error executing file content: {_format_context_error(result)}"
+                            if _is_hol_error(result):
+                                err = await self._handle_theorem_error(thm, result)
+                                if err:
+                                    return err
 
                     current_line = thm.proof_end_line
                     await self._save_context_checkpoint(thm.name)
@@ -2035,11 +2083,32 @@ class FileProofCursor:
             return idx
         return None
 
-    async def state_at(self, line: int, col: int = 1) -> StateAtResult:
+    async def state_at(self, line: int, col: int = 1,
+                       skip_prefix: bool = False) -> StateAtResult:
         """Get proof state at file position using prefix-based replay.
 
         Auto-enters the theorem containing the position if not already active.
+
+        skip_prefix: when True, theorems BEFORE the target are bound via `cheat`
+        (statement only) instead of being replayed — instant navigation into a
+        target even in a cold, unbuilt theory whose earlier proofs are slow or
+        non-terminating. The target theorem itself is still replayed for real.
+        Toggling the mode forces a clean reload of the prefix.
         """
+        if skip_prefix != self._skip_prefix:
+            self._skip_prefix = skip_prefix
+            self._skipped_thms = set()
+            # A prefix already loaded under the other mode is invalid now —
+            # rebuild from deps so the new mode governs every prefix theorem,
+            # and drop per-theorem caches keyed to the old prefix (stale
+            # checkpoints would otherwise be reused post-reinit and desync).
+            if self._loaded_to_line > 0:
+                self._needs_session_reinit = True
+                self._invalidate_all_checkpoints()
+                self._failed_proofs = {}
+                self._proof_traces = {}
+                self._theorem_oracles = {}
+
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
 

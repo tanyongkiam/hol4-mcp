@@ -68,6 +68,27 @@ def _auto_cheated_deps_lines(cursor, target_name: str | None = None) -> list[str
     return ["", f"[auto-cheated deps: {rendered}]"]
 
 
+def _prefix_skip_lines(cursor) -> list[str]:
+    """Notice shown when prefix-skip navigation is active.
+
+    In skip_prefix mode every prefix theorem was bound by `cheat` (statement
+    only, NOT replayed), so the goal shown rests on those statements. Report a
+    concise COUNT (not the full list — it can be hundreds) and tell the reader
+    this is a navigation aid, not a verification.
+    """
+    if not getattr(cursor, "_skip_prefix", False):
+        return []
+    n = len(getattr(cursor, "_skipped_thms", ()) or ())
+    return [
+        "",
+        f"[prefix-skip mode ON: {n} prefix theorem(s) bound by cheat (statement "
+        f"only, NOT replayed)]",
+        "  Navigation aid for a cold/unbuilt theory — the target's OWN tactics "
+        "still replay, but the goal rests on the skipped statements. This is NOT "
+        "a verification; re-run without skip_prefix (or holmake) to truly check.",
+    ]
+
+
 def _target_self_cheated_reason(cursor, target_name: str | None) -> str | None:
     """If the navigation/check TARGET was itself auto-cheated during load,
     return its reason; else None.
@@ -780,6 +801,7 @@ async def hol_goals(
     col: int = 1,
     workdir: str = None,
     session: str = "default",
+    skip_prefix: bool = False,
 ) -> str:
     """Goal count and structured goal slices, without a full top_goals() dump.
 
@@ -798,6 +820,9 @@ async def hol_goals(
         col: 1-indexed column for line (default 1).
         workdir: Working directory for HOL (used with file).
         session: Session name (default: "default")
+        skip_prefix: With line, bind prefix theorems by cheat (statement only)
+              instead of replaying — instant navigation in a cold/unbuilt theory.
+              See hol_state_at for the full semantics. (default: False)
 
     Returns: Goal count + headlines, one goal, or one assumption.
     """
@@ -817,7 +842,7 @@ async def hol_goals(
         if not cursor:
             return (f"ERROR: No cursor for session '{session}'. "
                     f"Pass file= to auto-init.")
-        result = await cursor.state_at(line, col)
+        result = await cursor.state_at(line, col, skip_prefix=skip_prefix)
         if result.error and not result.goals:
             return f"ERROR: {result.error}"
         goals = result.goals
@@ -1354,6 +1379,7 @@ async def hol_state_at(
     all_goals: bool = False,
     context_before: int = 0,
     context_after: int = 0,
+    skip_prefix: bool = False,
 ) -> str:
     """Get proof state at a file position.
 
@@ -1385,6 +1411,13 @@ async def hol_state_at(
                       to include in the step plan context (default: 0, off).
                       Both default to 0 (only failing step shown); pass e.g. 3
                       for surrounding context.
+        skip_prefix: If True, bind every theorem BEFORE the target via `cheat`
+                      (statement only) instead of replaying it — instant
+                      navigation into a target in a cold/unbuilt theory whose
+                      earlier proofs are slow or non-terminating. The target's
+                      own tactics still replay, so its live goal is real, but it
+                      rests on the skipped statements (NOT a verification).
+                      Toggling the mode forces a clean prefix reload. (default: False)
 
     When a proof is broken, the failing step's text is always shown.
     With context_before/context_after > 0, a "=== Steps around failure ===" section
@@ -1430,7 +1463,7 @@ async def hol_state_at(
     if not cursor:
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
-    result = await cursor.state_at(line, col)
+    result = await cursor.state_at(line, col, skip_prefix=skip_prefix)
     active_theorem = cursor._active_theorem
     thm = cursor._get_theorem(active_theorem) if active_theorem else None
 
@@ -1610,7 +1643,11 @@ async def hol_state_at(
         if opaque_multiline:
             error_footer = (
                 f"ERROR: PROOF BROKEN somewhere in the opaque step at {fail_str}. "
-                f"The line shown is the step's start, not the failure — bisect with `cheat`."
+                f"The line shown is the step's start, not the failure — bisect by "
+                f"splitting the step into per-goal `>- suspend \"X\"` sub-suspends "
+                f"(preferred: each becomes a navigable Resume body you validate "
+                f"independently, and the file owns the prefix), or `cheat` the "
+                f"frontier if you only need to locate the break."
             )
         else:
             error_footer = (
@@ -1703,6 +1740,9 @@ async def hol_state_at(
     # Name any deps auto-cheated while loading the file prefix (the state
     # shown was computed with those theorems replaced by `cheat`).
     lines.extend(_auto_cheated_deps_lines(cursor, active_theorem))
+
+    # Notice when prefix-skip navigation deliberately cheated the prefix.
+    lines.extend(_prefix_skip_lines(cursor))
 
     # Add timing info if available
     if result.timings:
