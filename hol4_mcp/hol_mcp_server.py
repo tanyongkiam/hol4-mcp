@@ -23,7 +23,7 @@ from . import _mcp_cancel_patch  # noqa: F401 — patches mcp SDK on import
 from fastmcp import FastMCP
 
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
-from .hol_cursor import FileProofCursor, _try_find_json_line
+from .hol_cursor import FileProofCursor, StateAtResult, _try_find_json_line
 from .hol_file_parser import (
     HOLParseError, step_line_numbers, format_steps, format_step_context,
     step_text_start,
@@ -35,6 +35,58 @@ DEFAULT_MAX_OUTPUT = 4096
 
 # Server-level tactic timeout (set via --tactic-timeout CLI flag or HOL_TACTIC_TIMEOUT env)
 TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "60.0"))
+
+# Overall wall-clock budget for a single state_at navigation (set via
+# --state-at-timeout CLI flag or HOL_STATE_AT_TIMEOUT env). The per-tactic
+# timeout bounds each tactic, but a large prefix replay or a long \\-chain can
+# still sum to many minutes; this caps the TOTAL so state_at can never hang
+# unbounded. Generous by default so a legitimate large-prefix replay completes;
+# raise per-call with the tool's timeout= argument when a prefix is genuinely huge.
+STATE_AT_TIMEOUT = float(os.environ.get("HOL_STATE_AT_TIMEOUT", "240.0"))
+
+
+async def _state_at_bounded(
+    cursor, line: int, col: int = 1, skip_prefix: bool = False,
+    timeout: float | None = None,
+) -> StateAtResult:
+    """Run cursor.state_at under an overall wall-clock budget.
+
+    On expiry, SIGINT the HOL process (recoverable — session.send drains stale
+    output on the next call) and resync the cursor, then return a TIMEOUT
+    StateAtResult (tactics_total=0 routes it through the structural-error path).
+    A budget <= 0 (or None when STATE_AT_TIMEOUT is disabled) means unbounded.
+    """
+    budget = STATE_AT_TIMEOUT if timeout is None else timeout
+    if budget is not None and budget <= 0:
+        budget = None
+    if budget is None:
+        return await cursor.state_at(line, col, skip_prefix=skip_prefix)
+    try:
+        return await asyncio.wait_for(
+            cursor.state_at(line, col, skip_prefix=skip_prefix),
+            timeout=budget,
+        )
+    except asyncio.TimeoutError:
+        try:
+            cursor.session.interrupt()
+        except Exception:
+            pass
+        try:
+            cursor.mark_interrupted()
+        except Exception:
+            pass
+        return StateAtResult(
+            goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+            file_hash="",
+            error=(
+                f"TIMEOUT: state_at exceeded its overall {budget:.0f}s budget and was "
+                f"aborted (HOL interrupted; session recovered). Either the prefix replay "
+                f"or a tactic at/after the target is too slow. Remedies: put a `cheat` at "
+                f"the frontier and inspect the goal BEFORE adding heavy tactics "
+                f"(fs[bigDef]/gvs/metis); split a lumped `\\`-chain with `>- suspend`; or "
+                f"retry with a larger timeout= argument."
+            ),
+        )
 
 
 def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
@@ -802,6 +854,7 @@ async def hol_goals(
     workdir: str = None,
     session: str = "default",
     skip_prefix: bool = False,
+    timeout: float = None,
 ) -> str:
     """Goal count and structured goal slices, without a full top_goals() dump.
 
@@ -823,6 +876,10 @@ async def hol_goals(
         skip_prefix: With line, bind prefix theorems by cheat (statement only)
               instead of replaying — instant navigation in a cold/unbuilt theory.
               See hol_state_at for the full semantics. (default: False)
+        timeout: With line, overall wall-clock budget (seconds) for the
+              navigation; None uses the server default (HOL_STATE_AT_TIMEOUT /
+              240s). On expiry HOL is interrupted and a TIMEOUT is returned
+              instead of hanging. See hol_state_at. (default: None)
 
     Returns: Goal count + headlines, one goal, or one assumption.
     """
@@ -842,7 +899,7 @@ async def hol_goals(
         if not cursor:
             return (f"ERROR: No cursor for session '{session}'. "
                     f"Pass file= to auto-init.")
-        result = await cursor.state_at(line, col, skip_prefix=skip_prefix)
+        result = await _state_at_bounded(cursor, line, col, skip_prefix=skip_prefix, timeout=timeout)
         if result.error and not result.goals:
             return f"ERROR: {result.error}"
         goals = result.goals
@@ -1380,6 +1437,7 @@ async def hol_state_at(
     context_before: int = 0,
     context_after: int = 0,
     skip_prefix: bool = False,
+    timeout: float = None,
 ) -> str:
     """Get proof state at a file position.
 
@@ -1418,6 +1476,11 @@ async def hol_state_at(
                       own tactics still replay, so its live goal is real, but it
                       rests on the skipped statements (NOT a verification).
                       Toggling the mode forces a clean prefix reload. (default: False)
+        timeout: Overall wall-clock budget (seconds) for this navigation. None
+                      uses the server default (HOL_STATE_AT_TIMEOUT / 240s). On
+                      expiry the HOL process is interrupted (recoverable) and a
+                      TIMEOUT is returned instead of hanging. Raise it only for a
+                      genuinely huge prefix replay; <= 0 disables the bound.
 
     When a proof is broken, the failing step's text is always shown.
     With context_before/context_after > 0, a "=== Steps around failure ===" section
@@ -1463,7 +1526,7 @@ async def hol_state_at(
     if not cursor:
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
-    result = await cursor.state_at(line, col, skip_prefix=skip_prefix)
+    result = await _state_at_bounded(cursor, line, col, skip_prefix=skip_prefix, timeout=timeout)
     active_theorem = cursor._active_theorem
     thm = cursor._get_theorem(active_theorem) if active_theorem else None
 
@@ -1876,7 +1939,7 @@ async def hol_check_proof(
         if thm.kind == "Definition" and thm.proof_body:
             # Definition blocks can't use execute_proof_traced (TC goal context).
             # Fall back to state_at at the End line to check proof completion.
-            result = await cursor.state_at(thm.proof_end_line - 1, col=1)
+            result = await _state_at_bounded(cursor, thm.proof_end_line - 1, col=1)
             # "no goals" error from goals_json means proof completed successfully
             no_goals_ok = result.error and "no goals" in result.error
             if not result.goals or no_goals_ok:
@@ -2016,6 +2079,7 @@ def main():
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE (default: 127.0.0.1)")
     serve_parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     serve_parser.add_argument("--tactic-timeout", type=float, default=None, help="Max seconds per tactic during proof replay (default: 5.0, or HOL_TACTIC_TIMEOUT env)")
+    serve_parser.add_argument("--state-at-timeout", type=float, default=None, help="Overall wall-clock budget (seconds) per state_at/hol_goals navigation (default: 240.0, or HOL_STATE_AT_TIMEOUT env)")
 
     # Also allow serve options at top level for backwards compat
     parser.add_argument("--transport", choices=["stdio", "http", "sse"], default="stdio", help=argparse.SUPPRESS)
@@ -2023,6 +2087,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
     parser.add_argument("-v", "--verbose", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--tactic-timeout", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--state-at-timeout", type=float, default=None, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -2031,9 +2096,11 @@ def main():
         return
 
     # Default to serve behavior
-    global TACTIC_TIMEOUT
+    global TACTIC_TIMEOUT, STATE_AT_TIMEOUT
     if args.tactic_timeout is not None:
         TACTIC_TIMEOUT = args.tactic_timeout
+    if args.state_at_timeout is not None:
+        STATE_AT_TIMEOUT = args.state_at_timeout
 
     if args.verbose:
         logging.basicConfig(

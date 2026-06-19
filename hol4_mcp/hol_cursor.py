@@ -2225,6 +2225,16 @@ class FileProofCursor:
         self._update_position(target, nav)
         return await self._build_result(target, nav, timings, t0, t3)
 
+    def mark_interrupted(self) -> None:
+        """Resync cursor state after the HOL process was SIGINT'd mid-replay.
+
+        An overall-budget timeout aborts a tactic partway, leaving the live
+        proofManager goal stack at an unknown point. Discard the cached
+        position and flag the session dirty so the next state_at rebuilds the
+        goal from scratch instead of trusting a stale checkpoint."""
+        self._pos = SessionPosition()
+        self._session_dirty = True
+
     def _parse_goals_json(self, output: str) -> list[dict]:
         """Parse JSON goal output from goals_json().
 
