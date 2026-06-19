@@ -521,11 +521,37 @@ class FileProofCursor:
 
         # Invalidate checkpoints and traces for theorems at or after the change
         if first_changed is not None:
+            # Whether the edit lands in a suspend/Resume chain that is currently
+            # BROKEN (a body auto-cheated / a child orphaned). Read this BEFORE
+            # _invalidate_from_line clears the _failed_proofs verdicts it keys on.
+            chain_broken = self._affected_chain_is_broken(first_changed)
+
             self._invalidate_from_line(first_changed)
             # Also reset loaded context tracking - can't trust context after change point
             if first_changed <= self._loaded_to_line:
                 self._loaded_to_line = max(0, first_changed - 1)
                 self._loaded_content_hash = ""  # Empty string = needs recompute
+
+            # Fixing a broken suspend/Resume chain: the session-global suspension
+            # store is append/consume-only and cannot be partially rolled back, so
+            # a fixed dispatcher's sub-`suspend`s only re-register their children in
+            # a CLEAN session. Force a session reinit (restart + replay from deps)
+            # so the whole chain re-runs and orphaned children ("No such label")
+            # come back — exactly what previously required a manual hol_stop + cold
+            # reload. Gated on chain_broken so ordinary edits to a HEALTHY
+            # suspend/Resume proof keep their fast partial replay.
+            if chain_broken:
+                self._needs_session_reinit = True
+                self._loaded_to_line = 0
+                self._loaded_content_hash = ""
+                self._pos = SessionPosition()
+                self._active_theorem = None
+                self._invalidate_all_checkpoints()
+                self._proof_traces.clear()
+                self._tc_goals.clear()
+                self._resume_goals.clear()
+                self._failed_proofs.clear()
+                self._theorem_oracles.clear()
 
             # If change is before first theorem, pre-theorem context may have changed
             # (e.g., open/Theory/Ancestors). Rebuild HOL session on next query.
@@ -969,6 +995,11 @@ class FileProofCursor:
         for name in list(self._resume_goals.keys()):
             if name not in current_thm_names:
                 del self._resume_goals[name]
+        # Auto-cheat verdicts for deleted/renamed theorems are stale; drop them
+        # so a vanished name can never carry a "failed at load" reason forward.
+        for name in list(self._failed_proofs.keys()):
+            if name not in current_thm_names:
+                del self._failed_proofs[name]
 
         # Invalidate checkpoints/traces/tc_goals/resume_goals for theorems at or after change point
         for thm in self._theorems:
@@ -978,6 +1009,14 @@ class FileProofCursor:
                     del self._proof_traces[thm.name]
                 if thm.name in self._tc_goals:
                     del self._tc_goals[thm.name]
+                # Drop the cached auto-cheat verdict: the theorem (or one before
+                # it) changed, so its prior "failed at load / SKIPPED" reason is
+                # stale and MUST be re-derived on the next load. Without this a
+                # fixed Resume body keeps reporting its first-load failure (and a
+                # sub-dispatcher's children keep showing "SKIPPED") until a full
+                # session restart — file=changed alone never refreshed it.
+                if thm.name in self._failed_proofs:
+                    del self._failed_proofs[thm.name]
                 # Resume goals: invalidate only when change affects the
                 # extraction context (main theorem or a nested suspending
                 # Resume earlier in the chain). Once a Resume's label has
@@ -1010,6 +1049,48 @@ class FileProofCursor:
                 elif thm.name in self._resume_goals:
                     # Non-Resume (shouldn't happen, but keep safe): drop
                     del self._resume_goals[thm.name]
+
+    def _suspension_chain_root_line(self, start_line: int) -> int | None:
+        """Earliest start_line of a suspend/Resume chain ROOT touched by a change
+        at/after ``start_line``, or None if no chain is affected.
+
+        A change to a ``Resume thm[label]`` body (or to a ``Theorem`` that itself
+        issues ``suspend``) invalidates the whole chain: the suspension store is
+        session-global and append/consume-only, so the chain must be re-run from
+        its root Theorem. The root of a ``Resume thm[label]`` is the Theorem named
+        ``thm`` (its ``suspension_name``); a ``Theorem``/``Triviality`` whose body
+        contains ``suspend`` is its own root.
+        """
+        name_to_thm = {t.name: t for t in self._theorems}
+        roots: list[int] = []
+        for thm in self._theorems:
+            if thm.proof_end_line < start_line:
+                continue
+            if thm.kind == "Resume":
+                root = name_to_thm.get(thm.suspension_name) if thm.suspension_name else None
+                if root is not None:
+                    roots.append(root.start_line)
+            elif (thm.kind in ("Theorem", "Triviality")
+                    and re.search(r'\bsuspend\b', thm.proof_body or "")):
+                roots.append(thm.start_line)
+        return min(roots) if roots else None
+
+    def _affected_chain_is_broken(self, start_line: int) -> bool:
+        """True if a change at/after ``start_line`` lands in a suspend/Resume
+        chain that currently has a failed/auto-cheated/orphaned body recorded in
+        ``_failed_proofs``.
+
+        Such a chain's suspension store is stale (a label was consumed by an
+        auto-cheat, or a sub-`suspend` never ran), so it cannot be partially
+        replayed — it must be re-run from a clean session. A healthy chain
+        (nothing in ``_failed_proofs``) is left to the normal fast partial path.
+        """
+        if self._suspension_chain_root_line(start_line) is None:
+            return False
+        return any(
+            thm.proof_end_line >= start_line and thm.name in self._failed_proofs
+            for thm in self._theorems
+        )
 
     async def init(self) -> dict:
         """Initialize cursor - parse file and load deps.

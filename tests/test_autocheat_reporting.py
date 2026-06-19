@@ -6,9 +6,12 @@ session or the FastMCP tool wrappers — they validate the reporting logic in
 isolation.
 """
 
+from pathlib import Path
+
 from hol4_mcp.hol_cursor import (
     _error_reason,
     _line_is_error_marker,
+    FileProofCursor,
     PER_THEOREM_TIMEOUT,
 )
 from hol4_mcp.hol_mcp_server import (
@@ -125,3 +128,65 @@ def test_self_cheat_lines_error_never_mentions_holmake():
     blob = "\n".join(lines).lower()
     assert "not validated" in blob
     assert "holmake" not in blob
+
+
+# --- stale auto-cheat verdict invalidation on file change ------------------
+# Regression for the MCP bug where _failed_proofs (the auto-cheat verdict
+# cache) survived an ordinary body edit: a fixed Resume body kept reporting
+# its first-load failure, and a sub-dispatcher's children kept showing
+# "SKIPPED", until a full session restart. _invalidate_from_line now drops the
+# verdict for the edited theorem (and anything after it) and for vanished names.
+
+_TWO_THMS_V1 = (
+    "Theorem aaa:\n  T\nProof\n  rw[]\nQED\n\n"
+    "Theorem bbb:\n  T\nProof\n  rw[]\nQED\n"
+)
+# Same file, only bbb's tactic edited (rw[] -> simp[]); aaa byte-identical.
+_TWO_THMS_V2 = (
+    "Theorem aaa:\n  T\nProof\n  rw[]\nQED\n\n"
+    "Theorem bbb:\n  T\nProof\n  simp[]\nQED\n"
+)
+
+
+def test_failed_proofs_dropped_for_edited_and_vanished_theorems(tmp_path):
+    f: Path = tmp_path / "invScript.sml"
+    f.write_text(_TWO_THMS_V1)
+    cur = FileProofCursor(f, session=None)
+    assert cur._reparse_if_changed() is True   # initial parse populates theorems
+
+    # Simulate a prior load that auto-cheated all of these. "ghost" no longer
+    # exists in the file (renamed/deleted between loads).
+    cur._failed_proofs = {
+        "aaa": "error: HOL_ERR ...",
+        "bbb": "error: HOL_ERR ...",
+        "ghost": "label not found at load — SKIPPED, never ran",
+    }
+    cur._loaded_to_line = 100
+
+    # Edit ONLY bbb's proof body.
+    f.write_text(_TWO_THMS_V2)
+    assert cur._reparse_if_changed() is True
+
+    # bbb changed -> its stale verdict must be dropped.
+    assert "bbb" not in cur._failed_proofs
+    # ghost is gone from the file -> its stale verdict must be dropped.
+    assert "ghost" not in cur._failed_proofs
+    # aaa is byte-identical and BEFORE the change -> its verdict is untouched
+    # (we only re-derive verdicts for theorems that could have changed).
+    assert "aaa" in cur._failed_proofs
+
+
+def test_failed_proofs_fully_cleared_on_pre_theorem_edit(tmp_path):
+    # An edit before the first theorem forces a session reinit, which already
+    # clears _failed_proofs wholesale; guard that path stays correct too.
+    f: Path = tmp_path / "invScript.sml"
+    f.write_text(_TWO_THMS_V1)
+    cur = FileProofCursor(f, session=None)
+    assert cur._reparse_if_changed() is True
+    cur._failed_proofs = {"aaa": "error: ...", "bbb": "error: ..."}
+    cur._loaded_to_line = 100
+
+    # Insert a comment line at the very top (before any theorem).
+    f.write_text("(* header *)\n" + _TWO_THMS_V1)
+    assert cur._reparse_if_changed() is True
+    assert cur._failed_proofs == {}
