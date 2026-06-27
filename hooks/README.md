@@ -41,13 +41,14 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H14 | ✅     | PreToolUse            | `Bash`                  | Block destructive git ops without literal `git ok` in the latest user message (transcript-aware; fail-open if transcript unreadable) |
 | H15 | ⏭     | PreToolUse            | `Write`                 | ~~On `~/.claude/plans/` writes, advise if "Operating principles" section is missing~~ — skipped (high FP on non-proof plans; marker regex fragile; plan template is the better forcing function) |
 | H16 | ✅     | PostToolUse           | `mcp__hol4__hol_state_at\|mcp__hol4__hol_send\|mcp__hol4__hol_check_proof` | Inject advisory when goal display contains `⅋ᵣ` / `resconj` — the canonical indicator that multiple subgoals were bundled into one Resume body via a shared `suspend` label (hol4-proving skill "one label = one goal" violation) |
-| H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored THEN-form `suspend` (`>>` / `\\` / `THEN` then `suspend "..."`) in `*Script.sml` edits — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects) |
+| H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored non-canonical `suspend` in `*Script.sml` edits: THEN-form (`>>` / `\\` / `THEN` then `suspend "..."`) and the `by (suspend "...")` justification form — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects) |
 | H18 | ✅     | PreToolUse            | `mcp__hol4__hol_send\|Edit\|Write\|MultiEdit` | Block the `markerLib` suspension-lookup query (the `(string*thm) option` one — returns NONE in a bare session, tempts guessing the suspended goal); point to `set_suspended_goal` to actually load it |
 | H19 | ✅     | PreToolUse            | `mcp__hol4__hol_restart` | Block `hol_restart` without literal `restart ok` in the latest user message (RULE J / "effectively never"; transcript-aware, fail-open, same consent design as H14) |
-| H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥12 THEN-combinators, or ≥15 non-blank lines with ≥4 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
+| H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥6 THEN-combinators, or ≥8 non-blank lines with ≥2 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
 | H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work (the HOL4 ruleset moved out of global CLAUDE.md into the skill, June 2026) |
+| H23 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block the standalone-`prove` workflow in `hol_send` (`prove(` / `store_thm(` / `save_thm(` / `TAC_PROOF(`) — RULE I + RULE G: a proof closed in the scratch session with a hand-typed goal proves nothing about the file form; write a `Theorem … QED` or sub-suspend the arm (`>- suspend` + `Resume`) |
 
-Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
+Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22 → H23. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
 
 The live wiring is `~/.claude/settings.json` (source of truth); the sample
 JSON at the bottom of this file may lag it.
@@ -407,14 +408,15 @@ Fix:
   field-name fallback as H6/H8; uses `ensure_ascii=False` so the U+214B
   marker survives dict serialisation.
 
-## H17 — THEN-form `suspend` blocker
+## H17 — non-canonical `suspend` blocker
 
 **File**: `h17_then_suspend.py`
 **Event**: `PreToolUse`
 **Matcher**: `Edit|Write|MultiEdit`
-**Effect**: blocks (exit 2) if the new content of a `*Script.sml` edit contains a
-THEN-form combinator (`>>`, `\\`, or the word `THEN`) immediately followed by
-`suspend "..."`.
+**Effect**: blocks (exit 2) if the new content of a `*Script.sml` edit places
+`suspend "..."` non-canonically — either after a THEN-form combinator (`>>`,
+`\\`, or the word `THEN`), or as a `by` justification
+(`` `P` by (suspend "X") `` / `` `P` by suspend "X" ``).
 
 ### Why
 
@@ -431,7 +433,13 @@ Regex `(?:>>(?!~)|\\\\|\bTHEN(?![1L_]))\s*suspend\s*"..."`:
 - `\\` — CakeML preamble synonym for THEN.
 - the word `THEN` — word-boundary; `THEN1` / `THENL` / `THEN_LT` excluded.
 
-Fires anywhere in the edit text, including inside parens
+Plus regex `\bby\s*\(?\s*suspend\s*"..."` for the `by`-justification form
+(`` `P` by (suspend "X") `` / `` `P` by suspend "X" ``) — a single-goal tactic
+parked off-pattern instead of dispatched with `>-`. No legitimate `by ... suspend`
+exists, so no false positives; the THEN regex never sees these (`suspend` is
+preceded by `by`/`(`, not a THEN-form).
+
+Both fire anywhere in the edit text, including inside parens
 (`>- (... >> suspend "L")`).
 
 ### Correct forms (not blocked)

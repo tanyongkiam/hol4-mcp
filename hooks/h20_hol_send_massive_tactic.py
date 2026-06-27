@@ -18,8 +18,8 @@ proof body) does NOT belong in hol_send:
 The correct loop: flush the verified chain INTO the `*Script.sml` body ending
 in a fresh `cheat` / `>- suspend "Frontier"`, then JUMP to the frontier with
 `hol_state_at` (full file-order replay -> accurate state) and probe with SHORT
-`hol_send` calls (one tactic, minimal goal slice). A >10-line chain belongs in
-the FILE, not in repeated hol_send calls.
+`hol_send` calls (one tactic, minimal goal slice). A multi-line tactic chain
+belongs in the FILE, not in repeated hol_send calls.
 
 Heuristic: count THEN-combinators (`\\`, `>>`) and non-blank lines in the
 hol_send command. Block when the command is a genuinely massive tactic:
@@ -34,9 +34,9 @@ import json
 import re
 import sys
 
-COMBINATOR_LIMIT = 12   # >= this many `\\`/`>>` THEN-combinators -> massive
-LINE_LIMIT = 15         # >= this many non-blank lines (with some combinators)
-MIN_COMBINATORS_FOR_LINES = 4
+COMBINATOR_LIMIT = 6    # >= this many `\\`/`>>` THEN-combinators -> massive
+LINE_LIMIT = 8          # >= this many non-blank lines (with some combinators)
+MIN_COMBINATORS_FOR_LINES = 2
 
 REMINDER = """\
 hol4-hook H20: REFUSED -- this hol_send is a MASSIVE tactic chain. This is a
@@ -61,7 +61,7 @@ DO THIS INSTEAD:
   3. Probe with SHORT `hol_send` only: ONE tactic, a MINIMAL goal slice
      (`String.substring (term_to_string g) 0 300`), never a full-body replay.
 
-A chain past ~10 lines belongs in the FILE. If `hol_state_at` cannot reach a
+A chain past a few lines belongs in the FILE. If `hol_state_at` cannot reach a
 goal inside a `\\`-chain, SUB-SUSPEND the frontier (`>- suspend "X"` + Resume)
 so the FILE owns the prefix -- NEVER replay the body through hol_send.
 """

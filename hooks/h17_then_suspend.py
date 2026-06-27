@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-H17 -- PreToolUse hook on Edit/Write/MultiEdit that blocks the THEN-suspend
-footgun in all its surface forms: `>>`, `\\\\`, and the word `THEN`,
-each followed by `suspend "..."`.
+H17 -- PreToolUse hook on Edit/Write/MultiEdit that blocks non-canonical
+`suspend` placements:
+  (1) the THEN-suspend footgun in all its surface forms: `>>`, `\\\\`, and
+      the word `THEN`, each followed by `suspend "..."`; and
+  (2) `suspend` mis-placed as a `by` justification (`` `P` by (suspend "X") ``
+      / `` `P` by suspend "X" ``) -- a single-goal tactic used to park a
+      subgoal instead of being dispatched with `>-`/THEN1.
+Canonical: every `suspend` is immediately preceded by `>-` (THEN1).
 
 Rationale: THEN (whichever surface form -- `>>`, `\\\\`, or the literal word
 `THEN`) distributes its right operand across ALL remaining goals.
@@ -41,6 +46,17 @@ BAD_THEN_SUSPEND_RE = re.compile(
     re.MULTILINE,
 )
 
+# `suspend` mis-placed as a `by` justification (`` `P` by (suspend "X") `` or
+# `` `P` by suspend "X" ``): a single-goal tactic used to PARK a `by`-subgoal
+# instead of being dispatched by `>-`/THEN1. Not a THEN-bundle (so the regex
+# above never sees it -- `suspend` is preceded by `by`/`(`, not `>>`/`\\`/
+# `THEN`), but still a non-canonical suspend form. There is no legitimate
+# `by ... suspend`, so this has no false positives.
+BAD_BY_SUSPEND_RE = re.compile(
+    r'\bby\s*\(?\s*suspend\s*"([^"]+)"',
+    re.MULTILINE,
+)
+
 REMINDER = """\
 hol4-hook H17: refused edit -- the literal pattern THEN+suspend
 distributes the suspend across ALL remaining goals under ONE label,
@@ -65,7 +81,12 @@ Correct forms:
   `>~ [pat] >- suspend "L"`                 (pattern-guided)
 
 For multiple residual goals into N distinct labels, chain with `>-`:
-  `>- suspend "L1" >- suspend "L2" >- suspend "L3"`."""
+  `>- suspend "L1" >- suspend "L2" >- suspend "L3"`.
+
+Also rejected: `suspend` as a `by` justification
+(`` `P` by (suspend "X") `` / `` `P` by suspend "X" ``) -- this parks a
+by-subgoal off-pattern instead of dispatching with `>-`. Prove the subgoal
+directly, or restructure so the goal is reached and dispatched with `>-`."""
 
 
 def extract_edits(payload):
@@ -99,6 +120,8 @@ def main():
         if not text:
             continue
         for m in BAD_THEN_SUSPEND_RE.finditer(text):
+            offenders.append((path, m.group(1), m.group(0)))
+        for m in BAD_BY_SUSPEND_RE.finditer(text):
             offenders.append((path, m.group(1), m.group(0)))
     if not offenders:
         return 0

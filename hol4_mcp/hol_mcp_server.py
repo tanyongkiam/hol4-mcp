@@ -42,7 +42,7 @@ TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "60.0"))
 # still sum to many minutes; this caps the TOTAL so state_at can never hang
 # unbounded. Generous by default so a legitimate large-prefix replay completes;
 # raise per-call with the tool's timeout= argument when a prefix is genuinely huge.
-STATE_AT_TIMEOUT = float(os.environ.get("HOL_STATE_AT_TIMEOUT", "240.0"))
+STATE_AT_TIMEOUT = float(os.environ.get("HOL_STATE_AT_TIMEOUT", "300.0"))
 
 
 async def _state_at_bounded(
@@ -878,7 +878,7 @@ async def hol_goals(
               See hol_state_at for the full semantics. (default: False)
         timeout: With line, overall wall-clock budget (seconds) for the
               navigation; None uses the server default (HOL_STATE_AT_TIMEOUT /
-              240s). On expiry HOL is interrupted and a TIMEOUT is returned
+              300s). On expiry HOL is interrupted and a TIMEOUT is returned
               instead of hanging. See hol_state_at. (default: None)
 
     Returns: Goal count + headlines, one goal, or one assumption.
@@ -1477,7 +1477,7 @@ async def hol_state_at(
                       rests on the skipped statements (NOT a verification).
                       Toggling the mode forces a clean prefix reload. (default: False)
         timeout: Overall wall-clock budget (seconds) for this navigation. None
-                      uses the server default (HOL_STATE_AT_TIMEOUT / 240s). On
+                      uses the server default (HOL_STATE_AT_TIMEOUT / 300s). On
                       expiry the HOL process is interrupted (recoverable) and a
                       TIMEOUT is returned instead of hanging. Raise it only for a
                       genuinely huge prefix replay; <= 0 disables the bound.
@@ -2079,7 +2079,7 @@ def main():
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE (default: 127.0.0.1)")
     serve_parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     serve_parser.add_argument("--tactic-timeout", type=float, default=None, help="Max seconds per tactic during proof replay (default: 5.0, or HOL_TACTIC_TIMEOUT env)")
-    serve_parser.add_argument("--state-at-timeout", type=float, default=None, help="Overall wall-clock budget (seconds) per state_at/hol_goals navigation (default: 240.0, or HOL_STATE_AT_TIMEOUT env)")
+    serve_parser.add_argument("--state-at-timeout", type=float, default=None, help="Overall wall-clock budget (seconds) per state_at/hol_goals navigation (default: 300.0, or HOL_STATE_AT_TIMEOUT env)")
 
     # Also allow serve options at top level for backwards compat
     parser.add_argument("--transport", choices=["stdio", "http", "sse"], default="stdio", help=argparse.SUPPRESS)
