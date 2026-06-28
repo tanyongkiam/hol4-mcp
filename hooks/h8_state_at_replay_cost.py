@@ -33,10 +33,12 @@ cost-discipline trigger is REPEATEDLY running expensive hol_state_at calls
 on the same body -- that's "burning replay time".
 
 If you find yourself re-running hol_state_at on this body:
-  - Switch to `hol_send` (e / eall / expandf) -- probes from current
-    proofManager state, no prefix replay.
-  - OR sub-suspend the failing block: `>- suspend "Label"` + Resume body
-    after the parent QED. Replay scope shrinks to body only."""
+  - Sub-suspend the frontier (primary fix): `>- suspend "Label"` +
+    `Resume thm[Label]: cheat QED` after the parent QED. Replay scope shrinks
+    to the body only, and the file owns the prefix.
+  - For a quick check, `hol_send` SMALL probes (a single `e`/`ef` tactic) at the
+    already-parked frontier -- NOT `eall`/`expandf` (all-goals drivers misfire
+    on a goalfrag), NOT a re-sent chain (RULE I/G)."""
 
 def extract_output_text(payload):
     candidates = []

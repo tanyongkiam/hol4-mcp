@@ -21,7 +21,7 @@ runtime; H17 catches it at edit time so it never reaches the live state.
 
 Correct forms:
   - `>- suspend "L"`              (single-goal, the canonical form)
-  - `>- (tac1 >> tac2 >> suspend "L")`  (chain on first goal, ending in suspend)
+  - `>- (tac1 >> tac2 >- suspend "L")`  (chain on first goal, ending in suspend)
   - `>~ [pat] >- suspend "L"`     (pattern-guided dispatch)
 
 Block fires on any `(>>|\\\\|THEN)\\s+suspend\\s*"..."` in the

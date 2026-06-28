@@ -156,15 +156,23 @@ legitimate cheat-probing return per the cheat-probing pattern (feedback_hol4_mcp
 ```
 hol4-hook H6: hol_check_proof returned FAILED / TIMEOUT.
 
-Per hol4-proving skill RULE C: do NOT re-run hol_check_proof to diagnose.
-  - Read the failing goal with `hol_state_at` (or `hol_send` / `expandf` if
-    the failure sits inside a `THEN1 (...)` / `>- (...)` chain).
-  - If this is the second failed attempt on the same theorem, sub-suspend
-    the failing arm: `>~ [pat] >- suspend "Label"` + `Resume thm[Label]:`
-    body after the parent QED.
+Per hol4-proving skill RULE C, hol_check_proof is NOT a diagnosis tool — do
+not re-run it to localize the failure.
+  - Failure inside an opaque `THEN1 (...)` / `>- (...)` / `\\`-chain (the usual
+    case)? SUB-SUSPEND the failing arm NOW — FIRST move, not after a second
+    attempt: `>~ [pat] >- suspend "Label"` (or `>- suspend "Label"`) +
+    `Resume thm[Label]: cheat QED` after the parent QED. Then `hol_state_at`
+    lands on the real goal — the file owns the prefix. This is the default
+    (~99% of opaque breaks).
+  - FLAT body, no `>-`/chain above the frontier? Read with `hol_state_at`.
+  - Do NOT bisect by moving a `cheat` through the chain, and do NOT
+    reconstruct the goal with `hol_send`/`e`/`sg`/`expandf` — a scratch goal
+    diverges silently from the file form (RULE G), and the all-goals drivers
+    (`expandf`/`Manager.expand`) are banned.
 
-Re-running hol_check_proof on the same theorem without inspecting goal state
-is a RULE C violation: ...
+Re-running hol_check_proof on the same theorem without sub-suspending is a
+RULE C violation: the failure location stays hidden inside the opaque
+"Tactic execution failed" wrapper.
 ```
 
 ### Limitations / known unknowns
@@ -212,10 +220,12 @@ cost-discipline trigger is REPEATEDLY running expensive hol_state_at calls
 on the same body -- that's "burning replay time".
 
 If you find yourself re-running hol_state_at on this body:
-  - Switch to `hol_send` (e / eall / expandf) -- probes from current
-    proofManager state, no prefix replay.
-  - OR sub-suspend the failing block: `>- suspend "Label"` + Resume body
-    after the parent QED. Replay scope shrinks to body only.
+  - Sub-suspend the frontier (primary fix): `>- suspend "Label"` +
+    `Resume thm[Label]: cheat QED` after the parent QED. Replay scope shrinks
+    to the body only, and the file owns the prefix.
+  - For a quick check, `hol_send` SMALL probes (a single `e`/`ef` tactic) at the
+    already-parked frontier -- NOT `eall`/`expandf` (all-goals drivers misfire
+    on a goalfrag), NOT a re-sent chain (RULE I/G).
 ```
 
 The wording explicitly acknowledges that a single slow call may be legitimate

@@ -80,11 +80,18 @@ async def _state_at_bounded(
             file_hash="",
             error=(
                 f"TIMEOUT: state_at exceeded its overall {budget:.0f}s budget and was "
-                f"aborted (HOL interrupted; session recovered). Either the prefix replay "
-                f"or a tactic at/after the target is too slow. Remedies: put a `cheat` at "
-                f"the frontier and inspect the goal BEFORE adding heavy tactics "
-                f"(fs[bigDef]/gvs/metis); split a lumped `\\`-chain with `>- suspend`; or "
-                f"retry with a larger timeout= argument."
+                f"aborted (HOL interrupted; session recovered). This is almost always a "
+                f"LOOPING TACTIC you just wrote — NOT a slow prefix (already-built prefix "
+                f"theorems replay fast). Prime suspects: simp/fs/gvs/rw[<recursive_def>] "
+                f"WITHOUT `Once` (unfolds forever, esp. inside its own induction IH); a "
+                f"GSYM or symmetric-equality rewrite that oscillates; an unbounded "
+                f"metis_tac/every_case_tac blowup. DIAGNOSE FIRST: put a `cheat` at the "
+                f"frontier BEFORE your newest tactic, navigate to THAT cheat (cheap) to "
+                f"read the goal, then fix the loop (simp[Once <def>]; drop the GSYM; narrow "
+                f"the rewrite set). Do NOT default to blaming the prefix. Only if the "
+                f"cheat-frontier navigation is ALSO slow is the prefix/target genuinely "
+                f"heavy — then split a lumped `\\`-chain with `>- suspend`, or retry with a "
+                f"larger timeout= argument."
             ),
         )
 
@@ -689,6 +696,61 @@ def _check_shadow_binding(command: str) -> str | None:
     )
 
 
+# Interactive GOAL-CREATION in hol_send is the reconstruct-from-scratch footgun:
+# spinning up a fresh goal with `g`/`gf`/`set_goal` and driving it with `e`/`ef`
+# builds a proof in the SCRATCH session that says NOTHING about whether the FILE
+# form replays (RULE G), diverges silently (goal order, prover-gen names, type
+# ambiguity), and is lost on compaction. The session is scratch, not storage.
+#
+# Block the goal CREATORS here (navigation establishes frontiers via quse_string,
+# which does NOT route through this tool, so hol_state_at is unaffected; short
+# e/ef PROBES on an already-navigated frontier stay allowed).
+_INTERACTIVE_GOAL_RE = re.compile(
+    r'\bproofManagerLib\.(?:g|gf|set_goal|set_goalfrag|set_suspended_goal'
+    r'|new_goalstack|restart)\b'
+    r'|(?<![\w.])(?:g|gf|set_goal|set_goalfrag|set_suspended_goal'
+    r'|new_goalstack|restart)\s*[(`]'
+)
+
+# Term quotations (`...` / ``...``), SML string literals, and comments routinely
+# contain a HOL variable `g` next to `(` or a closing backtick (e.g.
+# ``EVAL ``LENGTH (g xs)`` `` or `"g(x)"`). Those are legitimate read-only
+# queries, NOT goal creation. Blank out their CONTENTS (keeping the delimiters,
+# so a real `g `tm`` still shows `g `` and matches) before scanning.
+_QUOTE_SPAN_RE = re.compile(r'`+[^`]*`+')
+_SML_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+_SML_COMMENT_RE = re.compile(r'\(\*.*?\*\)', re.DOTALL)
+
+
+def _strip_noncode(command: str) -> str:
+    out = _SML_COMMENT_RE.sub(' ', command)
+    out = _QUOTE_SPAN_RE.sub('``', out)
+    out = _SML_STRING_RE.sub('""', out)
+    return out
+
+
+def _check_interactive_goal(command: str) -> str | None:
+    """Reject hol_send commands that create a fresh interactive goal. None if allowed."""
+    if not _INTERACTIVE_GOAL_RE.search(_strip_noncode(command)):
+        return None
+    return (
+        "ERROR: hol_send BLOCKED — creating an interactive goal (g/gf/set_goal/"
+        "set_goalfrag/new_goalstack) reconstructs a proof in the SCRATCH session.\n"
+        "An interactive close says NOTHING about whether the FILE form replays "
+        "(hol4-proving RULE G/I): the two diverge silently on goal order, "
+        "prover-generated names, and type ambiguity, and are lost on compaction.\n"
+        "\n"
+        "Develop on the FILE instead:\n"
+        "  1. Write the proof attempt (or a `cheat`/`>- suspend` frontier) into "
+        "the *Script.sml.\n"
+        "  2. hol_state_at(line,col) — replays the file prefix in order, shows the "
+        "ACCURATE goal; probe with SHORT hol_send (ONE tactic) on that frontier.\n"
+        "  3. hol_check_proof — validate the file form.\n"
+        "Extract a stuck sub-fact as its own `Theorem foo[local]: ... QED` rather "
+        "than reconstructing its goal with `g`."
+    )
+
+
 def _check_proof_state_command(command: str) -> str | None:
     """Block hol_send commands that interact with proof state.
 
@@ -730,6 +792,13 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     tag/aconv/drop = ...` (shadows a HOL primitive for the rest of the
     session — bind a prefixed name like `val my_gs = ...` instead).
 
+    Also rejected: creating an interactive goal (g/gf/set_goal/set_goalfrag/
+    new_goalstack) — that reconstructs a proof in the scratch session, which
+    says nothing about whether the FILE form replays (RULE G/I) and diverges
+    silently. Develop on the file: hol_state_at to read the accurate goal,
+    Edit to change tactics, hol_check_proof to validate. Short e/ef probes on
+    an already-navigated frontier stay allowed.
+
     Args:
         command: SML command to execute
         session: Session name (default: "default")
@@ -744,6 +813,10 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
         return blocked
 
     blocked = _check_shadow_binding(command)
+    if blocked:
+        return blocked
+
+    blocked = _check_interactive_goal(command)
     if blocked:
         return blocked
 
@@ -1623,11 +1696,16 @@ async def hol_state_at(
                 lines.extend(_exception_advisory_lines(result.error))
             lines.append("")
             lines.append(
-                f"To localize: put `\\\\ cheat` partway through {range_str} and move "
-                f"it until the proof passes — the failure is in the last region the "
-                f"cheat covered. Or split the `>-`/`>|` arm into a Suspend/Resume so "
-                f"each piece is navigable. The goal shown below is the state "
-                f"ENTERING this opaque step, not the failure point."
+                f"To localize: SUB-SUSPEND the arm — replace the failing "
+                f"`>- (...)` / `>|` / `\\\\`-chain arm with `>- suspend \"X\"` and "
+                f"add `Resume thm[X]: cheat QED` after the parent QED. Each arm "
+                f"becomes a navigable Resume body whose prefix the FILE owns, so "
+                f"`hol_state_at` lands on the real goal. This is the DEFAULT for an "
+                f"opaque break (99% of the time). Do NOT bisect by moving a `cheat` "
+                f"through the chain, and do NOT reconstruct the goal with "
+                f"`hol_send`/`e`/`sg` (a scratch goal diverges from the file form). "
+                f"The goal shown below is the state ENTERING this opaque step, not "
+                f"the failure point."
             )
             if thm:
                 s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
@@ -1706,11 +1784,11 @@ async def hol_state_at(
         if opaque_multiline:
             error_footer = (
                 f"ERROR: PROOF BROKEN somewhere in the opaque step at {fail_str}. "
-                f"The line shown is the step's start, not the failure — bisect by "
-                f"splitting the step into per-goal `>- suspend \"X\"` sub-suspends "
-                f"(preferred: each becomes a navigable Resume body you validate "
-                f"independently, and the file owns the prefix), or `cheat` the "
-                f"frontier if you only need to locate the break."
+                f"The line shown is the step's start, not the failure — SUB-SUSPEND: "
+                f"split the step into per-goal `>- suspend \"X\"` sub-suspends, each a "
+                f"navigable Resume body you validate independently with the file "
+                f"owning the prefix. This is the default for an opaque break; do NOT "
+                f"bisect by moving a `cheat` through the chain."
             )
         else:
             error_footer = (
@@ -1990,9 +2068,15 @@ async def hol_check_proof(
                 if fe.end_offset is not None else sl)
             span = f"line {sl}" if el <= sl else f"lines {sl}-{el}"
             lines.append(
-                f"TIMEOUT: step {failed_idx + 1} spans {span} — split this "
-                f"span with `>- suspend` to shrink the lump, or raise the "
-                f"per-tactic timeout for a long-running but correct tactic."
+                f"TIMEOUT: step {failed_idx + 1} spans {span}. FIRST suspect a "
+                f"LOOPING tactic in this span — simp/fs/gvs/rw[<recursive_def>] "
+                f"without `Once` (unfolds forever, esp. under its own induction "
+                f"IH), a GSYM/symmetric-eq rewrite that oscillates, or an "
+                f"unbounded metis_tac/every_case_tac. Read the span and fix the "
+                f"loop (simp[Once <def>]; drop the GSYM; narrow the rewrite set) "
+                f"BEFORE assuming it is merely slow. If genuinely slow-but-correct: "
+                f"split with `>- suspend` to shrink the lump, or raise the "
+                f"per-tactic timeout."
             )
     elif final.goals_after == 0:
         self_cheat = _target_self_cheated_reason(cursor, theorem)
