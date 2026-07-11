@@ -307,9 +307,11 @@ Information tools (prefer these over hol_send probes):
 - hol_goals(): goal count + headlines; n=k for one goal, n=k asm=j for one
   assumption — replaces top_goals() dumps and length(top_goals()) probes
 
-hol_send is available for exploration and interactive proof attack — use it
-freely. For replaying tactics in a script file, hol_state_at is preferred
-because it handles checkpoints automatically.
+hol_send is for SMALL probes only: test-drive a small tactic block at a
+parked frontier, or fully close a small goal. NEVER drive a whole proof
+through it — interactive and file form diverge silently; going deep is
+suspend/Resume territory. For replaying tactics in a script file, use
+hol_state_at (it handles checkpoints automatically).
 
 Output notes:
 - "[auto-cheated deps: ...]" names prefix theorems that failed/timed out at
@@ -777,16 +779,18 @@ def _check_proof_state_command(command: str) -> str | None:
 async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX_OUTPUT, session: str = "default") -> str:
     """Send raw SML command to HOL session.
 
-    Use freely for exploration and interactive proof attack — try tactic
-    chains, inspect terms, check rewrites, evaluate expressions, query the
-    database. Persist successful chains back into the script file once they
-    work.
+    Scope: SMALL probes only — test-drive a small tactic block at a parked
+    frontier, fully close a small goal, inspect terms, check rewrites,
+    evaluate expressions. NEVER drive a whole proof through hol_send: the
+    interactive session and the file form diverge silently (prover-generated
+    names, >> vs \\, parens, simp-set order) and the proof gets redone.
+    Develop on the FILE — going deep means sub-suspend (>- suspend "X" +
+    Resume), then jump with hol_state_at.
 
     For navigating an existing script file (replaying tactics from theorem
-    start to a position), prefer hol_state_at — it handles file changes,
+    start to a position), use hol_state_at — it handles file changes,
     checkpoints, and tactic replay automatically. For goal counts/slices use
-    hol_goals; for DB searches use hol_search. hol_send is the right tool
-    for everything else, including stepping through partial tactics ad hoc.
+    hol_goals; for DB searches use hol_search.
 
     Rejected mechanically: `val gs/fs/rw/simp/e/b/g/it/concl/hyp/dest_thm/
     tag/aconv/drop = ...` (shadows a HOL primitive for the rest of the
@@ -947,8 +951,9 @@ async def hol_goals(
         workdir: Working directory for HOL (used with file).
         session: Session name (default: "default")
         skip_prefix: With line, bind prefix theorems by cheat (statement only)
-              instead of replaying — instant navigation in a cold/unbuilt theory.
-              See hol_state_at for the full semantics. (default: False)
+              instead of replaying — see hol_state_at for the full semantics.
+              Requires explicit user authorization (RULE K); never on your
+              own initiative. (default: False)
         timeout: With line, overall wall-clock budget (seconds) for the
               navigation; None uses the server default (HOL_STATE_AT_TIMEOUT /
               300s). On expiry HOL is interrupted and a TIMEOUT is returned
@@ -1548,7 +1553,9 @@ async def hol_state_at(
                       earlier proofs are slow or non-terminating. The target's
                       own tactics still replay, so its live goal is real, but it
                       rests on the skipped statements (NOT a verification).
-                      Toggling the mode forces a clean prefix reload. (default: False)
+                      Requires explicit user authorization (RULE K); never on
+                      your own initiative. Toggling the mode forces a clean
+                      prefix reload. (default: False)
         timeout: Overall wall-clock budget (seconds) for this navigation. None
                       uses the server default (HOL_STATE_AT_TIMEOUT / 300s). On
                       expiry the HOL process is interrupted (recoverable) and a
