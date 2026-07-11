@@ -83,8 +83,8 @@ def main():
     print("  TRY/ORELSE/FIRST hide failure -> restructure as `>~ [pat] >- suspend \"X\"`.", file=sys.stderr)
     print("  >| (THENL) is position-keyed -> split per subgoal via suspend/Resume.", file=sys.stderr)
     print("", file=sys.stderr)
-    print("Restructure the edit before retrying. To bypass globally, temporarily", file=sys.stderr)
-    print("comment out the H1 hook entry in ~/.claude/settings.json.", file=sys.stderr)
+    print("Restructure the edit before retrying. Pre-existing occurrences in a", file=sys.stderr)
+    print("theorem you are restructuring: ask the user how to proceed.", file=sys.stderr)
     return 2
 
 if __name__ == "__main__":
