@@ -45,7 +45,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H18 | ✅     | PreToolUse            | `mcp__hol4__hol_send\|Edit\|Write\|MultiEdit` | Block the `markerLib` suspension-lookup query (the `(string*thm) option` one — returns NONE in a bare session, tempts guessing the suspended goal); point to `set_suspended_goal` to actually load it |
 | H19 | ✅     | PreToolUse            | `mcp__hol4__hol_restart` | Block `hol_restart` without literal `restart ok` in the latest user message (RULE J / "effectively never"; transcript-aware, fail-open, same consent design as H14) |
 | H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥6 THEN-combinators, or ≥8 non-blank lines with ≥2 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
-| H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work (the HOL4 ruleset moved out of global CLAUDE.md into the skill, June 2026) |
+| H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work |
 | H23 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block the standalone-`prove` workflow in `hol_send` (`prove(` / `store_thm(` / `save_thm(` / `TAC_PROOF(`) — RULE I + RULE G: a proof closed in the scratch session with a hand-typed goal proves nothing about the file form; write a `Theorem … QED` or sub-suspend the arm (`>- suspend` + `Resume`) |
 
 Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22 → H23. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
@@ -655,7 +655,7 @@ hook input. Cleanup: weekly `find ~/.claude/hook-state -mtime +7 -delete`.
 
 ## See also
 
-- `~/.claude/skills/hol4-proving/SKILL.md` — the HOL4 proof-interaction rules these hooks enforce.
+- `../skills/hol4-proving/SKILL.md` (+ its `notes/`) — the HOL4 proof-interaction rules these hooks enforce; exposed globally via the `~/.claude/skills/hol4-proving` symlink.
 - `~/.claude/CLAUDE.md` — generic behavioural rules (editing/git — H14's source — memory-writing, working principles).
 - `~/research/cakes/CLAUDE.md` — CakeML workspace orientation.
 - `~/hol4-mcp/LOCAL_CHANGES.md` — local divergences of the running MCP server.

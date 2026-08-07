@@ -7,7 +7,7 @@ Detection: cwd (or up to 3 ancestors) contains a Holmakefile or .holpath, or
 cwd itself contains *Script.sml files. Stateless, advisory only, never blocks;
 silent (exit 0, no output) outside HOL4 directories and on any error.
 
-The HOL4 ruleset lives in ~/.claude/skills/hol4-proving/SKILL.md; the global
+The HOL4 ruleset lives in ~/hol4-mcp/skills/hol4-proving/SKILL.md; the global
 CLAUDE.md only carries a pointer. This hook is the mechanical safety net that
 makes the skill load on the FIRST attempt rather than after a violation.
 """
@@ -21,7 +21,7 @@ hol4-hook H22: HOL4 project detected (Holmakefile/.holpath/*Script.sml).
 Before ANY proof work this session -- writing a tactic, editing a *Script.sml,
 calling a hol_*/holmake MCP tool, or writing a HOL proof plan -- load the HOL4
 ruleset: invoke the hol4-proving skill (Skill tool), or Read
-~/.claude/skills/hol4-proving/SKILL.md. The rules apply on the FIRST attempt."""
+~/hol4-mcp/skills/hol4-proving/SKILL.md. The rules apply on the FIRST attempt."""
 
 MARKERS = ("Holmakefile", ".holpath")
 ANCESTOR_LEVELS = 3

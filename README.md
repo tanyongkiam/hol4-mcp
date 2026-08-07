@@ -162,6 +162,21 @@ hol4_mcp/
 - **FileProofCursor** — Parses theorems from file, loads dependencies via `holdeptool.exe`, replays tactics using HOL's `TacticParse.sliceTacticBlock`, and manages PolyML `SaveState` checkpoints for fast state restoration (~1.4MB per theorem checkpoint vs ~132MB base).
 - **Change detection** — SHA-256 content hashing. On file change, invalidates checkpoints/traces from the first changed line forward. Pre-theorem changes (imports, ancestors) trigger full session reinit.
 
+## Agent guidance (`skills/`, `hooks/`)
+
+The repo also carries the guidance an agent needs to *use* this server:
+
+- `skills/hol4-proving/` — the HOL4 proof-interaction ruleset (`SKILL.md`) and its
+  technique notes (`notes/`). It is deliberately NOT under `.claude/`: it is a
+  proof-work skill, not a skill for developing this server. Expose it to Claude
+  Code globally with a symlink:
+  `ln -s "$PWD/skills/hol4-proving" ~/.claude/skills/hol4-proving`.
+- `hooks/` — Claude Code hooks that enforce those rules mechanically at the tool
+  call; see `hooks/README.md` for the table and the `settings.json` wiring.
+
+Editing either? `skills/hol4-proving/notes/reference_hol4_docs.md` defines which
+layer owns which fact and the quality bar every entry must pass.
+
 ## Development
 
 ```bash
