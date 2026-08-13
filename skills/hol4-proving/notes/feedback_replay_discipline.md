@@ -33,7 +33,7 @@ Only with explicit user authorization for THAT use; a green result under it prov
 
 ## ⛔ A state_at / check_proof TIMEOUT is YOUR looping tactic — NOT a slow prefix
 A navigation/check that times out (or visibly hangs) is almost always a **looping tactic you just wrote**, not the already-built prefix (prefix theorems replay fast — they're cached/compiled). ⛔ Do NOT default to "the prefix is too slow"; that is the wrong first diagnosis and wastes the budget retrying with bigger timeouts.
-- **#1 cause: `simp`/`fs`/`gvs`/`rw[<recursive_def>]` WITHOUT `Once`** — recursive defs AND recursive semantics predicates unfold forever, worst inside their own induction. Fix + variants: [[feedback_hol4_mcp_proving]] §Tactic gotchas.
+- **#1 cause: `simp`/`fs`/`gvs`/`rw[<recursive_def>]` WITHOUT `Once`** — recursive defs AND recursive semantics predicates unfold forever, worst inside their own induction. Fix + variants: [[feedback_hol4_mcp_proving]] §Rewriting that loops, oscillates, or blows up.
 - Other loops: a `GSYM`/symmetric-equality rewrite that oscillates (`a=b` and `b=a` both in scope); an unbounded `metis_tac`/`every_case_tac`/distributive-`simp` blowup.
 - **Diagnose, don't widen the timeout**: put a `cheat` at the frontier *before your newest tactic*, navigate to THAT cheat (cheap) to read the goal, then fix the loop. Only if the cheat-frontier navigation is ALSO slow is the prefix/target genuinely heavy (then sub-suspend / raise `timeout=`). "Repeating the prefix-is-slow excuse" is the documented failure mode here.
 
@@ -78,7 +78,7 @@ A 30-line block belongs in the FILE (then `hol_state_at` past its QED to confirm
 | Body >200 steps and failing inline | `>- suspend "label"` + Resume block |
 
 ## `state_at` navigation limit and recovery
-`hol_state_at` treats `THEN1 (chain)` / `>- (chain)` as ONE step — it cannot land *inside* the parenthesized chain, by design. The output says so explicitly (`NOTE: target line N is INSIDE step k … state shown is this step's ENTRY`); broken opaque steps report a LINE RANGE with bisect advice, and timeouts name the lumped span to split.
+`hol_state_at` treats `THEN1 (chain)` / `>- (chain)` as ONE step — it cannot land *inside* the parenthesized chain, by design. The output says so explicitly (`NOTE: target line N is INSIDE step k … state shown is this step's ENTRY`); broken opaque steps report a LINE RANGE with sub-suspend advice (the tool explicitly says NOT to bisect by moving a `cheat`), and timeouts name the lumped span to split.
 
 Recovery (preference order):
 1. **Sub-suspend restructure**: replace `THEN1 (body_with_cheat)` with `>- suspend "ArmLabel"` + `Resume thm[ArmLabel]: body_with_cheat QED`. After leaves close, inline back per [[feedback_suspend_resume]].

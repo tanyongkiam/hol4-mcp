@@ -19,8 +19,12 @@ HOOK_EVENT = "PostToolUse"
 HOOK_MATCHER = "mcp__hol4__hol_state_at"   # None = all calls for this event
 
 import json
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_payload import output_text  # noqa: E402
 
 THRESHOLD_MS = 30_000
 
@@ -40,26 +44,9 @@ If you find yourself re-running hol_state_at on this body:
   - Sub-suspend the frontier (primary fix): `>- suspend "Label"` +
     `Resume thm[Label]: cheat QED` after the parent QED. Replay scope shrinks
     to the body only, and the file owns the prefix.
-  - For a quick check, `hol_send` SMALL probes (a single `e`/`ef` tactic) at the
-    already-parked frontier -- NOT `eall`/`expandf` (all-goals drivers misfire
-    on a goalfrag), NOT a re-sent chain (RULE I/G)."""
-
-def extract_output_text(payload):
-    candidates = []
-    for key in ("tool_output", "tool_response", "result", "output", "response"):
-        v = payload.get(key)
-        if v is None:
-            continue
-        if isinstance(v, str):
-            candidates.append(v)
-        elif isinstance(v, dict):
-            candidates.append(json.dumps(v))
-        elif isinstance(v, list):
-            for item in v:
-                candidates.append(item if isinstance(item, str) else json.dumps(item))
-        else:
-            candidates.append(str(v))
-    return "\n".join(candidates)
+  - For a quick check, `hol_send` SMALL probes (a single `e` tactic) at the
+    already-parked frontier -- NOT `eall`/`ef`/`expandf` (all-goals drivers
+    misfire on a goalfrag), NOT a re-sent chain (RULE I/G)."""
 
 def main():
     try:
@@ -68,7 +55,7 @@ def main():
         return 0
     if payload.get("tool_name", "") != "mcp__hol4__hol_state_at":
         return 0
-    text = extract_output_text(payload)
+    text = output_text(payload)
     if not TIMING_LINE_RE.search(text):
         return 0  # error path: no replay happened
     if CACHE_HIT_RE.search(text):

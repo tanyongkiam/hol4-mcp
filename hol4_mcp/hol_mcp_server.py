@@ -800,8 +800,10 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     new_goalstack) — that reconstructs a proof in the scratch session, which
     says nothing about whether the FILE form replays (RULE G/I) and diverges
     silently. Develop on the file: hol_state_at to read the accurate goal,
-    Edit to change tactics, hol_check_proof to validate. Short e/ef probes on
-    an already-navigated frontier stay allowed.
+    Edit to change tactics, hol_check_proof to validate. Short single-goal `e`
+    probes on an already-navigated frontier stay allowed; `ef` does not count
+    as one — it takes a frag_tactic, so running a tactic through it means
+    goalFrag.expand/expandf, which apply to EVERY goal in the fragment.
 
     Args:
         command: SML command to execute
@@ -1943,10 +1945,17 @@ async def hol_check_proof(
     trace: bool = True,
     session: str = "default",
 ) -> str:
-    """Check if a theorem's proof completes after editing.
+    """Confirm a theorem's proof completes. END-OF-THEOREM ONLY.
 
-    Use this after editing a proof to see if it works now. More reliable than
-    hol_state_at with line numbers which may be stale after edits.
+    Replays from the theorem's start with the per-theorem timeout, so it costs
+    the same as holmake at theorem granularity and localizes nothing: a failure
+    inside an opaque `>- (...)` / chained arm is reported as the whole lumped
+    step. Call it once, when every chunk has already been stepped through and
+    you expect OK — not to "see if it closes", and not to find what broke.
+
+    To DEVELOP or DIAGNOSE instead: hol_state_at reads the live goal, and
+    sub-suspending an opaque arm (`>- suspend "X"` + `Resume thm[X]: cheat QED`)
+    gives the failure its own navigable body.
 
     Args:
         theorem: Theorem name to check

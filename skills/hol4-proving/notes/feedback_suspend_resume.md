@@ -1,6 +1,6 @@
 ---
 name: feedback_suspend_resume
-description: HOW to dispatch across goals, HOW to inline cleanly, multi-Resume cheat-tag recovery. Rules themselves live in the hol4-proving skill.
+description: HOW to dispatch across goals, HOW to inline cleanly, and how to recover a lost suspension / "No such label". Rules themselves live in the hol4-proving skill.
 metadata:
   type: feedback
 ---
@@ -27,10 +27,10 @@ Correct forms — `>-` (THEN1) sits immediately before every `suspend`:
 ⚠️ **Common trap**: `tac1 >- tac2 >- suspend "L"` is **NOT** chain-on-first-goal. It's left-associative `(tac1 >- tac2) >- suspend "L"`: tac2 closes tac1's FIRST subgoal, then suspend closes the SECOND. Only fires correctly when tac1 leaves ≥2 subgoals. For chain-on-single-goal, use `tac1 >> tac2 >- suspend "L"` (no inner `>- suspend` after intermediate transforming tactics).
 
 ## ⛔ Committed form: a GENUINE multi-arm induction keeps ONE Resume per CASE; everything else fully inlines
-Rule owner: skill Gate 1 — committed default is ONE `Proof … QED` (no suspend/Resume/Finalise); the ONLY keepers are (a) a genuine multi-arm `recInduct`/`Induct`/`Cases_on` proof, kept as EXACTLY one `>- suspend "Ctor"` + `Resume thm[Ctor]:` per dispatch case, or (b) an explicitly user-approved level-2 sub-suspend. A single deferred tail NEVER qualifies ("the label matches / isn't an orphan" is the trap).
+Rule owner: **skill Gate 1** — it defines the committed default and the two keeper cases; do not re-derive them here. What Gate 1 leaves to craft, and this section supplies: for a keeper induction, the shape is EXACTLY one `>- suspend "Ctor"` + `Resume thm[Ctor]:` per dispatch case.
 - **Refactor a monolithic proof to the per-case shape FIRST, before fixing anything.** A `recInduct`/`Induct`/`Cases_on` proof that is one opaque `\\`-chain dispatching by `THEN1 (...)`/`>- (...)` replays as a single step `hol_state_at` can't enter ("target INSIDE step 0"), so you can't read any arm's goal. Convert EVERY case — including already-passing arms (else the prefix still replays opaquely and a regression in a "passing" arm hides), whether the break is in old arms or new ones (datatype gained a case; `evaluate_def`/`_ind` regenerated). Bonus: each Resume re-validates with a short arm-only replay, not the whole-file one.
 - **Keep the per-case Resume bodies** — even trivial ones stay (the flat ladder of Resume blocks IS the committed table-of-contents); do NOT collapse them back into a monolithic `THEN1 (arm)` chain.
-- **But inline sub-suspends back into their case-Resume** — labels nested *inside* one case for dev navigation are dev scaffolding (Gate 1); "build passes" / "precedent" do not license them. Keeper (b) is approval-gated PER INSTANCE; absent approval, inline (innermost-first, §Inlining technique below), however large the case.
+- **But inline sub-suspends back into their case-Resume** — labels nested *inside* one case for dev navigation are dev scaffolding (Gate 1); "build passes" / "precedent" do not license them. Keeper (b) is approval-gated PER INSTANCE; absent approval, inline (innermost-first, §Inlining technique), however large the case.
 
 ## ⛔ No-overengineering — minimal dispatcher, observe, then add
 Before writing a multi-arm dispatcher with sub-suspends, **write the trivial body first** and observe what survives `Cases_on x >> simp []`. Half the arms you anticipate often close by simp itself; the rest often need just one inline chain. Sub-suspends are scaffolding for cases you actually CAN'T close inline — not a default partitioning device. (Local instance of CLAUDE.md "Fall back to simpler, not fancier".)
@@ -84,4 +84,4 @@ When inlining `suspend "X"` / `Resume thm[X]: <body> QED`:
 **Script-based inline-back of a large case tree**: use a FIXPOINT leaf-inliner — repeatedly inline any sub-suspend whose body has no further `>- suspend` (a leaf), until only the top-level case Resumes remain; this auto-handles arbitrary nesting with no manual innermost-first ordering. ⛔ Make the wrapper SHAPE-AWARE: if the body is already exactly one balanced `( … )` group (the common leaf), emit `>- body`, not `>- (body)` — the extra layer leaves redundant `>- ((X))` / cascading `))` to strip later. And flatten each dispatcher's FINAL arm onto the main thread (`\\`-chain) when it is the main line of reasoning, per step 2 above. (A positional "first paren group" extractor mishandles dispatcher bodies that aren't single groups; a parenthesis-balance walk handles both.)
 
 ## `>~` gvarify pitfalls
-See [[feedback_hol4_mcp_proving]] §`>~`/`>>~-` gvarify trap. Patterns must use `_` wildcards for any name that should NOT rename context; qualify overloaded constructors `Module$Con`.
+See [[feedback_hol4_mcp_proving]] §gvarify trap. Patterns must use `_` wildcards for any name that should NOT rename context; qualify overloaded constructors `Module$Con`.

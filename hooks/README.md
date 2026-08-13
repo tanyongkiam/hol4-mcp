@@ -49,9 +49,10 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H23 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block the standalone-`prove` workflow in `hol_send` (`prove(` / `store_thm(` / `save_thm(` / `TAC_PROOF(`) — RULE I + RULE G: a proof closed in the scratch session with a hand-typed goal proves nothing about the file form; write a `Theorem … QED` or sub-suspend the arm (`>- suspend` + `Resume`) |
 | H24 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Advise (never block) on newly-defined tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) in `*Script.sml` — lifting a tactic needs a strong stated justification; defaults are lift a LEMMA or leave the duplication. Diff-aware on binding names; `*Lib.sml`/`*Syntax.sml` out of scope by the path test |
 | H25 | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|mcp__hol4__hol_state_at\|mcp__hol4__holmake` | Sweep finished proof text for composition defects (adjacent normalisers, `impl_tac` sandwich, `>-` not marking a sibling, near-identical sibling arms, nested splitter ladders, n-ary tactic forms, self-feeding lambdas). Fires per theorem on `hol_check_proof` → `Status: OK`; counts-only backstop on `holmake` for git-modified scripts. Advisory; checks live in `proof_sweep.py` |
-| H26 | 📝     | PostToolUse           | `mcp__hol4__hol_check_proof` | **Proposed.** On FAILED/TIMEOUT, match the FAILING TACTIC against a symptom→cause table and inject the specific corpus fact, where H6 today injects only a generic reminder. Deferred until the tactic-smell audit completes |
+| H26 | ✅     | —                     | —                      | **Implemented inside H6**, not as its own hook: it fires on the same event with the same payload, so a separate hook would mean two messages on one failure. See "The symptom table" under H6 |
 
-Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22 → H23 → H24 → H25. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
+Skipped: H2, H3, H5, H9, H11, H12, H13, H15. H21 (holmake-on-cheated-theory
+blocker) was proposed and rejected. H4 is the only live proposal.
 
 The live wiring is `~/.claude/settings.json`; `install_hooks.py --check`
 reports any drift between it and the scripts in this directory.
@@ -91,10 +92,9 @@ From the `hol4-proving` skill (`HOL4 — banned tactics` section; formerly in `~
 
 The diff-based check means a pre-existing `TRY` carried verbatim through an
 edit does NOT trigger the hook — only **newly introduced** occurrences do.
-This matches the rule: *"Pre-existing TRY / ORELSE / `>|` in untouched
-theorems is acceptable until that theorem itself is restructured. Any banned
-tactic you authored or copied this session inside a discharged region is a
-discharge violation."*
+This mirrors Gate 5 in the skill, which tolerates pre-existing uses until the
+theorem is restructured and treats anything you authored or copied this
+session inside a discharged region as a violation.
 
 ### Bypass
 
@@ -127,68 +127,76 @@ hot-reload).
   where `TRY` is used as an SML identifier rather than a banned tactic, the
   hook will still fire — comment it out in settings.json for that session.
 
-## H6 — post-`hol_check_proof` failure reminder
+## H6 — post-`hol_check_proof` failure reminder + symptom hint
 
 **File**: `h6_check_proof_failure.py`
 **Event**: `PostToolUse`
 **Matcher**: `mcp__hol4__hol_check_proof`
-**Effect**: never blocks. On a failed `hol_check_proof` invocation, injects a
-terse system reminder citing RULE C and the sub-suspend pattern.
+**Effect**: never blocks. Injects a RULE C reminder on a failed
+`hol_check_proof`, plus — when the failing tactic matches the symptom table —
+the corpus fact that explains that symptom.
 
 ### What triggers it
 
-The hook scans the PostToolUse `tool_output` / `tool_response` payload for any
-of these regexes:
+A failure signature in the tool result: `TIMEOUT after Ns`, `Status: FAILED`,
+`Status: INCOMPLETE`, `Status: ERROR`, `<-- FAILED`, `Tactic execution failed`,
+`PROOF BROKEN`. Miss → silent exit 0.
 
-- `TIMEOUT after Ns`
-- `Status: FAILED`
-- `Status: INCOMPLETE` (the real hol4-mcp failure-state status string)
-- `Status: ERROR`
-- `<-- FAILED` (per-step annotation in the trace)
-- `Tactic execution failed`
-- `PROOF BROKEN`
+`Status: CHEAT (not verified)` is intentionally **not** a trigger — reaching a
+parked `cheat` is the expected result of the cheat-the-frontier pattern
+(hol4-proving skill RULE I), not a failure.
 
-Hit → inject reminder via `hookSpecificOutput.additionalContext`. Miss → silent
-exit 0.
+Exact wording of the reminder lives in the hook (`REMINDER`); it is not
+duplicated here, so the two cannot drift.
 
-`Status: CHEAT (not verified)` is intentionally **not** a trigger — that's a
-legitimate cheat-probing return per the cheat-probing pattern (feedback_hol4_mcp_proving).
+### The symptom table
 
-### What the reminder says
+The corpus already contains the facts that would prevent the most expensive
+debugging detours — and they still do not reach the point of use. Two
+structural reasons, neither fixable by wording: **volume vs recall** (dense
+facts read at session start are not available at hour six), and **indexed by
+cause, searched by symptom** (sections are named for causes; at the moment of
+failure the cause is the ANSWER, not the question). H6 already fires at the
+right moment and already has the failing tactic in its payload.
 
-```
-hol4-hook H6: hol_check_proof returned FAILED / TIMEOUT.
+| failing tactic | failure shape | injected hint |
+|---|---|---|
+| `qpat_x_assum` / `qpat_assum` / `rename1` / `qmatch_*` | raised | pattern no longer matches: a prover-generated name that got re-rolled, or a tyvar mismatch that prints identically |
+| `drule*` / `irule*` / `match_mp_tac` / `mp_then` | raised | free tyvar in the lemma's OWN statement; or the constant is `[simp]`-tagged and no longer an atom; or the assumption is not yet in the lemma's shape |
+| `simp` / `simp_tac` / `asm_simp_tac` / `srw_tac` | left goals | `simp` uses assumptions as they stand; `fs`/`gvs`/`rw` simplify them first — and split a disjunctive assumption |
 
-Per hol4-proving skill RULE C, hol_check_proof is NOT a diagnosis tool — do
-not re-run it to localize the failure.
-  - Failure inside an opaque `THEN1 (...)` / `>- (...)` / `\\`-chain (the usual
-    case)? SUB-SUSPEND the failing arm NOW — FIRST move, not after a second
-    attempt: `>~ [pat] >- suspend "Label"` (or `>- suspend "Label"`) +
-    `Resume thm[Label]: cheat QED` after the parent QED. Then `hol_state_at`
-    lands on the real goal — the file owns the prefix. This is the default
-    (~99% of opaque breaks).
-  - FLAT body, no `>-`/chain above the frontier? Read with `hol_state_at`.
-  - Do NOT bisect by moving a `cheat` through the chain, and do NOT
-    reconstruct the goal with `hol_send`/`e`/`sg`/`expandf` — a scratch goal
-    diverges silently from the file form (RULE G), and the all-goals drivers
-    (`expandf`/`Manager.expand`) are banned.
+**Calibration.** The hint fires only when all of these hold, because a hint
+that is wrong at the moment of failure is worse than silence — it is read when
+trust is highest:
 
-Re-running hol_check_proof on the same theorem without sub-suspending is a
-RULE C violation: the failure location stays hidden inside the opaque
-"Tactic execution failed" wrapper.
-```
+- the failing step is **short** (≤200 chars) — a token buried in a lumped
+  opaque arm is not evidence about that arm, and the server already tells you
+  to sub-suspend those;
+- the matched tactic is the step's **first** one — a tactic after a combinator
+  may never have run;
+- the **failure shape matches the row**. `raised` rows need a HOL_ERR /
+  exception signature, so a matcher that ran fine and merely left goals gets
+  nothing. The `simp` row needs the opposite: goals left, no exception. No row
+  matches a TIMEOUT — the server already prints a looping-tactic advisory
+  there, and a second opinion on top of it is noise.
+
+Rows deliberately exclude `fs`/`gvs`/`rw`: for those the simp hint is not just
+unhelpful but false. `srw_tac` counts as `rw` and is excluded with it — in
+`bossLib`, `srw_tac` is `BasicProvers.srw_tac` and `rw` is `PRIM_SRW_TAC`,
+the same family.
 
 ### Limitations / known unknowns
 
 - The PostToolUse JSON schema for MCP tool results is not canonical across
-  Claude Code versions. The hook scans several plausible field names
-  (`tool_output`, `tool_response`, `result`, `output`, `response`) and
-  serialises dict/list shapes to JSON before searching. If a future version
-  uses a name not in that list, the trigger silently doesn't fire — failing
-  open is the right default.
+  Claude Code versions. `hook_payload.output_text` scans several plausible
+  field names and collects every string leaf. If a future version uses a name
+  outside that list the trigger silently doesn't fire — failing open is the
+  right default.
 - No dedupe. If you fail `hol_check_proof` 5 times in a row on the same
   theorem, you get 5 reminders. Each says the same useful thing — that's
   intentional.
+- The hint is keyed on the failing tactic alone. It cannot see the goal, so
+  it is a checklist to run, not a verdict; it says so.
 
 ## H8 — `hol_state_at` replay-cost nudge
 
@@ -214,26 +222,11 @@ Skips (silent exit 0):
 
 ### What the reminder says
 
-```
-hol4-hook H8: hol_state_at replay took <N.N>s on <file>.
-
-A single slow replay can be legitimate (cold cache, first call on a large
-file, no incremental reuse available). The anti-pattern flagged by the hol4-proving skill
-cost-discipline trigger is REPEATEDLY running expensive hol_state_at calls
-on the same body -- that's "burning replay time".
-
-If you find yourself re-running hol_state_at on this body:
-  - Sub-suspend the frontier (primary fix): `>- suspend "Label"` +
-    `Resume thm[Label]: cheat QED` after the parent QED. Replay scope shrinks
-    to the body only, and the file owns the prefix.
-  - For a quick check, `hol_send` SMALL probes (a single `e`/`ef` tactic) at the
-    already-parked frontier -- NOT `eall`/`expandf` (all-goals drivers misfire
-    on a goalfrag), NOT a re-sent chain (RULE I/G).
-```
-
-The wording explicitly acknowledges that a single slow call may be legitimate
-(first touch, cold cache), so the reminder is conditional advice rather than
-a per-call accusation.
+Points at the two cheap alternatives — sub-suspend the frontier, or `hol_send`
+SMALL probes at the already-parked frontier — and explicitly acknowledges that
+a single slow call may be legitimate (first touch, cold cache), so it reads as
+conditional advice rather than a per-call accusation. Exact wording lives in
+the hook (`REMINDER_TEMPLATE`).
 
 ### Threshold rationale
 
@@ -294,17 +287,8 @@ applies the edit virtually) and fires only when a Resume theorem name is
 
 ### Reminder content
 
-Single missing theorem:
-```
-hol4-hook H10: Resume <thm> added; insert `Finalise <thm>;` after the last
-Resume block now (hol4-proving skill Gate 2).
-```
-
-Multiple:
-```
-hol4-hook H10: Resume blocks for <thm1>, <thm2> added without Finalise.
-Insert `Finalise <thm>;` placeholders now (hol4-proving skill Gate 2).
-```
+Names the theorem(s) missing a `Finalise` and cites Gate 2; separate wordings
+for the one-theorem and several-theorem cases. Exact text lives in the hook.
 
 ## H14 — destructive git ops require `git ok` consent
 
@@ -317,9 +301,11 @@ message in the session transcript.
 
 ### Destructive verb list
 
-Matched after `git `:
-`commit`, `push`, `stash`, `revert`, `reset`, `checkout`, `restore`, `clean`,
-`rm`, `mv`, `pull`, `merge`, `rebase`, `cherry-pick`.
+Matched after `git` **and any global options it carries** — `git -C dir commit`,
+`git --no-pager push` and `git -c k=v commit` all reach the verb, so the
+options are not a bypass:
+`commit`, `push`, `stash`, `revert`, `reset`, `checkout`, `switch`, `restore`,
+`clean`, `rm`, `mv`, `pull`, `merge`, `rebase`, `cherry-pick`, `apply`, `am`.
 
 Plus: `git branch -D`, `git branch -d`, `git branch --delete`.
 
@@ -380,12 +366,14 @@ the SAME label into one combined goal at Resume time. Display rendering of
 bundled.
 
 This is symptomatic of:
-- A dispatcher that uses the same `suspend "Label"` on multiple arms
+- A dispatcher that routes the same `suspend "Label"` to multiple arms
   (`>~ [pat_a] >- suspend "X" >~ [pat_b] >- suspend "X"` …). Each arm's
-  residual gets tagged identically, and Resume sees them merged.
+  residual gets tagged identically, and Resume sees them merged. This covers
+  the alike-patterns case too: a single `>~ [pat] >- tac` arm runs on the
+  FIRST match only, so bundling means two arms reached one label, not one arm
+  firing twice.
 - A `>>` (THEN) distributing across multiple residual goals before
   `suspend "Label"`, bundling them.
-- A `>~ [pat] >- suspend "Label"` whose pattern matches more than one goal.
 
 Bundled goals cannot be decomposed cleanly with standard HOL tactics —
 the user must split the dispatcher into per-arm labels (one label = one
@@ -393,23 +381,9 @@ goal) so each Resume body sees a single goal.
 
 ### What the reminder says
 
-```
-hol4-hook H16: goal display contains `⅋ᵣ` / `resconj` -- multiple
-subgoals are bundled into one Resume body.
-
-Cause is one of:
-  - The parent dispatcher used the SAME `suspend "Label"` on MULTIPLE arms.
-    ...
-  - A `>>` (THEN) distributed over residual goals before `suspend "Label"`,
-    bundling them.
-  - A `>~ [pat] >- suspend "Label"` pattern matched and fired more than
-    once because subsequent dispatcher arms have the same pattern shape.
-
-Fix:
-  - Split the suspended arms by giving each its OWN label
-    (`suspend "Label_NONE"`, `suspend "Label_Break"`, ...), and write a
-    Resume body per label. ...
-```
+Lists the three causes above and the fix — give each suspended arm its OWN
+label and write one Resume body per label — and warns against attacking the
+merged `resconj` goal directly. Exact text lives in the hook.
 
 ### Limitations
 
@@ -417,9 +391,8 @@ Fix:
   artifact that intentionally references `resconj` (e.g. a meta-discussion
   via `term_to_string`) would also fire — acceptable, since there's no
   legitimate reason to ship code containing the symbol.
-- Same `tool_output`/`tool_response` / `result` / `output` / `response`
-  field-name fallback as H6/H8; uses `ensure_ascii=False` so the U+214B
-  marker survives dict serialisation.
+- Depends on `hook_payload.output_text` keeping strings raw: JSON-escaping the
+  payload would hide the U+214B marker and silently disable the hook.
 
 ## H17 — non-canonical `suspend` blocker
 
@@ -497,56 +470,6 @@ Fires on any occurrence of the banned token, including in a memory note or
 comment about the ban itself (this README phrases around it for that reason).
 Acceptable — the token has no legitimate use in committed proof work.
 
-## H26 — symptom-matched hint on failure (proposed)
-
-**File**: `h26_symptom_hint.py` (not yet written)
-**Event**: `PostToolUse`
-**Matcher**: `mcp__hol4__hol_check_proof`
-
-### Why
-
-The corpus already contains the facts that would prevent the most expensive
-debugging detours, in files marked **MUST READ before ANY proof work** — and they
-still do not reach the point of use. Observed repeatedly in one session: a
-polymorphic-tyvar mismatch was rediscovered by debugging although the note
-describes that exact symptom ("while PRINTING identically"); `simp` vs `fs` was
-rediscovered although a section covers it.
-
-Two structural reasons, neither fixable by wording:
-
-1. **Volume vs recall.** ~40 dense facts read at session start are not available at
-   hour six under load. This is retrieval, not compliance.
-2. **Indexed by cause, searched by symptom.** Sections are named for causes
-   ("Polymorphic constructors"). At the moment of failure the query is
-   "`drule` didn't match a lemma that obviously applies" — the cause is the
-   ANSWER, not the question.
-
-H6 already fires at the right moment and already has the failing tactic in its
-payload; it just says nothing about it.
-
-### The table (each entry measured, not guessed)
-
-| failing tactic | likely cause | corpus section |
-|---|---|---|
-| `drule` / `drule_all` / `match_mp_tac` / `irule` not matching a plainly applicable lemma | a free tyvar in the lemma's OWN statement; or the constant was `[simp]`-tagged so it is no longer an atom in the assumptions | §Polymorphic constructors; §`[simp]` removes the atom |
-| `simp [...]` made no progress though the needed fact is an assumption | `simp` uses assumptions as they stand; `fs`/`gvs` simplify them first | §simp vs assumptions |
-| `qpat_x_assum` / `rename1` / `qmatch_*` raised | the pattern no longer matches: a prover-generated name, or a tyvar mismatch that prints identically | §Prover-generated names; §Polymorphic constructors |
-
-### Calibration
-
-Advisory, never blocks (PostToolUse cannot). Must fire ONLY on a table match, not
-on every failure — an unmatched failure keeps H6's generic reminder and nothing
-more. Validate against real failing calls before shipping: a hint that is wrong
-at the moment of failure is worse than silence, because it is read when trust is
-highest.
-
-### Fallback for what the hook cannot match
-
-A **symptom index** at the head of `feedback_hol4_mcp_proving.md` — ten lines of
-"symptom → section" — so the file is enterable from where the reader actually is
-when the hook does not match. Cheap, and useful independently of H26.
-
-
 ## Installing the full suite
 
 The scripts in this directory are dormant until wired into Claude Code's
@@ -561,7 +484,7 @@ The scripts in this directory are dormant until wired into Claude Code's
 ~/hol4-mcp/hooks/install_hooks.py --print  # emit the JSON block for a manual merge
 ```
 
-`install_hooks.py` discovers every `h*.py` beside it and reads the
+`install_hooks.py` discovers every `h<N>_<name>.py` beside it and reads the
 registration each hook declares at module level:
 
 ```python
@@ -576,9 +499,11 @@ imported, so a broken hook cannot execute during install.
 
 Merging is idempotent and additive: entries already pointing at a hook are left
 alone, entries for scripts outside this directory are never touched, and a
-timestamped backup of `settings.json` is written before any change. Merging by
-hand also works — JSON has no multiple `hooks` keys, and a trailing comma makes
-the whole block vanish with no warning.
+timestamped backup of `settings.json` is written before any change. Backups
+accumulate one per change — sweep them occasionally with
+`rm ~/.claude/settings.json.bak.*`. Merging by hand also works — JSON has no
+multiple `hooks` keys, and a trailing comma makes the whole block vanish with
+no warning.
 
 
 ### Manual / single-hook wiring
@@ -598,7 +523,7 @@ malformed (typically a trailing comma); fix and retry.
 
 ```bash
 # Confirm each script is executable and parses
-for f in ~/hol4-mcp/hooks/h*.py; do
+for f in ~/hol4-mcp/hooks/*.py; do
   python3 -c "import ast; ast.parse(open('$f').read())" && echo "ok: $f"
 done
 
@@ -608,6 +533,11 @@ python3 -c "import json; json.load(open('$HOME/.claude/settings.json'))" \
 
 # Confirm every hook here is wired and no wired hook has vanished
 ~/hol4-mcp/hooks/install_hooks.py --check
+
+# Confirm the guidance these hooks cite still resolves (links, §sections,
+# paths, H-numbers) — a hook message naming a renamed section is a dead
+# reference the model reads at the worst possible moment
+~/hol4-mcp/skills/hol4-proving/corpus_check.py
 ```
 
 ### Disabling
@@ -627,14 +557,29 @@ Reference: <https://docs.claude.com/en/docs/claude-code/hooks>.
   tool error.
 - **JSON on stdout** (exit 0) can inject `hookSpecificOutput.additionalContext`
   to add context visible to the model.
-- Hook should be fast (default timeout 10 min, but set explicit `timeout` in
-  settings.json — H1 uses 5s).
+- Hook should be fast. A per-entry `timeout` may be set in settings.json;
+  none of these hooks does, so all run under Claude Code's default. Every hook
+  here returns in well under a second, so the default is not a constraint.
+
+## Shared modules
+
+Two files here are **not** hooks — `install_hooks.py` discovers only
+`h<N>_<name>.py`, so a plain name is never wired by accident:
+
+- `hook_payload.py` — `output_text(payload)` (a PostToolUse result flattened to
+  searchable text, strings kept raw) and `latest_user_message(payload)` (newest
+  real user turn, for the consent-gated hooks). Every hook that reads a payload
+  uses these; reimplementing one is how the copies drift apart.
+- `proof_sweep.py` — the composition checks H25 runs, also usable standalone:
+  `./proof_sweep.py FILE [FIRST_LINE LAST_LINE]`.
 
 ## Per-session state
 
-Hooks needing cross-call state (H5, H7, H8) will use
-`~/.claude/hook-state/<session_id>/` keyed by the `session_id` field on the
-hook input. Cleanup: weekly `find ~/.claude/hook-state -mtime +7 -delete`.
+H25 caches the last file any hol4 call named under
+`~/.claude/hook-state/<session_id>/`, keyed by the `session_id` field on the
+hook input — `hol_check_proof` is usually called without `file=`, so without
+the cache the sweep has nothing to read. Every other hook is stateless.
+Cleanup: weekly `find ~/.claude/hook-state -mtime +7 -delete`.
 
 ## See also
 

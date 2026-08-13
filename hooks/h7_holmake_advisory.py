@@ -26,9 +26,11 @@ If you reached for holmake to check progress mid-proof, STOP. Use the
 end-of-proof verification ladder instead:
   - Per-theorem: hol_state_at past QED shows "No goals (proof complete)"
     OR hol_check_proof returns Status: OK.
-  - Cheat-tag check (multi-Resume theorems): Tag.dest_tag (Thm.tag <thm>)
-    returns (["DISK_THM"], []).
   - Per-file: only after every theorem passes the above, holmake ONCE.
+
+A theorem with surviving Resume blocks also needs its `Finalise <thm>;`
+(skill Gate 2) -- without it the theorem stays cheated even when every
+Resume body is OK.
 
 If this holmake call was the legitimate end-of-file gate or a setup step
 to unstick a stale .dat dependency, disregard."""

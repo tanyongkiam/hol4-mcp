@@ -3,7 +3,8 @@
 H20 -- PreToolUse hook on mcp__hol4__hol_send that BLOCKS sending a massive
 tactic chain, and points to file persistence instead.
 
-Rationale (hol4-proving skill RULE I + 'HOL4 -- replay cost discipline'): the
+Rationale (hol4-proving skill RULE I + the cost-discipline trigger at the end
+of 'HOL4 -- iteration loop'): the
 interactive proofManagerLib session is SCRATCH, not storage. A large tactic
 chain (a `proofManagerLib.e(...)` / `e(...)` / `expand` / replay of a whole
 proof body) does NOT belong in hol_send:

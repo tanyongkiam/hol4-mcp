@@ -22,8 +22,12 @@ HOOK_EVENT = "PostToolUse"
 HOOK_MATCHER = "mcp__hol4__hol_state_at|mcp__hol4__hol_send|mcp__hol4__hol_check_proof"   # None = all calls for this event
 
 import json
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_payload import output_text  # noqa: E402
 
 # Display marker: U+214B (TURNED AMPERSAND) followed by U+1D63 (SUBSCRIPT R).
 DISPLAY_MARKER = "⅋ᵣ"
@@ -36,44 +40,25 @@ hol4-hook H16: goal display contains `⅋ᵣ` / `resconj` -- multiple
 subgoals are bundled into one Resume body.
 
 Cause is one of:
-  - The parent dispatcher used the SAME `suspend "Label"` on MULTIPLE arms.
-    Each arm's residual goal got tagged identically, and Resume now sees
-    them merged via `resconj`. Canonical: ONE label = ONE goal.
+  - The SAME `suspend "Label"` reached MULTIPLE arms -- literally repeated
+    across dispatcher arms, or two `>~ [pat]` arms whose patterns are shaped
+    alike so both route to the same label. Each arm's residual goal got
+    tagged identically, and Resume now sees them merged via `resconj`.
+    Canonical: ONE label = ONE goal. (One `>~ [pat] >- tac` arm cannot fire
+    twice -- it runs on the FIRST match only.)
   - A `>>` (THEN) distributed over residual goals before `suspend "Label"`,
     bundling them.
-  - A `>~ [pat] >- suspend "Label"` pattern matched and fired more than
-    once because subsequent dispatcher arms have the same pattern shape.
 
 Fix (hol4-proving skill 'HOL4 - suspend/Resume/Finalise'):
   - Split the suspended arms by giving each its OWN label
     (`suspend "Label_NONE"`, `suspend "Label_Break"`, ...), and write a
     Resume body per label. The bundled `resconj` goal then decomposes
     into per-arm subgoals you can discharge independently.
-  - If the same `>~ [pat]` matched multiple goals, refine the pattern with
-    a discriminating sub-term so the arms separate (or `Cases_on` upstream
+  - If two `>~ [pat]` arms are shaped alike, refine one pattern with a
+    discriminating sub-term so the arms separate (or `Cases_on` upstream
     to drive the goals into distinct shapes).
   - Do NOT try to attack the merged `resconj` goal directly; the structure
     is not user-facing and standard tactics don't decompose it cleanly."""
-
-def extract_output_text(payload):
-    candidates = []
-    for key in ("tool_output", "tool_response", "result", "output", "response"):
-        v = payload.get(key)
-        if v is None:
-            continue
-        if isinstance(v, str):
-            candidates.append(v)
-        elif isinstance(v, dict):
-            candidates.append(json.dumps(v, ensure_ascii=False))
-        elif isinstance(v, list):
-            for item in v:
-                candidates.append(
-                    item if isinstance(item, str)
-                    else json.dumps(item, ensure_ascii=False)
-                )
-        else:
-            candidates.append(str(v))
-    return "\n".join(candidates)
 
 TARGET_TOOLS = {
     "mcp__hol4__hol_state_at",
@@ -88,7 +73,7 @@ def main():
         return 0
     if payload.get("tool_name", "") not in TARGET_TOOLS:
         return 0
-    text = extract_output_text(payload)
+    text = output_text(payload)
     if DISPLAY_MARKER not in text and not CONST_RE.search(text):
         return 0
     print(json.dumps({

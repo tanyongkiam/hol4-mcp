@@ -33,6 +33,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import proof_sweep  # noqa: E402
+from hook_payload import output_text  # noqa: E402
 
 STATE = os.path.expanduser("~/.claude/hook-state")
 MAX_SHOWN = 8
@@ -56,15 +57,6 @@ def cached_file(session, tool_input):
             return fh.read().strip()
     except OSError:
         return None
-
-
-def result_text(payload):
-    r = payload.get("tool_response", payload.get("tool_result", ""))
-    if isinstance(r, dict):
-        r = r.get("result", "") or json.dumps(r)
-    elif isinstance(r, list):
-        r = " ".join(str(x) for x in r)
-    return r if isinstance(r, str) else str(r)
 
 
 def emit(msg):
@@ -133,7 +125,7 @@ def main():
     tool = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
     path = cached_file(payload.get("session_id"), tool_input)
-    text = result_text(payload)
+    text = output_text(payload)
     try:
         if tool.endswith("hol_check_proof"):
             return do_check_proof(text, path)

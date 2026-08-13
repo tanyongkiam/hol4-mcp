@@ -22,66 +22,14 @@ HOOK_EVENT = "PreToolUse"
 HOOK_MATCHER = "mcp__hol4__hol_restart"   # None = all calls for this event
 
 import json
+import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_payload import latest_user_message  # noqa: E402
+
 CONSENT_RE = re.compile(r"\brestart\s+ok\b", re.IGNORECASE)
-
-def read_latest_user_message(transcript_path):
-    if not transcript_path:
-        return None
-    try:
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except (FileNotFoundError, OSError):
-        return None
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except Exception:
-            continue
-        content = None
-        # Variant 1: flat {role, content}
-        if event.get("role") == "user":
-            content = event.get("content", "")
-        # Variant 2: nested {message: {role, content}}
-        msg = event.get("message")
-        if content is None and isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content", "")
-        # Variant 3: type field
-        if content is None and event.get("type") == "user":
-            content = event.get("content", "") or event.get("text", "")
-        if content is None:
-            continue
-        # Skip tool_result events (carried as role=user but not real prompts).
-        if _is_tool_result_only(content):
-            continue
-        return _extract_text(content)
-    return None
-
-def _is_tool_result_only(content):
-    """True if `content` is a list whose every element is a tool_result block."""
-    if not isinstance(content, list) or not content:
-        return False
-    for c in content:
-        if not isinstance(c, dict):
-            return False
-        if c.get("type") != "tool_result":
-            return False
-    return True
-
-def _extract_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            (c.get("text", "") if isinstance(c, dict) else str(c))
-            for c in content
-        )
-    return str(content)
 
 def main():
     try:
@@ -90,8 +38,7 @@ def main():
         return 0
     if payload.get("tool_name", "") != "mcp__hol4__hol_restart":
         return 0
-    transcript_path = payload.get("transcript_path", "")
-    latest = read_latest_user_message(transcript_path)
+    latest = latest_user_message(payload)
     if latest is None:
         return 0  # fail-open
     if CONSENT_RE.search(latest):
