@@ -168,7 +168,10 @@ def check_sibling_arms(lines, base):
             out.append((arms[k][0], f"{n} near-identical sibling arms -- the split is "
                                     f"~{n}x coarser than the argument needs; name the "
                                     f"split (`gvs [AllCaseEqs()]`, or split the actual "
-                                    f"scrutinee) rather than compressing the arms"))
+                                    f"scrutinee) rather than compressing the arms. If the "
+                                    f"{n} arms are all trivial, pick a case predicate that "
+                                    f"puts every trivial case in ONE branch and `reverse` it "
+                                    f"to the front, so a single arm absorbs them"))
         elif n == 2:
             out.append((arms[k][0], "two near-identical sibling arms -- `>>` if they "
                                     "close the same way, or one tail with `first_x_assum "

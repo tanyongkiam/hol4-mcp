@@ -49,6 +49,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H23 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block the standalone-`prove` workflow in `hol_send` (`prove(` / `store_thm(` / `save_thm(` / `TAC_PROOF(`) — RULE I + RULE G: a proof closed in the scratch session with a hand-typed goal proves nothing about the file form; write a `Theorem … QED` or sub-suspend the arm (`>- suspend` + `Resume`) |
 | H24 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Advise (never block) on newly-defined tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) in `*Script.sml` — lifting a tactic needs a strong stated justification; defaults are lift a LEMMA or leave the duplication. Diff-aware on binding names; `*Lib.sml`/`*Syntax.sml` out of scope by the path test |
 | H25 | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|mcp__hol4__hol_state_at\|mcp__hol4__holmake` | Sweep finished proof text for composition defects (adjacent normalisers, `impl_tac` sandwich, `>-` not marking a sibling, near-identical sibling arms, nested splitter ladders, n-ary tactic forms, self-feeding lambdas). Fires per theorem on `hol_check_proof` → `Status: OK`; counts-only backstop on `holmake` for git-modified scripts. Advisory; checks live in `proof_sweep.py` |
+| H26 | 📝     | PostToolUse           | `mcp__hol4__hol_check_proof` | **Proposed.** On FAILED/TIMEOUT, match the FAILING TACTIC against a symptom→cause table and inject the specific corpus fact, where H6 today injects only a generic reminder. Deferred until the tactic-smell audit completes |
 
 Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22 → H23 → H24 → H25. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
 
@@ -495,6 +496,56 @@ script, write the body inside `Resume thm[Label]: ... QED` and navigate with
 Fires on any occurrence of the banned token, including in a memory note or
 comment about the ban itself (this README phrases around it for that reason).
 Acceptable — the token has no legitimate use in committed proof work.
+
+## H26 — symptom-matched hint on failure (proposed)
+
+**File**: `h26_symptom_hint.py` (not yet written)
+**Event**: `PostToolUse`
+**Matcher**: `mcp__hol4__hol_check_proof`
+
+### Why
+
+The corpus already contains the facts that would prevent the most expensive
+debugging detours, in files marked **MUST READ before ANY proof work** — and they
+still do not reach the point of use. Observed repeatedly in one session: a
+polymorphic-tyvar mismatch was rediscovered by debugging although the note
+describes that exact symptom ("while PRINTING identically"); `simp` vs `fs` was
+rediscovered although a section covers it.
+
+Two structural reasons, neither fixable by wording:
+
+1. **Volume vs recall.** ~40 dense facts read at session start are not available at
+   hour six under load. This is retrieval, not compliance.
+2. **Indexed by cause, searched by symptom.** Sections are named for causes
+   ("Polymorphic constructors"). At the moment of failure the query is
+   "`drule` didn't match a lemma that obviously applies" — the cause is the
+   ANSWER, not the question.
+
+H6 already fires at the right moment and already has the failing tactic in its
+payload; it just says nothing about it.
+
+### The table (each entry measured, not guessed)
+
+| failing tactic | likely cause | corpus section |
+|---|---|---|
+| `drule` / `drule_all` / `match_mp_tac` / `irule` not matching a plainly applicable lemma | a free tyvar in the lemma's OWN statement; or the constant was `[simp]`-tagged so it is no longer an atom in the assumptions | §Polymorphic constructors; §`[simp]` removes the atom |
+| `simp [...]` made no progress though the needed fact is an assumption | `simp` uses assumptions as they stand; `fs`/`gvs` simplify them first | §simp vs assumptions |
+| `qpat_x_assum` / `rename1` / `qmatch_*` raised | the pattern no longer matches: a prover-generated name, or a tyvar mismatch that prints identically | §Prover-generated names; §Polymorphic constructors |
+
+### Calibration
+
+Advisory, never blocks (PostToolUse cannot). Must fire ONLY on a table match, not
+on every failure — an unmatched failure keeps H6's generic reminder and nothing
+more. Validate against real failing calls before shipping: a hint that is wrong
+at the moment of failure is worse than silence, because it is read when trust is
+highest.
+
+### Fallback for what the hook cannot match
+
+A **symptom index** at the head of `feedback_hol4_mcp_proving.md` — ten lines of
+"symptom → section" — so the file is enterable from where the reader actually is
+when the hook does not match. Cheap, and useful independently of H26.
+
 
 ## Installing the full suite
 

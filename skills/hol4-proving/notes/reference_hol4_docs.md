@@ -50,6 +50,7 @@ The whole HOL4 corpus lives in the `hol4-mcp` repo under `skills/hol4-proving/` 
 (Generic memory-writing hygiene — global-vs-project placement, search-before-write, rule-not-war-story — stays in `~/.claude/CLAUDE.md`; this file is only the HOL4-corpus specifics.)
 
 ## Health signals (smells that mean "fix the source")
+- A fact **rediscovered by debugging although it is already written down** → it is indexed by CAUSE and was searched for by SYMPTOM. Add a symptom entry (or a runtime hint at the failing tool call — hooks README, H26), do NOT restate the fact; a second copy makes retrieval worse, not better.
 - A rule needing an "ignore the tooling message that says X" carve-out → the message is the bug; fix the message, delete the carve-out.
 - The same imperative restated >2× across layers → collapse to one owner + pointers.
 - A hook/docstring/runtime message recommending a now-discouraged tactic (e.g. `eall`/`expandf` on a goalfrag, cheat-bisection, `hol_send` reconstruction) → a live contradiction; fix at the message's source, not by adding a counter-rule.
