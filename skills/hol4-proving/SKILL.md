@@ -56,6 +56,7 @@ Before a single tactic against a non-trivial cheat/goal, in user-facing text:
 2. **Name the discharge** ("closes by lemma X on asm Y" / "case-split on Z: SOME-arm by IH, NONE-arm impossible by …").
 3. **If structural, write the skeleton with `cheat (* what closes this *)` at each leaf** — one sentence per leaf. Can't write the sentence → not ready, you're guessing.
 4. **Read the live goal** (`hol_state_at`, or `hol_send` if state_at can't navigate). Never tactic from memory of "what the goal should look like".
+5. **An equality between two object-language fragments is a LEMMA, not a tactic sequence.** Tell *while proving*: you are feeding target-language constructs into simp sets instead of applying a named fact about them. State it — such a fact is usually self-contained (no relation, no induction), is worth stating even at ONE use site, and stating it exposes the side conditions the inline version hides.
 
 Forbidden: copying a speculative chain from a plan/comment/memory as if verified; "try the chain and iterate from the error"; opening with `metis_tac`/`every_case_tac`/`gs[]` blowups. If three attempts haven't shrunk the goal, STOP and re-map the plain-English argument to tactics — if you can't, the STRUCTURE is wrong, not the tactics.
 
@@ -153,6 +154,10 @@ NOT proof of done: passing `QED`; `grep -c cheat = 0`; an intermediate goal clos
 - **Sub-suspends and one-shot `[local]` nav-helpers are dev scaffolding** — fine in-session, but ALWAYS inline back before done; surviving dev scaffolding is junk (Gate 1). The ONLY keepers: a genuine multi-case induction (or similar), or a user-approved sub-suspend (≤2-deep, never deeper) — NEVER forgotten dev scaffolding.
 - **`Finalise thm;` is MANDATORY** after the last Resume (Gate 2) — add the placeholder the moment you write the first Resume.
 - **MCP suspend/Resume may still have edge-case bugs.** Lost suspension / "No such label" on a clean ancestor chain / Holmake-vs-MCP divergence → minimal reproducer, surface it; Holmake wins, report don't work around (RULE D).
+
+## HOL4 — which normaliser, and what it does to your assumptions
+
+`simp` uses assumptions AS THEY STAND (it *is* `asm_simp_tac`); `fs`/`gvs`/`rw` SIMPLIFY the assumptions first. So an assumption that must be simplified before it is a usable rewrite closes under `fs`/`gvs` and leaves `simp` unchanged — "the fact is right there in the assumptions" is never a reason to expect `simp` to close a goal. And a DISJUNCTIVE assumption is split into one goal per disjunct by `fs`/`gvs`/`rw` but not by `simp`, so a following `>-` can dispatch a branch you did not mean. **`[simp]` on a definition removes it as an ATOM from the assumptions**, so every lemma taking that constant as a hypothesis silently stops matching — check what depends on it before tagging. Measured cases, and the shapes that are NOT split: [[feedback_hol4_mcp_proving]].
 
 ## HOL4 — banned tactics
 
