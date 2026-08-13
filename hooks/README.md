@@ -50,6 +50,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H24 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Advise (never block) on newly-defined tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) in `*Script.sml` — lifting a tactic needs a strong stated justification; defaults are lift a LEMMA or leave the duplication. Diff-aware on binding names; `*Lib.sml`/`*Syntax.sml` out of scope by the path test |
 | H25 | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|mcp__hol4__hol_state_at\|mcp__hol4__holmake` | Sweep finished proof text for composition defects (adjacent normalisers, `impl_tac` sandwich, `>-` not marking a sibling, near-identical sibling arms, nested splitter ladders, n-ary tactic forms, self-feeding lambdas). Fires per theorem on `hol_check_proof` → `Status: OK`; counts-only backstop on `holmake` for git-modified scripts. Advisory; checks live in `proof_sweep.py` |
 | H26 | ✅     | —                     | —                      | **Implemented inside H6**, not as its own hook: it fires on the same event with the same payload, so a separate hook would mean two messages on one failure. See "The symptom table" under H6 |
+| H27 | ✅     | PreToolUse            | `Bash`                  | Run the audit gates against a `git commit` touching `*Script.sml` and block on what it finds — diff-scoped, so only theorems the commit touches are judged. Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem. Override with `wip ok` |
 
 Skipped: H2, H3, H5, H9, H11, H12, H13, H15. H21 (holmake-on-cheated-theory
 blocker) was proposed and rejected. H4 is the only live proposal.
@@ -469,6 +470,64 @@ script, write the body inside `Resume thm[Label]: ... QED` and navigate with
 Fires on any occurrence of the banned token, including in a memory note or
 comment about the ban itself (this README phrases around it for that reason).
 Acceptable — the token has no legitimate use in committed proof work.
+
+## H27 — audit gates at commit time
+
+**File**: `h27_commit_audit_gate.py`
+**Event**: `PreToolUse`
+**Matcher**: `Bash`
+**Effect**: blocks (exit 2) a `git commit` that would record proof code failing
+the audit gates. Override: `wip ok` in the latest user message.
+
+### Why
+
+The skill's audit gates fire "when you feel done" — self-reported, so nothing
+fires when the feeling doesn't arrive. Scaffolded proofs pass `hol_check_proof`
+AND `holmake`, so no other signal catches them either. H25 reports composition
+defects but is a PostToolUse advisory and cannot stop anything. This makes the
+gates mechanical at the one moment that is unambiguous: proof code leaving your
+hands.
+
+### Diff-scoped
+
+Only what the commit introduces is judged. A theorem is swept only if the commit
+touches it; `cheat`, banned tactics and `Resume` count only on ADDED lines.
+Pre-existing debris in untouched theorems is tolerated until that theorem is
+restructured — exactly what Gate 5 says. `-a` and `--amend` shift the diff base.
+
+### What it checks, and what it deliberately does not
+
+Blocks on Gates 1, 2, 3, 5 and the `proof_sweep` composition checks.
+
+**Gate 6 (single-use `[local]` helpers) is deliberately excluded.** Its keeper
+case — a small, intent-documenting named fact — is the common and correct idiom,
+and no mechanical test separates it from a one-shot nav-helper. Calibrating
+against a reviewed script, the check fired on `clean_prog_CONS`,
+`in_cc_eq_state_cc` and five siblings, all of which should stay. It remains a
+judgement prompt in the skill's audit, where a human does the judging.
+
+Gate 1 is kept only because size discriminates it: keeper (a) is a per-case
+`Resume` ladder, so a theorem with a *short* run of Resume blocks reads as the
+deferred tail the gate calls junk, while a long ladder is the sanctioned form
+and passes silently.
+
+### Calibration
+
+The bar was "refuse the commit that needed a cleanup, pass the cleaned result",
+measured on a real before/after pair: the pre-cleanup revision of a proof script
+is refused with ~190 findings, the reviewed version that shipped passes clean.
+Anything that fired on the shipped version was treated as a false positive and
+removed or narrowed, not tolerated.
+
+### Limitations
+
+- `--amend` uses `HEAD~1` as the base, which also picks up unstaged working-tree
+  changes. Approximate by design; it errs toward showing more.
+- Fails open on anything unexpected — not a repo, a git error, an unreadable
+  file. A gate bug must never block real work.
+- Runs alongside H14, which gates the same commits on `git ok`. Two hooks on one
+  call is intentional here: they answer different questions (may you commit at
+  all, and is this code fit to commit).
 
 ## Installing the full suite
 

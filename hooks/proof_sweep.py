@@ -10,8 +10,13 @@ directory) -- the un-narrowed version of most of them flags common idiom.
 Usage (standalone):
     ./proof_sweep.py FILE [FIRST_LINE LAST_LINE]
 
-Used by h25_proof_text_sweep.py, which runs it on the theorem a successful
-hol_check_proof just confirmed.
+Judged ONE THEOREM AT A TIME, whether or not a range is given: the checks that
+reason about siblings must not see across a block boundary, or the next
+theorem's dispatchers pass as siblings of this one's trailing `>-` and the
+finding is silently suppressed.
+
+Used by h25_proof_text_sweep.py on the theorem a successful hol_check_proof just
+confirmed, and by h27_commit_audit_gate.py on each theorem a commit touches.
 """
 import difflib
 import re
@@ -28,6 +33,7 @@ NORM = "|".join(sorted(NORM_STRENGTH, key=len, reverse=True))
 NARY = {"qexists_tac": "qexistsl_tac", "qexists": "qexistsl",
         "qx_gen_tac": "qx_genl_tac", "qid_spec_tac": "qid_specl_tac",
         "qrefine": "qrefinel", "qunabbrev_tac": "qunabbrevl_tac"}
+LADDER_ARMS = 4   # `>-` sibling arms at or above which a trailing `>-` is a ladder case
 SPLITTER = r"conj_tac|strip_tac|gen_tac"
 
 LEAD = r"(?:>>|>-|\\\\|THEN1|THEN)?\s*"
@@ -145,7 +151,10 @@ def check_dispatchers(lines, base):
         if not before and not after:
             out.append((ln, "`>-` is the only dispatcher at its level, so the previous "
                             "tactic left one goal -- `>>`"))
-        elif ">-" in before and not after:
+        elif ">-" in before and not after and before.count(">-") < LADDER_ARMS:
+            # A long run of sibling `>-` arms IS an induction/constructor ladder,
+            # where the last arm is a genuine sibling. Only a short run reads as
+            # the main line written as though it were just another subgoal.
             out.append((ln, "trailing `>-`: the last goal is usually the main line, not "
                             "a sibling -- `>>`, unless these really are sibling arms "
                             "(induction cases, constructor arms)"))
@@ -225,15 +234,41 @@ CHECKS = [check_normaliser_runs, check_impl, check_dispatchers,
           check_sibling_arms, check_nested_ladder, check_nary, check_lambda]
 
 
+RE_BLOCK_OPEN = re.compile(r"^(Theorem|Definition|Triviality|Resume)\s")
+RE_BLOCK_SHUT = re.compile(r"^(QED|End)\b")
+
+
+def _theorem_windows(lines):
+    """(first, last) 0-based half-open spans, one per Theorem/Resume block.
+
+    Checks that reason about SIBLINGS must not see across a block boundary: the
+    next theorem's dispatchers are not siblings of this one's trailing `>-`, and
+    treating them as such silently suppresses the finding.
+    """
+    out, start = [], None
+    for i, l in enumerate(lines):
+        if start is None and RE_BLOCK_OPEN.match(l):
+            start = i
+        elif start is not None and RE_BLOCK_SHUT.match(l):
+            out.append((start, i + 1))
+            start = None
+    if start is not None:
+        out.append((start, len(lines)))
+    return out or [(0, len(lines))]
+
+
 def sweep(text, first=None, last=None):
-    """[(line, message)] for the given 1-based inclusive line range."""
+    """[(line, message)] for the given 1-based inclusive line range, or for the
+    whole text judged one theorem at a time."""
     lines = clean(text).split("\n")
-    lo = (first or 1) - 1
-    hi = last if last else len(lines)
-    window = lines[lo:hi]
+    if first or last:
+        spans = [((first or 1) - 1, last if last else len(lines))]
+    else:
+        spans = _theorem_windows(lines)
     hits = []
-    for chk in CHECKS:
-        hits.extend(chk(window, lo + 1))
+    for lo, hi in spans:
+        for chk in CHECKS:
+            hits.extend(chk(lines[lo:hi], lo + 1))
     return sorted(set(hits))
 
 
