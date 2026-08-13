@@ -110,6 +110,8 @@ Goes through `kRENAME_TAC`, which `gvarify`s the goal+asms first (every free var
 - Use `>~` only when pattern's bound names truly are fresh, OR are wildcards `_`. Otherwise expect rename pollution.
 
 ### `>>~- ([pat], body)` semantic — body must fully close every matched goal
+⛔ **`>>~- ([pat], tac)` runs `tac` on ALL goals matching `pat`; `>~ [pat] >- (tac)` runs it on the FIRST match only.** They coincide only when exactly one goal matches — check that before rewriting either form into the other.
+
 Parses to `LSelectThen(Rename(pat), body >> First[])` (`~/research/HOL/src/parse/TacticParse.sml:192`). `First[]` always fails, so body must produce zero residual subgoals across ALL matching goals. When body leaves residue on even one matching goal, `>>~-` fails opaquely with `[‘pat’]` as the failing-tactic display — no inner step counter, no goal text.
 - **Decomposition diagnostic.** Split `>>~- ([pat], body) → >~ [pat_1] >- body  >~ [pat_2] >- body  ...` with per-goal distinguishers. Each `>~` consumes ONE goal, localizing which one breaks the body. Then sub-suspend that single arm.
 - **Distinguishers come from asm literals, not from semantic intent.** Patterns must match what the goal/asms LITERALLY contain at the dispatch point. Verify BEFORE writing the chain: `length (List.filter (fn (asl,g) => exists (can (find_term (can (match_term pat)))) (g::asl)) (top_goals ()))` per pattern. If any returns 0, the pattern doesn't distinguish what you think (classic miss: keying on a subterm literal that is IDENTICAL across the arms while the real discriminator sits elsewhere in the asms).

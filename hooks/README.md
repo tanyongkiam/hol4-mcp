@@ -585,5 +585,4 @@ Cleanup: weekly `find ~/.claude/hook-state -mtime +7 -delete`.
 
 - `../skills/hol4-proving/SKILL.md` (+ its `notes/`) — the HOL4 proof-interaction rules these hooks enforce; exposed globally via the `~/.claude/skills/hol4-proving` symlink.
 - `~/.claude/CLAUDE.md` — generic behavioural rules (editing/git — H14's source — memory-writing, working principles).
-- `~/research/cakes/CLAUDE.md` — CakeML workspace orientation.
 - `~/hol4-mcp/LOCAL_CHANGES.md` — local divergences of the running MCP server.

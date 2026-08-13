@@ -26,7 +26,8 @@ You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tacti
 | `fs`/`gvs`/`metis_tac` suddenly takes 60s on a goal that used to be instant | §Assumption context |
 | `decide_tac`/`ARITH_TAC` will not close an obviously-true arithmetic goal | §Arithmetic |
 | should this be `[simp]`-tagged? | §`[simp]` tags |
-| a chain that closed interactively will not replay from the file | §hol_send hygiene · §Assumption context — see its subgoal-scoping bullet |
+| a chain that closed interactively will not replay from the file | §hol_send hygiene · §Assumption context — see its subgoal-scoping bullet · [[feedback_replay_discipline]] §Interactive `e` vs file `\\` |
+| a per-goal tactic (`drule_all`, `first_x_assum`) fails for no clear reason right after `hol_state_at` — classically `Lib.assert: predicate not true` | [[feedback_replay_discipline]] §goalfrag — an all-goals driver was applied to a parked goalfrag; the goal terms are fine |
 | `hol_state_at` says "target INSIDE step k" | §Reading a `>-` / `THEN1` / `\\`-chain arm's goal |
 | `PROOF BROKEN` / `replayed=0/N` / a goal that looks wrong | [[feedback_replay_discipline]] §desync · [[feedback_hol4_mcp_proving]] §Recovery |
 | a navigation or check TIMEOUT | [[feedback_replay_discipline]] §TIMEOUT |

@@ -302,28 +302,14 @@ mcp = FastMCP("hol", instructions="""HOL4 theorem prover - proof development wor
 3. Repeat until proof complete
 4. holmake: Only at the end to verify the build
 
-Information tools (prefer these over hol_send probes):
-- hol_search(query=, pattern=): theorem database search (DB.find/DB.match)
-- hol_goals(): goal count + headlines; n=k for one goal, n=k asm=j for one
-  assumption — replaces top_goals() dumps and length(top_goals()) probes
+Develop on the FILE, not in the session. hol_send is for SMALL probes only —
+never drive a whole proof through it; going deep is suspend/Resume territory.
+Prefer hol_search and hol_goals over hol_send probes for information.
 
-hol_send is for SMALL probes only: test-drive a small tactic block at a
-parked frontier, or fully close a small goal. NEVER drive a whole proof
-through it — interactive and file form diverge silently; going deep is
-suspend/Resume territory. For replaying tactics in a script file, use
-hol_state_at (it handles checkpoints automatically).
-
-Output notes:
-- "[auto-cheated deps: ...]" names prefix theorems that failed/timed out at
-  load and were replaced by cheat — the shown state/verification rests on
-  their STATEMENTS only. Fix them before trusting an OK.
-- A NOTE about a target "INSIDE step k" means the state shown is that
-  opaque step's ENTRY; split the arm with `>- suspend` to navigate inside.
-
-Guard rails (server-enforced):
-- One HOL session at a time (RULE J): hol_start refuses a second concurrent
-  session (force=True overrides); switching workdirs needs hol_stop first.
-- hol_send rejects `val gs/fs/rw/simp/e/... = ...` shadow bindings.
+Each tool's docstring covers its own params, output markers and guard rails;
+read the one you are about to call rather than guessing. Server-enforced
+refusals (a second concurrent session, shadow bindings, hol_restart without
+user consent) are policy firing, not errors to retry.
 
 Do NOT:
 - Call hol_restart after file edits (state_at auto-detects changes)
@@ -1093,11 +1079,14 @@ async def hol_stop(session: str = "default") -> str:
 
 @mcp.tool()
 async def hol_restart(session: str = "default") -> str:
-    """Restart HOL session (stop + start, preserves workdir).
+    """Restart HOL session (stop + start, preserves workdir). ASK THE USER FIRST.
 
-    Only needed when:
-    - HOL state is corrupted (rare)
-    - Upstream dependencies changed (edited other .sml files that need Holmake)
+    Hook H19 refuses this unless the user's latest message says `restart ok`, so
+    it is never self-service: say why a restart is needed and let them grant it.
+    Genuinely needed only when upstream dependencies changed (you edited other
+    .sml files that need Holmake). "Corrupted state" is essentially never the
+    cause — a weird replay is a proof or navigation error (RULE D) that
+    restarting hides.
 
     NOT needed for edits to current proof file - state_at auto-detects changes.
 
@@ -1119,6 +1108,10 @@ async def hol_restart(session: str = "default") -> str:
 @mcp.tool()
 async def hol_setenv(env: dict, session: str = "default") -> str:
     """Set environment variables for a HOL session and auto-restart to apply.
+
+    The restart is in-process, so hook H19's consent gate does not see it. That
+    is not an escape hatch: call this to CHANGE the environment, never to obtain
+    a restart you would otherwise have to ask for.
 
     These are passed to the HOL process and affect Holmakefile INCLUDES expansion.
 

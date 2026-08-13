@@ -94,9 +94,7 @@ Recovery (preference order):
 ⛔ A TRANSFORMING tactic (a `gvs [defs, AllCaseEqs()]` that reshapes rather than closes) applied via one `e` touches goal 1 only; the file `\\` distributes it over EVERY open goal — sibling arms case-split and rename, so later positional `>-` arms see goals the interactive session never produced. When assembling a file form from per-goal interactive development: scope each goal's tactics under its own `>- (...)` arm; merge into a distributed `\\` only tactics verified to close (or no-op on) every open goal. (For CLOSING tactics, N successive `e tac` ≡ file `\\` — a goal-count difference means your tactics/context differ, not navigation.)
 
 ## `>>~-` vs `>~` — match semantics
-`>>~- ([pat], tac)` runs `tac` on ALL goals matching `pat`; `>~ [pat] >- (tac)` runs it on the
-FIRST match only. They are equivalent only when exactly one goal matches — keep this in mind if
-rewriting one form into the other.
+Owner: [[feedback_hol4_mcp_proving]] §`>>~- ([pat], body)` semantic.
 
 # ADVICE
 
