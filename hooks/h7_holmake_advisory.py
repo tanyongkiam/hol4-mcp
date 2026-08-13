@@ -9,6 +9,10 @@ disregard.
 
 Rule source: hol4-proving skill '⛔ RULE A' / 'HOL4 - iteration loop'.
 """
+
+HOOK_EVENT = "PostToolUse"
+HOOK_MATCHER = "mcp__hol4__holmake"   # None = all calls for this event
+
 import json
 import sys
 

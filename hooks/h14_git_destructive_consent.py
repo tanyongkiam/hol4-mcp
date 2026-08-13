@@ -21,6 +21,10 @@ legitimately-needed work due to a hook bug.
 
 CLAUDE.md source: '⛔ Editing and git' section.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "Bash"   # None = all calls for this event
+
 import json
 import re
 import sys

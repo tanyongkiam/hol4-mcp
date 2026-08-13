@@ -16,6 +16,10 @@ Diff-aware on theorem NAMES (not labels): adding a sub-Resume like
 Rule source: hol4-proving skill '⛔ Post-discharge audit Gate 2' /
 'HOL4 - suspend/Resume/Finalise'.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "Edit|Write|MultiEdit"   # None = all calls for this event
+
 import json
 import re
 import sys

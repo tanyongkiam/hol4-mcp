@@ -11,6 +11,10 @@ The HOL4 ruleset lives in ~/hol4-mcp/skills/hol4-proving/SKILL.md; the global
 CLAUDE.md only carries a pointer. This hook is the mechanical safety net that
 makes the skill load on the FIRST attempt rather than after a violation.
 """
+
+HOOK_EVENT = "SessionStart"
+HOOK_MATCHER = None   # None = all calls for this event
+
 import glob
 import json
 import os

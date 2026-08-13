@@ -17,6 +17,10 @@ Stateless, advisory only. Never blocks. Matches:
 
 Rule source: hol4-proving skill 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal'.
 """
+
+HOOK_EVENT = "PostToolUse"
+HOOK_MATCHER = "mcp__hol4__hol_state_at|mcp__hol4__hol_send|mcp__hol4__hol_check_proof"   # None = all calls for this event
+
 import json
 import re
 import sys

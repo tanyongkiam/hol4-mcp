@@ -17,6 +17,10 @@ must restructure.
 Rule source: hol4-proving skill 'HOL4 - banned tactics' section,
 Post-discharge Gate 5.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "Edit|Write|MultiEdit"   # None = all calls for this event
+
 import json
 import re
 import sys

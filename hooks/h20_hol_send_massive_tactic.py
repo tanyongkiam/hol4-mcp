@@ -30,6 +30,10 @@ hol_send command. Block when the command is a genuinely massive tactic:
 Small interactive probes (a handful of tactics) pass untouched. Stateless;
 fails open on malformed input.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "mcp__hol4__hol_send"   # None = all calls for this event
+
 import json
 import re
 import sys

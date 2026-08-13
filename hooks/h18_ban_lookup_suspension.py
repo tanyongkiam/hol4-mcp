@@ -26,6 +26,10 @@ the store -- `hol_state_at` to the dispatcher's QED first.)
 Block fires on any occurrence of `lookup_suspension` in the hol_send command
 (or in Edit/Write/MultiEdit new content). Stateless.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "mcp__hol4__hol_send|Edit|Write|MultiEdit"   # None = all calls for this event
+
 import json
 import re
 import sys

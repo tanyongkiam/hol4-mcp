@@ -158,6 +158,7 @@ NOT proof of done: passing `QED`; `grep -c cheat = 0`; an intermediate goal clos
 
 - `TRY` / `ORELSE` (hide failure): existing uses → restructure to `>~ [pat] >- suspend "X"` dispatch before modifying any body. Tempted to add a fresh `TRY`? ask "what shape is THIS goal, what closes it?" — almost always a `>~ [pat]` selector or a `Cases_on`.
 - `>|` (`THENL`) (position-keyed brittleness): split per-subgoal via suspend/Resume or per-case `>~`/`>-`, not by goal-stack index.
+- **Tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) — not banned, but require a STRONG stated justification** (H24 advises on newly-defined ones). A named tactic hides WHAT is proved behind HOW, so no call site is checkable in isolation — it converts duplication into indirection without making either copy a checkable statement. When a ritual repeats, the two default outcomes are: (1) **lift a LEMMA** — state the fact the ritual establishes, prove it once, and every repeat becomes a one-line application; (2) **leave the duplication** — the reader still sees the whole argument at each site. Sibling files that define them are precedent to weigh, not to follow.
 
 Spotter's guide for TRY anti-patterns: [[feedback_hol4_mcp_proving]].
 

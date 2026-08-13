@@ -47,11 +47,12 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥6 THEN-combinators, or ≥8 non-blank lines with ≥2 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
 | H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work |
 | H23 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block the standalone-`prove` workflow in `hol_send` (`prove(` / `store_thm(` / `save_thm(` / `TAC_PROOF(`) — RULE I + RULE G: a proof closed in the scratch session with a hand-typed goal proves nothing about the file form; write a `Theorem … QED` or sub-suspend the arm (`>- suspend` + `Resume`) |
+| H24 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Advise (never block) on newly-defined tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) in `*Script.sml` — lifting a tactic needs a strong stated justification; defaults are lift a LEMMA or leave the duplication. Diff-aware on binding names; `*Lib.sml`/`*Syntax.sml` out of scope by the path test |
 
-Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22 → H23. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
+Ship order recommendation: H1 → H6 → H8 → H7 → H10 → H14 → H16 → H17 → H18 → H19 → H20 → H22 → H23 → H24. (H2, H3, H5, H9, H11, H12, H13, H15 skipped; H21 — holmake-on-cheated-theory blocker — proposed and rejected by user, June 2026.)
 
-The live wiring is `~/.claude/settings.json` (source of truth); the sample
-JSON at the bottom of this file may lag it.
+The live wiring is `~/.claude/settings.json`; `install_hooks.py --check`
+reports any drift between it and the scripts in this directory.
 
 ## H1 — banned-tactics scanner
 
@@ -500,106 +501,33 @@ The scripts in this directory are dormant until wired into Claude Code's
 `~/.claude/settings.json`. Schema reference:
 <https://docs.claude.com/en/docs/claude-code/settings#hooks>.
 
-### One-shot wiring (copy-paste)
+### Installing (one command)
 
-Append (or merge) the following `hooks` block into `~/.claude/settings.json`.
-If you already have a `hooks` key, merge by hand — JSON does not support
-multiple `hooks` keys, and trailing commas are silently rejected (the entire
-hooks block disappears with no warning if you slip one in).
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h1_banned_tactics.py"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h10_resume_needs_finalise.py"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h14_git_destructive_consent.py"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h17_then_suspend.py"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__hol4__hol_send|Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h18_ban_lookup_suspension.py"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "mcp__hol4__hol_check_proof",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h6_check_proof_failure.py"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__hol4__hol_state_at",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h8_state_at_replay_cost.py"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__hol4__holmake",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h7_holmake_advisory.py"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__hol4__hol_state_at|mcp__hol4__hol_send|mcp__hol4__hol_check_proof",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/yongkiam/hol4-mcp/hooks/h16_bundled_suspend_goals.py"
-          }
-        ]
-      }
-    ]
-  }
-}
+```bash
+~/hol4-mcp/hooks/install_hooks.py          # merge every hook into settings.json
+~/hol4-mcp/hooks/install_hooks.py --check  # report drift, write nothing (exit 1 if any)
+~/hol4-mcp/hooks/install_hooks.py --print  # emit the JSON block for a manual merge
 ```
 
-Replace `/home/yongkiam/hol4-mcp` if your clone lives elsewhere.
+`install_hooks.py` discovers every `h*.py` beside it and reads the
+registration each hook declares at module level:
+
+```python
+HOOK_EVENT   = "PreToolUse"               # or PostToolUse, SessionStart, ...
+HOOK_MATCHER = "Edit|Write|MultiEdit"     # or None = all calls for this event
+```
+
+**Adding a hook file is therefore the only step needed to install it** — there
+is no list here to keep in sync, and a hook that omits `HOOK_EVENT` is an error
+rather than a silent omission. Declarations are read statically (`ast`), never
+imported, so a broken hook cannot execute during install.
+
+Merging is idempotent and additive: entries already pointing at a hook are left
+alone, entries for scripts outside this directory are never touched, and a
+timestamped backup of `settings.json` is written before any change. Merging by
+hand also works — JSON has no multiple `hooks` keys, and a trailing comma makes
+the whole block vanish with no warning.
+
 
 ### Manual / single-hook wiring
 
@@ -625,6 +553,9 @@ done
 # Confirm settings.json is valid JSON
 python3 -c "import json; json.load(open('$HOME/.claude/settings.json'))" \
   && echo "settings.json ok"
+
+# Confirm every hook here is wired and no wired hook has vanished
+~/hol4-mcp/hooks/install_hooks.py --check
 ```
 
 ### Disabling

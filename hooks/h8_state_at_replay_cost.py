@@ -14,6 +14,10 @@ Skips:
 
 Rule source: hol4-proving skill 'HOL4 - iteration loop' / Cost-discipline trigger.
 """
+
+HOOK_EVENT = "PostToolUse"
+HOOK_MATCHER = "mcp__hol4__hol_state_at"   # None = all calls for this event
+
 import json
 import re
 import sys

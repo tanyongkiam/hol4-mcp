@@ -12,6 +12,10 @@ legitimate cheat probe per the cheat-probing pattern (feedback_hol4_mcp_proving)
 
 Rule source: hol4-proving skill RULE C ('HOL4 - iteration loop').
 """
+
+HOOK_EVENT = "PostToolUse"
+HOOK_MATCHER = "mcp__hol4__hol_check_proof"   # None = all calls for this event
+
 import json
 import re
 import sys

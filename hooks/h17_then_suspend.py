@@ -29,6 +29,10 @@ Edit/Write/MultiEdit new content. Stateless, no transcript read.
 
 Rule source: hol4-proving skill 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal'.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "Edit|Write|MultiEdit"   # None = all calls for this event
+
 import json
 import re
 import sys

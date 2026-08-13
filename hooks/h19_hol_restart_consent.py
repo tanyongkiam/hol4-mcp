@@ -17,6 +17,10 @@ the real bug. Consent must be explicit, per-request, like `git ok` (H14).
 Fails open if transcript_path is missing or unreadable -- never blocks
 legitimately-needed work due to a hook bug.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "mcp__hol4__hol_restart"   # None = all calls for this event
+
 import json
 import re
 import sys

@@ -29,6 +29,10 @@ The correct loop:
 `DB.find`, a term inspection), never for a finished proof. Stateless; fails
 open on malformed input.
 """
+
+HOOK_EVENT = "PreToolUse"
+HOOK_MATCHER = "mcp__hol4__hol_send"   # None = all calls for this event
+
 import json
 import re
 import sys
