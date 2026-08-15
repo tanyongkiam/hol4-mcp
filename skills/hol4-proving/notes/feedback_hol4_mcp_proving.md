@@ -185,6 +185,6 @@ Naive in-place TRY substitutes also fail; only suspend/Resume works. See [[feedb
 - For suspend/Resume sequencing across constructors, see [[feedback_suspend_resume]].
 
 ## Recovery
-- Smart-quote errors (`unknown character "\226"`): `python3 /home/yongkiam/hol4-mcp/check_quotes.py <file> --fix`. Don't hand-fix with sed/xxd.
+- Smart-quote errors (`unknown character "\226"`): `python3 ~/hol4-mcp/check_quotes.py <file> --fix`. Don't hand-fix with sed/xxd.
 - `holmake` target = Theory name; `fooProofTheory` from `fooProofScript.sml`. Use `jobs` param or `HOL4_MCP_HOLMAKE_JOBS` for parallel builds.
 - ⛔ **`PROOF BROKEN` / `replayed=0/N` / wrong-looking goal / "No such label" → the FIRST diagnosis is ALWAYS a YOU problem** (tactic that fails in file-form; subgoal attacked after a reordered/incomplete prefix; a line *inside* a `\\`-chain that lands at the chain ENTRY; an unparenthesised `by`-chain; a dispatcher that never reaches its QED; a wrong/auto-generated identifier). "Cache/desync" is essentially never the cause; don't whitespace-bump/backward-nav/restart. PROVE it: replay file-form (`hol_state_at` past QED, or `holmake`) — it fails there too. Full diagnostic: [[feedback_replay_discipline]] §desync; "No such label" specifically: [[feedback_suspend_resume]].
