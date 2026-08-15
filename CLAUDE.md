@@ -2,11 +2,12 @@
 
 ## Environment
 
-Installed editable into the linuxbrew python that the `hol4-mcp` entry point
-runs on, so an edit here is live for the running server. There is no `.venv`.
+Installed editable into the environment the `hol4-mcp` entry point runs on, so
+an edit here is live for the running server — no reinstall step. That
+environment is machine-specific; locate it rather than assuming a path (the
+interpreter that can `import hol4_mcp`).
 
 ```bash
-PY=/home/linuxbrew/.linuxbrew/opt/python@3.11/bin/python3.11
 $PY -m pip install -e .
 ```
 
@@ -15,6 +16,9 @@ $PY -m pip install -e .
 ```bash
 $PY -m pytest tests/ -q
 ```
+
+Requires `pytest`, `pytest-asyncio` and `pytest-xdist` (for the `-n` in the
+`pyproject` addopts) in that same environment.
 
 ## FastMCP
 

@@ -1050,46 +1050,66 @@ class FileProofCursor:
                     # Non-Resume (shouldn't happen, but keep safe): drop
                     del self._resume_goals[thm.name]
 
-    def _suspension_chain_root_line(self, start_line: int) -> int | None:
-        """Earliest start_line of a suspend/Resume chain ROOT touched by a change
-        at/after ``start_line``, or None if no chain is affected.
+    def _chain_members(self, root_name: str) -> list[TheoremInfo]:
+        """The root Theorem plus every ``Resume`` block that belongs to it."""
+        return [
+            t for t in self._theorems
+            if t.name == root_name
+            or (t.kind == "Resume" and t.suspension_name == root_name)
+        ]
 
-        A change to a ``Resume thm[label]`` body (or to a ``Theorem`` that itself
-        issues ``suspend``) invalidates the whole chain: the suspension store is
-        session-global and append/consume-only, so the chain must be re-run from
-        its root Theorem. The root of a ``Resume thm[label]`` is the Theorem named
-        ``thm`` (its ``suspension_name``); a ``Theorem``/``Triviality`` whose body
-        contains ``suspend`` is its own root.
+    def _affected_chain_roots(self, start_line: int) -> list[TheoremInfo]:
+        """Suspend/Resume chains whose already-registered part a change at
+        ``start_line`` invalidates: the chain ROOT begins at/before the change
+        and at least one member reaches to/past it.
+
+        A chain lying entirely AFTER the change is NOT affected — none of its
+        text changed and it has not run, so its suspension store is not stale
+        and it owes no reinit. Scoping by straddling (rather than "every
+        theorem after the change") is what keeps an unrelated broken chain
+        later in the file from forcing a full session reinit on every edit.
+
+        The root of a ``Resume thm[label]`` is the Theorem named ``thm`` (its
+        ``suspension_name``); a ``Theorem``/``Triviality`` whose body contains
+        ``suspend`` is its own root.
         """
         name_to_thm = {t.name: t for t in self._theorems}
-        roots: list[int] = []
+        roots: dict[str, TheoremInfo] = {}
         for thm in self._theorems:
             if thm.proof_end_line < start_line:
                 continue
             if thm.kind == "Resume":
                 root = name_to_thm.get(thm.suspension_name) if thm.suspension_name else None
-                if root is not None:
-                    roots.append(root.start_line)
             elif (thm.kind in ("Theorem", "Triviality")
                     and re.search(r'\bsuspend\b', thm.proof_body or "")):
-                roots.append(thm.start_line)
-        return min(roots) if roots else None
+                root = thm
+            else:
+                root = None
+            if root is not None and root.start_line <= start_line:
+                roots[root.name] = root
+        return list(roots.values())
+
+    def _suspension_chain_root_line(self, start_line: int) -> int | None:
+        """Earliest start_line of a suspend/Resume chain ROOT affected by a
+        change at ``start_line``, or None if no chain is affected."""
+        roots = self._affected_chain_roots(start_line)
+        return min((r.start_line for r in roots), default=None)
 
     def _affected_chain_is_broken(self, start_line: int) -> bool:
-        """True if a change at/after ``start_line`` lands in a suspend/Resume
-        chain that currently has a failed/auto-cheated/orphaned body recorded in
+        """True if a change at ``start_line`` lands in a suspend/Resume chain
+        that currently has a failed/auto-cheated/orphaned body recorded in
         ``_failed_proofs``.
 
         Such a chain's suspension store is stale (a label was consumed by an
         auto-cheat, or a sub-`suspend` never ran), so it cannot be partially
         replayed — it must be re-run from a clean session. A healthy chain
-        (nothing in ``_failed_proofs``) is left to the normal fast partial path.
+        (nothing in ``_failed_proofs``) is left to the normal fast partial path,
+        and so is a broken chain that the change does not touch.
         """
-        if self._suspension_chain_root_line(start_line) is None:
-            return False
         return any(
-            thm.proof_end_line >= start_line and thm.name in self._failed_proofs
-            for thm in self._theorems
+            member.name in self._failed_proofs
+            for root in self._affected_chain_roots(start_line)
+            for member in self._chain_members(root.name)
         )
 
     async def init(self) -> dict:
