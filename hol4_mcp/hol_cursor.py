@@ -1966,7 +1966,15 @@ class FileProofCursor:
             )
 
         t1 = time.perf_counter()
-        if self._active_theorem != thm_at_pos.name:
+        # Re-enter when the target changed, and ALSO when the loaded prefix no
+        # longer reaches this theorem's start: an edit BEFORE the theorem
+        # truncates _loaded_to_line, and everything between there and the
+        # theorem (including derived `Theorem foo = <expr>` blocks, which are
+        # not parsed as theorems) must be re-executed before its tactics replay.
+        # Skipping that replays the proof against stale bindings, so a fix to
+        # something earlier in the file silently has no effect.
+        if (self._active_theorem != thm_at_pos.name
+                or self._loaded_to_line < thm_at_pos.start_line):
             enter_result = await self.enter_theorem(thm_at_pos.name)
             if "error" in enter_result:
                 return StateAtResult(
