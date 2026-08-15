@@ -50,6 +50,8 @@ Unqualified `§` names are sections of [[feedback_hol4_mcp_proving]]. H6 injects
 
 **Trigger**: TaskUpdate→completed, "ready for holmake", "I think this is finished", "discharged", the last cheat in a theorem closing, before any summary or done-claim. **Run the gates PER THEOREM — the moment a theorem's last cheat closes, BEFORE starting the next one**; an end-of-file sweep is a backstop, not the primary trigger. The feeling of being done IS the trigger — MOST acute after a LONG session, when accumulated `suspend`/`Resume` scaffolding feels structural but is junk (Gate 1). **`hol_check_proof OK`, `grep -c cheat = 0`, "all leaves close", "TaskUpdate completed" are PRE-audit signals — none mean done.**
 
+⛔ **A `git commit` recording proof code is also a trigger — and the only one enforced.** H27 blocks it on Gates 1/2/3/5 and the `proof_sweep` composition checks, judging only what the diff ADDS (override: `wip ok`). Gate 6 stays yours to judge — no mechanical test separates a keeper `[local]` from a one-shot nav-helper. Being blocked there means you skipped this audit, not that the hook is strict.
+
 For each theorem you edited — at minimum every cheat-discharged one — ALL seven gates must hold. Each has a mechanical check — run it, don't eyeball.
 
 - **Gate 1 — Dev-scaffolding `suspend`/`Resume`/`Finalise` is ALWAYS BAD JUNK; inline it back.** The default finished form of ANY theorem is ONE `Proof … QED` with **no `suspend`/`Resume`/`Finalise`**. Any you created to navigate or develop MUST be gone from the committed form.
