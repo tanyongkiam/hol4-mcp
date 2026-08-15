@@ -165,6 +165,41 @@ def _target_self_cheated_reason(cursor, target_name: str | None) -> str | None:
     return failed.get(target_name)
 
 
+_SLOW_NAV_SECS = 120.0
+_slow_nav_counts: dict[tuple[str, str, str], int] = {}
+
+
+def _slow_nav_lines(session: str, file, theorem: str | None,
+                    elapsed_secs: float) -> list[str]:
+    """Warn when the SAME theorem is navigated slowly more than once.
+
+    One slow replay is the unavoidable cold start. Every later one re-pays for a
+    replayed unit that should have been shrunk instead, so the COUNT — not the
+    duration — is the signal.
+    """
+    if not theorem or elapsed_secs < _SLOW_NAV_SECS:
+        return []
+    key = (session, str(file or ""), theorem)
+    n = _slow_nav_counts.get(key, 0) + 1
+    _slow_nav_counts[key] = n
+    if n < 2:
+        return []
+    return [
+        "",
+        f"⛔ SLOW NAVIGATION #{n} into `{theorem}` ({elapsed_secs:.0f}s, over the "
+        f"{_SLOW_NAV_SECS:.0f}s threshold) — STOP: THIS IS A PROCESS FAILURE.",
+        "   The first slow replay is the cold start; every one after it re-pays for "
+        "a replayed",
+        "   unit that is too big. Do NOT probe again before shrinking it: put one "
+        "`>- suspend",
+        "   \"<Case>\"` per arm of a multi-case proof (for a genuine induction that "
+        "ladder is the",
+        "   COMMITTED form, not scaffolding to inline back), then sub-suspend the "
+        "failing arm.",
+        "   Minutes-per-probe iteration is never justified by the proof being large.",
+    ]
+
+
 def _target_self_cheated_lines(reason: str) -> list[str]:
     """Explicit 'this was NOT validated' verdict for a self-cheated target.
 
@@ -1926,6 +1961,10 @@ async def hol_state_at(
                 parts.append("inside_by=true")
             lines.append(f"[Cache: {', '.join(parts)}]")
 
+    if result.timings:
+        lines.extend(_slow_nav_lines(session, cursor.file, active_theorem,
+                                     result.timings.get('total', 0)))
+
     _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)
 
@@ -2061,7 +2100,11 @@ async def hol_check_proof(
     final = trace_data[-1]
     total_ms = sum(e.real_ms for e in trace_data)
     total_steps = len(trace_data)
-    
+
+    # Emitted before the verdict so it survives every early return below.
+    lines.extend(_slow_nav_lines(session, cursor.file, theorem,
+                                 total_ms / 1000.0))
+
     if final.error:
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")
         lines.append(f"Error: {final.error}")
