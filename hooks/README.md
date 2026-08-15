@@ -51,6 +51,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H25 | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|mcp__hol4__hol_state_at\|mcp__hol4__holmake` | Sweep finished proof text for composition defects (adjacent normalisers, `impl_tac` sandwich, `>-` not marking a sibling, near-identical sibling arms, nested splitter ladders, n-ary tactic forms, self-feeding lambdas). Fires per theorem on `hol_check_proof` → `Status: OK`; counts-only backstop on `holmake` for git-modified scripts. Advisory; checks live in `proof_sweep.py` |
 | H26 | ✅     | —                     | —                      | **Implemented inside H6**, not as its own hook: it fires on the same event with the same payload, so a separate hook would mean two messages on one failure. See "The symptom table" under H6 |
 | H27 | ✅     | PreToolUse            | `Bash`                  | Run the audit gates against a `git commit` touching `*Script.sml` and block on what it finds — diff-scoped, so only theorems the commit touches are judged. Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem. Override with `wip ok` |
+| H28 | ✅     | PreToolUse            | `Bash`                  | Block shell invocations of `Holmake` / raw `poly`\|`hol`, redirecting to `mcp__hol4__holmake` / `hol_start`. Command-position match only, so prose and log paths pass. Override with `shell holmake ok` |
 
 Skipped: H2, H3, H5, H9, H11, H12, H13, H15. H21 (holmake-on-cheated-theory
 blocker) was proposed and rejected. H4 is the only live proposal.
