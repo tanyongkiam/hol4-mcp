@@ -35,6 +35,13 @@ def strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub('', text)
 
 
+# HOL diagnostics that carry information no structured channel reproduces: the
+# goal printer's same-name/different-type warning, parser messages about
+# invented type variables and overload resolution. They ride the SUCCESS path,
+# so unless they are harvested here they reach the caller only by accident.
+_DIAGNOSTIC_RE = re.compile(r'^[ \t]*(WARNING:.*|<<HOL message:.*)$', re.M)
+
+
 class HOLSession:
     """Direct HOL subprocess management with clean interrupt support."""
 
@@ -45,6 +52,10 @@ class HOLSession:
         self.process: Optional[asyncio.subprocess.Process] = None
         self._buffer = b""
         self._lock = asyncio.Lock()  # Serialize send() to prevent concurrent stdout reads
+        # (command, diagnostic line) pairs, so a reader can separate what HOL
+        # said about the caller's own tactics from prefix-loading chatter.
+        self.diagnostics: list[tuple[str, str]] = []
+        self._resync_seq = 0              # distinct sentinel per resync
 
     async def start(self) -> str:
         """Start HOL subprocess."""
@@ -108,6 +119,51 @@ class HOLSession:
             except asyncio.TimeoutError:
                 break
 
+    async def resync(self, timeout: float = 30) -> bool:
+        """Re-align the pipe after a `send` was abandoned mid-read.
+
+        Cancelling a send (an overall-budget abort, which SIGINTs HOL) leaves
+        the aborted command's reply unwritten. HOL emits it while unwinding —
+        measured from 0.2 ms to 352 ms — long after `_drain_pipe`'s 10 ms poll
+        gives up, so the next command reads the ABORTED command's frame and
+        every reply after it is off by one, indefinitely. Write a sentinel and
+        swallow frames until its own reply arrives.
+        """
+        if not self.process or self.process.returncode is not None:
+            return False
+        async with self._lock:
+            self._resync_seq += 1
+            marker = f"HOL_MCP_RESYNC_{self._resync_seq}"
+            self._buffer = b""
+            try:
+                await self._write_command(f'print "{marker}\\n";')
+            except Exception:
+                return False
+            deadline = time.monotonic() + timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                try:
+                    frame = await self._read_response(timeout=left)
+                except (asyncio.TimeoutError, RuntimeError):
+                    return False
+                if marker in frame:
+                    return True
+
+    async def drain_stale(self):
+        """Drop residual output, holding the send lock.
+
+        `_drain_pipe` reads stdout directly, so calling it while another
+        coroutine is inside `send` raises "read() called while another
+        coroutine is already waiting for incoming data". Callers outside
+        `send` must come through here.
+        """
+        if not self.process or self.process.returncode is not None:
+            return
+        async with self._lock:
+            await self._drain_pipe()
+
     async def send(self, sml_code: str, timeout: float = 5) -> str:
         """Send SML code and wait for response."""
         if not self.process or self.process.returncode is not None:
@@ -118,7 +174,8 @@ class HOLSession:
             await self._write_command(sml_code)
 
             try:
-                return await self._read_response(timeout=timeout)
+                return self._note_diagnostics(
+                    sml_code, await self._read_response(timeout=timeout))
             except asyncio.TimeoutError:
                 self.interrupt()
                 try:
@@ -126,7 +183,16 @@ class HOLSession:
                 except asyncio.TimeoutError:
                     remaining = ""
                 msg = f"TIMEOUT after {timeout}s - sent interrupt."
-                return f"{msg}\n{remaining}" if remaining else msg
+                return self._note_diagnostics(
+                    sml_code, f"{msg}\n{remaining}" if remaining else msg)
+
+    def _note_diagnostics(self, command: str, output: str) -> str:
+        """Record HOL diagnostics from one reply; returns the reply unchanged."""
+        for m in _DIAGNOSTIC_RE.finditer(output):
+            self.diagnostics.append((command, m.group(1).strip()))
+        if len(self.diagnostics) > 500:
+            del self.diagnostics[:-500]
+        return output
 
     async def _read_response(self, timeout: float) -> str:
         """Read until null terminator, return all segments joined."""

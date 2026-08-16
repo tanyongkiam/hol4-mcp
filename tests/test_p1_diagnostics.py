@@ -186,7 +186,7 @@ async def test_timeout_attribution_state_at(tmp_path):
         # Establish a real step plan / active theorem first.
         await hol_state_at(session=session, line=9, col=3)
 
-        async def timed_out_state_at(line, col=1):
+        async def timed_out_state_at(line, col=1, skip_prefix=False):
             return StateAtResult(
                 goals=[], tactic_idx=2, tactics_replayed=1, tactics_total=2,
                 file_hash=cursor._content_hash,

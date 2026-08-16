@@ -11,7 +11,7 @@ from .hol_file_parser import (
     TheoremInfo, parse_theorems, LocalBlock, parse_local_blocks,
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan, step_text_start,
-    _find_json_line,
+    construct_start_line, _find_json_line,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -152,6 +152,19 @@ def _is_hol_error(output: str) -> bool:
     if "\nFail " in output or output.startswith("Fail "):
         return True
     return False
+
+
+# Sends that run the CALLER's own proof work, as opposed to loading the prefix.
+_REPLAY_CMD_RE = re.compile(r'^\s*(ef\s*\(|gf\s|e\s*\(|goals_json)')
+
+
+def _step_label(cmd: str, limit: int = 60) -> str:
+    """A readable tactic snippet from a replay command."""
+    text = " ".join(cmd.split()).rstrip(';')
+    m = re.match(r'^ef\s*\(\s*goalFrag\.\w+\s*\((.*)\)\s*\)$', text)
+    if m:
+        text = m.group(1).strip()
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _is_fatal_hol_error(output: str) -> bool:
@@ -307,7 +320,8 @@ class StateAtResult:
     """Result of state_at() call."""
     goals: list[dict]         # Current goals: [{"asms": [...], "goal": "..."}, ...]
     tactic_idx: int           # Index of tactic at position (0-based)
-    tactics_replayed: int     # Number of tactics replayed to reach this state
+    tactics_replayed: int     # Step index actually reached (a position, not a
+                              # count of commands issued: see _NavResult)
     tactics_total: int        # Total tactics in proof
     file_hash: str            # Content hash when this state was computed
     error: str | None = None  # Error message if replay failed
@@ -315,6 +329,8 @@ class StateAtResult:
     inside_by: bool = False   # Position is inside a decomposed by/>- subproof (between open/close)
     inside_step_idx: int | None = None  # Step index when position is strictly INSIDE
                                         # an opaque step (state shown = step entry)
+    warnings: list[str] | None = None   # HOL diagnostics emitted while producing
+                                        # this state (success path included)
 
 
 @dataclass
@@ -331,7 +347,9 @@ class _TargetInfo:
 @dataclass
 class _NavResult:
     """Result of navigation strategy dispatch."""
-    actual_replayed: int
+    reached_idx: int          # Step index the session now sits at, NOT a
+                              # command count: "reused" issues nothing and
+                              # still reaches the target.
     error_msg: str | None
     strategy: str             # "reused" | "incremental" | "checkpoint" | "replay"
 
@@ -365,7 +383,9 @@ class TheoremCheckpoint:
     tactics_count: int            # Number of tactics when end_of_proof saved
     end_of_proof_path: Path | None = None   # Proof replay checkpoint (for state_at)
     context_path: Path | None = None       # Context checkpoint (theory state, for navigation)
-    content_hash: str = ""        # File hash when checkpoint was saved
+    content_hash: str = ""        # Hash of the file PREFIX through this
+                                  # theorem, i.e. the content this saved state
+                                  # was produced from (_theorem_prefix_hash)
 
 
 class FileProofCursor:
@@ -448,7 +468,7 @@ class FileProofCursor:
 
         # Termination condition goals for Definition blocks:
         # Maps definition name -> TC goal string (e.g., "?R. WF R /\ ...")
-        # Extracted during _load_remaining_content BEFORE each Definition
+        # Extracted during context loading BEFORE each Definition
         # block is processed (required because Hol_defn can't be re-called
         # after the constant exists without corrupting theory state).
         self._tc_goals: dict[str, str] = {}
@@ -458,12 +478,16 @@ class FileProofCursor:
         # reason ("timeout >Ns …" / "error: …"). Cleared on file change.
         self._failed_proofs: dict[str, str] = {}
 
+        # Per-step cost of the last step-by-step replay:
+        # (step index, elapsed seconds, "ok" | "budget" | "failed").
+        self._step_costs: list[tuple[int, float, str]] = []
+
         # Oracle tags per theorem from verify_all_proofs.
         # e.g. {"thm_c": ["cheat"]} means thm_c transitively depends on a cheat.
         self._theorem_oracles: dict[str, list[str]] = {}
 
         # Resume goals: name -> {"asms": [...], "goal": "..."}
-        # Extracted during _load_remaining_content BEFORE each Resume block
+        # Extracted during context loading BEFORE each Resume block
         self._resume_goals: dict[str, dict] = {}
 
         # True when pre-theorem context changed (e.g., open/Theory/Ancestors).
@@ -527,9 +551,14 @@ class FileProofCursor:
             chain_broken = self._affected_chain_is_broken(first_changed)
 
             self._invalidate_from_line(first_changed)
-            # Also reset loaded context tracking - can't trust context after change point
+            # Also reset loaded context tracking - can't trust context after change point.
+            # The reload resumes at the truncation point, so it must be a construct
+            # BOUNDARY: mid-construct, HOL is handed the tail of a
+            # Definition/Datatype/Theorem and the resulting "Unknown identifier"
+            # is sticky across every later navigation.
             if first_changed <= self._loaded_to_line:
-                self._loaded_to_line = max(0, first_changed - 1)
+                boundary = construct_start_line(content, first_changed)
+                self._loaded_to_line = max(0, boundary - 1)
                 self._loaded_content_hash = ""  # Empty string = needs recompute
 
             # Fixing a broken suspend/Resume chain: the session-global suspension
@@ -596,6 +625,26 @@ class FileProofCursor:
             if thm.name == name:
                 return thm
         return None
+
+    def _nearest_theorem_ranges(self, line: int, span: int = 2) -> str:
+        """Valid line ranges around ``line``, for a bad-position rejection.
+
+        A rejection that names no valid range costs the caller a
+        guess-and-retry round trip.
+        """
+        if not self._theorems:
+            return " The file contains no parsed theorem blocks."
+        ordered = sorted(self._theorems, key=lambda t: t.start_line)
+        before = [t for t in ordered if t.proof_end_line <= line][-span:]
+        after = [t for t in ordered if t.start_line > line][:span]
+        near = before + after
+        if not near:
+            near = ordered[:span]
+        listed = ", ".join(
+            f"{t.name} (lines {t.start_line}-{t.proof_end_line - 1})"
+            for t in near
+        )
+        return f" Nearest theorem blocks: {listed}."
 
     def _get_theorem_at_position(self, line: int) -> TheoremInfo | None:
         """Get theorem containing the given line number."""
@@ -743,6 +792,22 @@ class FileProofCursor:
         self._loaded_content_hash = ""
         return True
 
+    def _theorem_prefix_hash(self, theorem_name: str) -> str:
+        """Hash of the file content a theorem's checkpoint was built from.
+
+        A checkpoint is the theory state after the file up to and including
+        this theorem has run, so only that PREFIX determines it — an edit
+        after the theorem's QED cannot change the state it captured. Same
+        prefix convention as _check_stale_state (lines[:end_line - 1]).
+        """
+        thm = self._get_theorem(theorem_name)
+        if thm is None:
+            # Renamed or deleted: no prefix to compare, so nothing validates.
+            return self._content_hash
+        return self._compute_hash(
+            '\n'.join(self._content.split('\n')[:thm.proof_end_line - 1])
+        )
+
     def _is_checkpoint_valid(self, theorem_name: str) -> bool:
         """Check if end_of_proof checkpoint exists and is valid."""
         ckpt = self._checkpoints.get(theorem_name)
@@ -750,7 +815,8 @@ class FileProofCursor:
             return False
         if ckpt.end_of_proof_path is None or not ckpt.end_of_proof_path.exists():
             return False
-        if ckpt.content_hash != "" and ckpt.content_hash != self._content_hash:
+        if (ckpt.content_hash != ""
+                and ckpt.content_hash != self._theorem_prefix_hash(theorem_name)):
             return False
         return True
 
@@ -761,7 +827,8 @@ class FileProofCursor:
             return False
         if ckpt.context_path is None or not ckpt.context_path.exists():
             return False
-        if ckpt.content_hash != "" and ckpt.content_hash != self._content_hash:
+        if (ckpt.content_hash != ""
+                and ckpt.content_hash != self._theorem_prefix_hash(theorem_name)):
             return False
         return True
 
@@ -798,16 +865,20 @@ class FileProofCursor:
         if _is_hol_error(result):
             return False
 
-        # Merge with existing entry (may already have context_path)
+        # Merge with existing entry (may already have context_path). The hash
+        # is refreshed too: the state just saved is the state of the file as it
+        # is NOW, whatever the entry was first stamped with.
         if theorem_name in self._checkpoints:
             self._checkpoints[theorem_name].end_of_proof_path = ckpt_path
             self._checkpoints[theorem_name].tactics_count = tactics_count
+            self._checkpoints[theorem_name].content_hash = \
+                self._theorem_prefix_hash(theorem_name)
         else:
             self._checkpoints[theorem_name] = TheoremCheckpoint(
                 theorem_name=theorem_name,
                 tactics_count=tactics_count,
                 end_of_proof_path=ckpt_path,
-                content_hash=self._content_hash,
+                content_hash=self._theorem_prefix_hash(theorem_name),
             )
         return True
 
@@ -837,15 +908,18 @@ class FileProofCursor:
         if _is_hol_error(result):
             return
 
-        # Update checkpoint dict (merge with any existing end_of_proof entry)
+        # Update checkpoint dict (merge with any existing end_of_proof entry).
+        # The hash is refreshed too — see _save_end_of_proof_checkpoint.
         if theorem_name in self._checkpoints:
             self._checkpoints[theorem_name].context_path = ckpt_path
+            self._checkpoints[theorem_name].content_hash = \
+                self._theorem_prefix_hash(theorem_name)
         else:
             self._checkpoints[theorem_name] = TheoremCheckpoint(
                 theorem_name=theorem_name,
                 tactics_count=0,
                 context_path=ckpt_path,
-                content_hash=self._content_hash,
+                content_hash=self._theorem_prefix_hash(theorem_name),
             )
 
     async def _load_checkpoint_and_backup(self, theorem_name: str, target_tactic_idx: int) -> bool:
@@ -1000,6 +1074,9 @@ class FileProofCursor:
         for name in list(self._failed_proofs.keys()):
             if name not in current_thm_names:
                 del self._failed_proofs[name]
+        for name in list(self._theorem_oracles.keys()):
+            if name not in current_thm_names:
+                del self._theorem_oracles[name]
 
         # Invalidate checkpoints/traces/tc_goals/resume_goals for theorems at or after change point
         for thm in self._theorems:
@@ -1017,6 +1094,11 @@ class FileProofCursor:
                 # session restart — file=changed alone never refreshed it.
                 if thm.name in self._failed_proofs:
                     del self._failed_proofs[thm.name]
+                # Same for the cached oracle tags: an edit at or before this
+                # theorem can discharge the cheat its "⚠ depends on cheat"
+                # verdict was derived from.
+                if thm.name in self._theorem_oracles:
+                    del self._theorem_oracles[thm.name]
                 # Resume goals: invalidate only when change affects the
                 # extraction context (main theorem or a nested suspending
                 # Resume earlier in the chain). Once a Resume's label has
@@ -1262,7 +1344,7 @@ class FileProofCursor:
         cheat_block = f'Theorem {thm.name}{attrs}:\n{thm.goal}\nProof\n  cheat\nQED'
         # Drain extra residual output from the failed proof before cheating
         await asyncio.sleep(0.1)
-        await self.session._drain_pipe()
+        await self.session.drain_stale()
         result = await self.session.send(cheat_block, timeout=30)
         # Check for success: val <name> = ... : thm in output
         # (residual output from the original failed proof can pollute the result,
@@ -1310,7 +1392,7 @@ class FileProofCursor:
             return True
         # Bare statement didn't re-parse standalone — drain any residual and let
         # the caller replay the real proof so navigation stays correct.
-        await self.session._drain_pipe()
+        await self.session.drain_stale()
         return False
 
     def _local_block_at(self, line: int) -> LocalBlock | None:
@@ -1369,100 +1451,6 @@ class FileProofCursor:
                         f"label not found at load — Resume block "
                         f"SKIPPED, never ran ({_error_reason(err)})"
                     )
-
-    async def _load_remaining_content(self) -> str | None:
-        """Load remaining file content, theorem-by-theorem.
-
-        When theorems fall inside SML `local ... in ... end` blocks, the entire
-        block is sent as one chunk because Poly/ML requires the complete local
-        declaration as a syntactic unit.
-
-        Returns:
-            Error message if a fatal load error occurs, else None.
-        """
-        content_lines = self._content.split('\n')
-        remaining_thms = [t for t in self._theorems if t.proof_end_line > self._loaded_to_line]
-
-        i = 0
-        while i < len(remaining_thms):
-            thm = remaining_thms[i]
-            # Check if either the theorem or the pre-content (gap before it)
-            # falls inside a local block.
-            local_block = self._local_block_at(thm.start_line)
-            if local_block is None and self._loaded_to_line < thm.start_line:
-                local_block = self._local_block_overlapping(self._loaded_to_line, thm.start_line - 1)
-
-            if local_block is None:
-                # Normal theorem
-                if thm.start_line > self._loaded_to_line:
-                    err = await self._send_and_check(
-                        '\n'.join(content_lines[self._line_to_idx(self._loaded_to_line):self._line_to_idx(thm.start_line)]),
-                        timeout=60)
-                    if err:
-                        return err
-                    self._loaded_to_line = thm.start_line
-
-                await self._extract_goals_for([thm])
-
-                thm_content = '\n'.join(content_lines[self._line_to_idx(thm.start_line):self._line_to_idx(thm.proof_end_line)])
-                if thm_content.strip():
-                    result = await self.session.send(thm_content, timeout=PER_THEOREM_TIMEOUT)
-                    if result.startswith("TIMEOUT") and thm.kind != "Definition":
-                        self.session.interrupt()
-                        await asyncio.sleep(0.5)
-                        err = await self._cheat_failed_theorem(
-                            thm, f"timeout >{PER_THEOREM_TIMEOUT}s loading whole proof"
-                        )
-                        if err:
-                            return f"Error executing file content: {_format_context_error(result)}"
-                    elif _is_fatal_hol_error(result):
-                        return f"Error executing file content: {_format_context_error(result)}"
-                    elif _is_hol_error(result):
-                        err = await self._handle_theorem_error(thm, result)
-                        if err:
-                            return err
-                self._loaded_to_line = thm.proof_end_line
-                i += 1
-            else:
-                # Local block: collect all theorems inside, send as one chunk
-                lb = local_block
-                block_thms = []
-                while i < len(remaining_thms) and lb.local_line <= remaining_thms[i].start_line <= lb.end_line:
-                    block_thms.append(remaining_thms[i])
-                    i += 1
-
-                await self._extract_goals_for(block_thms)
-
-                block_end = lb.end_line + 1  # line after 'end'
-                if block_end > self._loaded_to_line:
-                    block_content = '\n'.join(content_lines[self._line_to_idx(self._loaded_to_line):self._line_to_idx(block_end)])
-                    if block_content.strip():
-                        result = await self.session.send(block_content, timeout=PER_THEOREM_TIMEOUT)
-                        if _is_fatal_hol_error(result):
-                            return f"Error executing file content: {_format_context_error(result)}"
-                        if _is_hol_error(result):
-                            for bt in block_thms:
-                                err = await self._handle_theorem_error(bt, result)
-                                if err:
-                                    return err
-                    self._loaded_to_line = block_end
-
-        # Trailing content after last theorem
-        if self._theorems:
-            total_lines = len(content_lines)
-            if self._loaded_to_line <= total_lines:
-                trailing_start = self._loaded_to_line + 1
-                lb = self._local_block_overlapping(trailing_start, total_lines)
-                if lb:
-                    total_lines = max(total_lines, lb.end_line)
-                trailing = '\n'.join(content_lines[self._line_to_idx(self._loaded_to_line):total_lines])
-                err = await self._send_and_check(trailing, timeout=60)
-                if err:
-                    return err
-                self._loaded_to_line = total_lines + 1
-
-        self._loaded_content_hash = self._content_hash
-        return None
 
     async def _load_context_to_line(self, target_line: int, timeout: float = 300) -> str | None:
         """Load file content up to target_line into HOL session.
@@ -1537,10 +1525,21 @@ class FileProofCursor:
                     if not cheated:
                         thm_content = '\n'.join(content_lines[self._line_to_idx(thm.start_line):self._line_to_idx(thm.proof_end_line)])
                         if thm_content.strip():
-                            result = await self.session.send(thm_content, timeout=timeout)
-                            if _is_fatal_hol_error(result):
+                            # One PREFIX theorem gets the per-theorem budget, not
+                            # the caller's whole-navigation timeout: a single slow
+                            # proof must be cheated and named, not abort the
+                            # navigation and leave the target unreachable.
+                            thm_timeout = min(timeout, PER_THEOREM_TIMEOUT) if timeout else PER_THEOREM_TIMEOUT
+                            result = await self.session.send(thm_content, timeout=thm_timeout)
+                            if result.startswith("TIMEOUT"):
+                                err = await self._cheat_failed_theorem(
+                                    thm, f"timeout >{thm_timeout}s loading whole proof"
+                                )
+                                if err:
+                                    return err
+                            elif _is_fatal_hol_error(result):
                                 return f"Error executing file content: {_format_context_error(result)}"
-                            if _is_hol_error(result):
+                            elif _is_hol_error(result):
                                 err = await self._handle_theorem_error(thm, result)
                                 if err:
                                     return err
@@ -1820,6 +1819,12 @@ class FileProofCursor:
 
         Returns True if navigation succeeded.
         """
+        if self._session_dirty:
+            # Same veto as _try_reuse_state: this path navigates FROM the live
+            # position, which a hol_send may have moved. When the target is in
+            # the common prefix it can issue zero commands and hand back the
+            # probe's goal stack. Force checkpoint/replay instead.
+            return False
         if tactic_idx <= first_diff:
             # Target in common prefix: navigate directly (all commands identical)
             return await self._navigate_steps(old_tactic_idx, tactic_idx)
@@ -1858,16 +1863,54 @@ class FileProofCursor:
 
         replayed = 0
         step_timeout = self._tactic_timeout or 30
-        for cmd in cmds:
+        # Per-step cost of THIS replay: (step index, seconds, outcome). The
+        # step boundaries exist here anyway; keeping their elapsed times is
+        # what lets a report separate a blow-up (finished, slowly) from a
+        # candidate loop (only ever hits the budget, never returns).
+        self._step_costs = []
+        for idx, cmd in enumerate(cmds):
+            t_step = time.perf_counter()
             step_result = await self.session.send(cmd, timeout=step_timeout)
+            elapsed = time.perf_counter() - t_step
             if _is_hol_error(step_result):
                 if step_result.startswith("TIMEOUT"):
-                    return replayed, f"Tactic replay timed out (>{step_timeout}s)"
-                return replayed, f"Tactic replay failed: {step_result}"
+                    self._step_costs.append((idx, elapsed, "budget"))
+                    return replayed, (
+                        f"Tactic replay timed out: step {idx} "
+                        f"({_step_label(cmd)}) did not finish within the "
+                        f"per-step budget of {step_timeout}s — a candidate "
+                        f"LOOP, since a looping tactic never returns."
+                        + self._step_cost_report()
+                    )
+                self._step_costs.append((idx, elapsed, "failed"))
+                return replayed, (
+                    f"Tactic replay failed at step {idx} "
+                    f"({_step_label(cmd)}): {step_result}"
+                    + self._step_cost_report()
+                )
+            self._step_costs.append((idx, elapsed, "ok"))
             replayed += 1
 
         # Shouldn't happen: fallback fully succeeded but batch didn't?
         return replayed, f"Tactic replay failed: {result}"
+
+    def _step_cost_report(self, top: int = 3) -> str:
+        """The costliest COMPLETED steps of the last replay.
+
+        A step that finished carries a real elapsed time (superlinear but
+        terminating work — a blow-up); a step that only ever hits its budget
+        has none to report. Printing the completed ones is what tells a
+        reader which of the two happened.
+        """
+        done = [(i, secs) for i, secs, outcome in self._step_costs
+                if outcome == "ok"]
+        if not done:
+            return ""
+        done.sort(key=lambda p: -p[1])
+        shown = ", ".join(
+            f"step {i} {secs * 1000:.0f}ms" for i, secs in done[:top]
+        )
+        return f"\nCompleted steps by cost: {shown}."
 
     async def _replay_to_boundary(
         self, thm: TheoremInfo, tactic_idx: int, total_tactics: int
@@ -1877,7 +1920,7 @@ class FileProofCursor:
         Try O(1) checkpoint path first, then fall back to full replay with
         step-by-step fallback on batch failure.
 
-        Returns (success, actual_replayed, error_msg, used_checkpoint).
+        Returns (success, reached_idx, error_msg, used_checkpoint).
         """
         # Try checkpoint path
         if self._is_checkpoint_valid(thm.name) and thm.proof_body:
@@ -1962,10 +2005,22 @@ class FileProofCursor:
             return StateAtResult(
                 goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
                 file_hash=self._content_hash,
-                error=f"Position ({line}, {col}) is not within any theorem"
+                error=(f"Position ({line}, {col}) is not within any theorem."
+                       f"{self._nearest_theorem_ranges(line)}")
             )
 
         t1 = time.perf_counter()
+        # Backward navigation: the loaded prefix runs PAST this theorem's own
+        # block, so later theorems — and their [simp] attributes — are in scope
+        # and can close a goal the file's own order leaves open. Drop back to
+        # the nearest predecessor checkpoint, as execute_proof_traced does.
+        if (self._deps_checkpoint_saved
+                and self._loaded_to_line > thm_at_pos.proof_end_line):
+            predecessor = self._find_predecessor_checkpoint(thm_at_pos)
+            if predecessor is None or not await self._load_context_checkpoint(
+                    predecessor.name):
+                await self._restore_to_deps()
+
         # Re-enter when the target changed, and ALSO when the loaded prefix no
         # longer reaches this theorem's start: an edit BEFORE the theorem
         # truncates _loaded_to_line, and everything between there and the
@@ -2106,13 +2161,13 @@ class FileProofCursor:
         if not target.changed and await self._try_reuse_state(
             target.tactic_idx
         ):
-            return _NavResult(actual_replayed=target.tactic_idx, error_msg=None, strategy="reused")
+            return _NavResult(reached_idx=target.tactic_idx, error_msg=None, strategy="reused")
 
         # Strategy 2: Incremental update (file changed, common prefix available)
         if target.incremental_update is not None and await self._try_incremental_navigate(
             target.incremental_update[0], target.incremental_update[1], target.tactic_idx
         ):
-            return _NavResult(actual_replayed=target.tactic_idx, error_msg=None, strategy="incremental")
+            return _NavResult(reached_idx=target.tactic_idx, error_msg=None, strategy="incremental")
 
         # Strategy 3: Checkpoint or full replay (step boundary)
         return await self._navigate_step_boundary(target)
@@ -2127,7 +2182,7 @@ class FileProofCursor:
             )
         )
         strategy = "checkpoint" if used_checkpoint else "replay"
-        return _NavResult(actual_replayed=replayed, error_msg=replay_error, strategy=strategy)
+        return _NavResult(reached_idx=replayed, error_msg=replay_error, strategy=strategy)
 
     def _update_position(self, target: _TargetInfo, nav: _NavResult) -> None:
         """Update session position tracking after successful navigation."""
@@ -2160,7 +2215,7 @@ class FileProofCursor:
         return StateAtResult(
             goals=goals,
             tactic_idx=target.tactic_idx,
-            tactics_replayed=nav.actual_replayed,
+            tactics_replayed=nav.reached_idx,
             tactics_total=target.total_tactics,
             file_hash=self._content_hash,
             error=error_msg,
@@ -2194,6 +2249,35 @@ class FileProofCursor:
 
     async def state_at(self, line: int, col: int = 1,
                        skip_prefix: bool = False) -> StateAtResult:
+        """Navigate, and attach the HOL diagnostics the navigation produced.
+
+        HOL emits its most valuable warnings (same-name/different-type
+        variables, invented type variables) on the SUCCESS path, where every
+        structured channel regenerates its content from terms and the raw
+        output is discarded. Harvesting them around the whole navigation is
+        the only place they can be caught for a caller that never sees a
+        failure.
+        """
+        sink = getattr(self.session, "diagnostics", None)
+        mark = len(sink) if isinstance(sink, list) else None
+        result = await self._state_at_traced(line, col, skip_prefix)
+        if mark is not None and result.warnings is None:
+            fresh: list[str] = []
+            for cmd, text in sink[mark:]:
+                # `<<HOL message: …>>` is chatty — a cold prefix load emits one
+                # per parsed quotation — so keep only those from the caller's
+                # own tactics. A `WARNING:` is rare and kept wherever it came
+                # from.
+                if not text.startswith("WARNING:") and not _REPLAY_CMD_RE.match(cmd):
+                    continue
+                if text not in fresh:
+                    fresh.append(text)
+            if fresh:
+                result.warnings = fresh[:20]
+        return result
+
+    async def _state_at_traced(self, line: int, col: int = 1,
+                               skip_prefix: bool = False) -> StateAtResult:
         """Get proof state at file position using prefix-based replay.
 
         Auto-enters the theorem containing the position if not already active.
@@ -2272,6 +2356,14 @@ class FileProofCursor:
         """
         result = _find_json_line(output, "goals_json")
 
+        # goals_json reports what the goal text cannot show (same-name variables
+        # of different types); route it to the session's diagnostic sink so
+        # state_at attaches it like any other HOL diagnostic.
+        sink = getattr(getattr(self, "session", None), "diagnostics", None)
+        if isinstance(sink, list):
+            for w in result.get('warnings') or []:
+                sink.append(("goals_json();", str(w)))
+
         if 'ok' in result:
             goals = []
             for g in result['ok']:
@@ -2302,6 +2394,13 @@ class FileProofCursor:
             "active_tactics": len(self._step_plan),
             "loaded_to_line": self._loaded_to_line,
             "stale": stale,
+            # An armed reinit makes the next navigation a COLD replay from
+            # dependencies. Without saying so, this status is indistinguishable
+            # from a cursor that simply has not loaded anything yet.
+            **({"pending_work":
+                "session restart armed: the next navigation replays the whole "
+                "prefix from dependencies (all checkpoints were discarded)"}
+               if self._needs_session_reinit else {}),
             "completed": [],
             "theorems": [
                 {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat,
@@ -2439,10 +2538,9 @@ class FileProofCursor:
             ))
 
         # Track oracle tags (detects cheat cascades via HOL4's tag propagation)
+        # An empty list is a clean verdict and must overwrite a stale one.
         if 'ok' in parsed:
-            oracles = parsed['ok'].get('oracles', [])
-            if oracles:
-                self._theorem_oracles[theorem_name] = oracles
+            self._theorem_oracles[theorem_name] = parsed['ok'].get('oracles', [])
 
         self._proof_traces[theorem_name] = trace
         return trace
@@ -2665,10 +2763,9 @@ class FileProofCursor:
             )
 
             # Track oracle tags (detects cheat cascades via HOL4's tag propagation)
+            # An empty list is a clean verdict and must overwrite a stale one.
             if 'ok' in parsed:
-                oracles = parsed['ok'].get('oracles', [])
-                if oracles:
-                    self._theorem_oracles[thm.name] = oracles
+                self._theorem_oracles[thm.name] = parsed['ok'].get('oracles', [])
 
             # For Definitions/Resume: always re-send the full block.
             # Definitions: create the constant and store def/ind theorems.

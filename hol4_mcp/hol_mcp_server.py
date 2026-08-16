@@ -45,16 +45,43 @@ TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "60.0"))
 STATE_AT_TIMEOUT = float(os.environ.get("HOL_STATE_AT_TIMEOUT", "300.0"))
 
 
+def _nav_lock(cursor) -> asyncio.Lock:
+    """The cursor's navigation lock, created on first use.
+
+    `HOLSession._lock` serializes ONE command; a navigation is a sequence of
+    them (`drop_all()`, `gf ...`, the replayed steps, `goals_json()`), and two
+    of them interleaved leave each caller reading whichever proof won the race.
+    """
+    lock = getattr(cursor, "_nav_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        cursor._nav_lock = lock
+    return lock
+
+
 async def _state_at_bounded(
+    cursor, line: int, col: int = 1, skip_prefix: bool = False,
+    timeout: float | None = None,
+) -> StateAtResult:
+    """Navigate under the cursor's navigation lock and an overall budget."""
+    async with _nav_lock(cursor):
+        return await _state_at_budgeted(
+            cursor, line, col, skip_prefix=skip_prefix, timeout=timeout
+        )
+
+
+async def _state_at_budgeted(
     cursor, line: int, col: int = 1, skip_prefix: bool = False,
     timeout: float | None = None,
 ) -> StateAtResult:
     """Run cursor.state_at under an overall wall-clock budget.
 
-    On expiry, SIGINT the HOL process (recoverable — session.send drains stale
-    output on the next call) and resync the cursor, then return a TIMEOUT
-    StateAtResult (tactics_total=0 routes it through the structural-error path).
-    A budget <= 0 (or None when STATE_AT_TIMEOUT is disabled) means unbounded.
+    On expiry, SIGINT the HOL process, flush the pipe back to a fresh prompt
+    (session.resync — the aborted command's reply lands too late for the next
+    send's 10 ms drain and would otherwise be read as that send's own reply),
+    resync the cursor, then return a TIMEOUT StateAtResult (tactics_total=0
+    routes it through the structural-error path). A budget <= 0 (or None when
+    STATE_AT_TIMEOUT is disabled) means unbounded.
     """
     budget = STATE_AT_TIMEOUT if timeout is None else timeout
     if budget is not None and budget <= 0:
@@ -69,6 +96,13 @@ async def _state_at_bounded(
     except asyncio.TimeoutError:
         try:
             cursor.session.interrupt()
+        except Exception:
+            pass
+        # Read the aborted command's reply before anything else is written,
+        # or it becomes the next command's reply and the pipe stays one frame
+        # behind for the rest of the session.
+        try:
+            await cursor.session.resync()
         except Exception:
             pass
         try:
@@ -94,6 +128,114 @@ async def _state_at_bounded(
                 f"larger timeout= argument."
             ),
         )
+
+
+def _classify_state_at(result: StateAtResult) -> tuple[bool, bool, bool]:
+    """Classify a StateAtResult as (proof_complete, structural_error, broken).
+
+    Every tool that presents these goals must agree on what they mean, so the
+    test lives here rather than in each presenter. `broken` means the replay
+    stopped BEFORE the requested position: the goals are the failure point's,
+    not the position's.
+    """
+    is_proof_complete = bool(
+        result.error
+        and "no goals" in result.error.lower()
+        and result.tactics_replayed == result.tactics_total
+        and not result.goals
+    )
+    is_structural = bool(result.error and result.tactics_total == 0)
+    is_broken = bool(
+        result.error
+        and not is_proof_complete
+        and not is_structural
+        and result.tactics_replayed < result.tactic_idx
+    )
+    return is_proof_complete, is_structural, is_broken
+
+
+async def _state_caveat_lines(
+    cursor, result: StateAtResult, active_theorem: str | None,
+    thm=None, line: int | None = None,
+) -> list[str]:
+    """Caveats that must accompany ANY presentation of `result`'s goals.
+
+    Each one qualifies what the goals rest on — an entered-but-not-reached
+    step, a cheated target, cheated dependencies, prefix-skip mode. Dropping
+    them turns a qualified state into an unqualified one.
+    """
+    lines: list[str] = []
+
+    # HOL's own diagnostics from this navigation. The same-name/different-type
+    # warning in particular is unrecoverable once dropped: the rendered goal
+    # prints no types, so the colliding variables look identical.
+    if result.warnings:
+        lines.append("")
+        lines.append("[HOL diagnostics during this navigation:]")
+        for w in result.warnings:
+            lines.append(f"  {w}")
+
+    # Chain-entry landing: the requested position is strictly inside one
+    # opaque step (lumped/parenthesized chain). The state shown is the
+    # step's ENTRY, which is easy to misread as the state at that line.
+    if (result.inside_step_idx is not None and not result.error
+            and thm is not None and thm.proof_body and line is not None):
+        k = result.inside_step_idx
+        step_plan = cursor._step_plan
+        if k < len(step_plan):
+            text_start = step_text_start(step_plan, k, thm.proof_body)
+            start_line = _file_offset_to_line_col(
+                thm.proof_body_offset + text_start, cursor._content)[0]
+            end_line = _file_offset_to_line_col(
+                thm.proof_body_offset + step_plan[k].end,
+                cursor._content)[0]
+            if end_line > start_line:
+                lines.append("")
+                lines.append(
+                    f"NOTE: target line {line} is INSIDE step {k} "
+                    f"(lumped/parenthesized chain, lines {start_line}-"
+                    f"{end_line}); the state shown is this step's ENTRY "
+                    f"at line {start_line}, not the state at line {line}. "
+                    f"To navigate inside, split the arm with `>- suspend` "
+                    f"into a Resume body."
+                )
+
+    # Suggest extracting by/>- subproof into a suspend/Resume block
+    if result.inside_by and not result.error:
+        lines.append("")
+        lines.append("[Inside by/>- subproof. Consider extracting into a suspend/Resume block "
+                     "for independent verification and easier editing.]")
+
+    # Smart-quote diagnosis on parse/lex-flavoured errors (the raw replay
+    # error may carry lexer text the formatted output above does not show).
+    if result.error:
+        lines.extend(_quote_diagnosis_if_parse_error(cursor.file, result.error))
+
+    # Lost-suspension diagnosis: a Resume whose label cannot be found usually
+    # means an ancestor (dispatcher or earlier Resume) broke during loading.
+    if result.error and active_theorem and (
+            "No such label" in result.error
+            or "Failed to set up Resume goal" in result.error):
+        diag = await cursor.diagnose_resume_failure(active_theorem)
+        if diag:
+            lines.append("")
+            lines.append(diag)
+
+    # Refuse a false-green: if the TARGET theorem itself was auto-cheated
+    # during load, the goals/"No goals" above rest on its STATEMENT, not its
+    # replayed proof — say so loudly instead of letting it read as a pass.
+    self_cheat = _target_self_cheated_reason(cursor, active_theorem)
+    if self_cheat is not None:
+        lines.extend(_target_self_cheated_lines(self_cheat))
+
+    # Name any deps auto-cheated while loading the file prefix (the state
+    # shown was computed with those theorems replaced by `cheat`).
+    lines.extend(_auto_cheated_deps_lines(cursor, active_theorem))
+
+    # Notice when prefix-skip navigation deliberately cheated the prefix.
+    lines.extend(_prefix_skip_lines(cursor))
+
+    return lines
 
 
 def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
@@ -288,8 +430,25 @@ def _quote_diagnosis_if_parse_error(file_path, error_text: str) -> list[str]:
     return [""] + diag if diag else []
 
 
+def _clip(output: str, budget: int) -> str:
+    """Fit `output` into `budget` bytes, keeping BOTH ends.
+
+    The head carries the classification and attribution — `PROOF BROKEN at
+    ...`, `TIMEOUT: step k (lines A-B)` — which a tail-only cut drops exactly
+    when the goal is large enough for the caller to need them.
+    """
+    if len(output) <= budget:
+        return output
+    head_budget = min(budget // 3, 1500)
+    marker = f"\n\n[... {len(output) - budget} bytes elided ...]\n\n"
+    tail_budget = budget - head_budget - len(marker)
+    if tail_budget < 100:
+        return f"[TRUNCATED: {len(output)} bytes, showing last {budget}]\n\n" + output[-budget:]
+    return output[:head_budget] + marker + output[-tail_budget:]
+
+
 def _truncate_output(output: str, max_output: int, footer: str = "") -> str:
-    """Truncate output to max_output bytes, showing tail.
+    """Truncate output to max_output bytes, keeping the head and the tail.
 
     If footer is provided, it's appended AFTER truncation so it's never lost.
     """
@@ -302,16 +461,8 @@ def _truncate_output(output: str, max_output: int, footer: str = "") -> str:
         if body_budget < 100:
             # Not enough room — just show footer
             return footer.lstrip("\n")
-        if len(output) > body_budget:
-            return (
-                f"[TRUNCATED: {len(output)} bytes, showing last {body_budget}]\n\n"
-                + output[-body_budget:]
-                + footer
-            )
-        return output + footer
-    if len(output) > max_output:
-        return f"[TRUNCATED: {len(output)} bytes, showing last {max_output}]\n\n{output[-max_output:]}"
-    return output
+        return _clip(output, body_budget) + footer
+    return _clip(output, max_output)
 
 
 @dataclass
@@ -686,11 +837,13 @@ _PROOFMGR_MUTATING_RE = re.compile(
     r'|set_goal|set_goalfrag|set_suspended_goal|set_resume_goalfrag\w*'
     r'|verify_resume\w*|run_resume\w*|verify_core'
     r'|markerLib\.resume|bossLib\.sg'
-    r'|proofManagerLib\.(?:e|b|r|g|gf|ef|eall|ee|expand|expandf|expand_list'
-    r'|expand_frag|rotate|restart|drop|dropn|backup|add|split)'
+    r'|proofManagerLib\.(?:e|b|r|g|gf|ef|eall|ee|eta|enth|expand|expandf'
+    r'|expand_list|expand_frag|rotate|restart|drop|dropn|backup|add|split)'
     r')\b'
-    # bare top-level proof drivers (tactic_prefix shadows e/expand/ef at top level)
-    r'|(?<![\w.])(?:e|ef|expand|expandf|expand_list|sg|g|gf|b|r)\s*[(`]'
+    # bare top-level proof drivers (tactic_prefix shadows e/expand/ef at top level;
+    # eall/enth/eta/ee reach the goal stack straight from proofManagerLib)
+    r'|(?<![\w.])(?:eall|enth|expand_list|expandf|expand|eta|ef|ee|e'
+    r'|sg|gf|g|b|r)\s*[(`]'
 )
 
 
@@ -1003,8 +1156,25 @@ async def hol_goals(
         result = await _state_at_bounded(cursor, line, col, skip_prefix=skip_prefix, timeout=timeout)
         if result.error and not result.goals:
             return f"ERROR: {result.error}"
+        _complete, _structural, _broken = _classify_state_at(result)
+        if _structural or _broken:
+            # The goals on the stack belong to the point replay stopped at, not
+            # to the requested position; presenting them as "N goal(s) at line
+            # L" is the same false-green hol_state_at refuses.
+            return (
+                f"ERROR: PROOF BROKEN — replay stopped at step "
+                f"{result.tactics_replayed} of {result.tactics_total}, before "
+                f"line {line}. The goals on the stack are the failure point's, "
+                f"not line {line}'s. Use hol_state_at(line={line}) to see where "
+                f"and which tactic failed.\n{result.error}"
+            )
         goals = result.goals
         origin = f"at line {line}"
+        active = cursor._active_theorem
+        caveats = await _state_caveat_lines(
+            cursor, result, active,
+            cursor._get_theorem(active) if active else None, line,
+        )
     else:
         s = await _get_session(session)
         if not s:
@@ -1024,8 +1194,13 @@ async def hol_goals(
             for g in data['ok']
         ]
         origin = "live session"
+        caveats = []
 
     _schedule_gc(session)
+
+    def qualified(text: str) -> str:
+        """Append the caveats that qualify what these goals rest on."""
+        return "\n".join([text, *caveats]) if caveats else text
 
     def trunc(s: str, limit: int, flatten: bool = True) -> str:
         if flatten:
@@ -1035,7 +1210,7 @@ async def hol_goals(
         return s
 
     if not goals:
-        return f"0 goals ({origin}) — proof complete."
+        return qualified(f"0 goals ({origin}) — proof complete.")
 
     if n is None:
         lines = [f"{len(goals)} goal(s) ({origin}, goal 1 = top):"]
@@ -1044,7 +1219,7 @@ async def hol_goals(
             lines.append(f"{i}: [{len(asms)} asm] {trunc(g['goal'], max_term)}")
         if any(g.get('asms') for g in goals):
             lines.append("Use n=k for goal k's assumptions; n=k, asm=j for one in full.")
-        return "\n".join(lines)
+        return qualified("\n".join(lines))
 
     if n < 1 or n > len(goals):
         return f"ERROR: n={n} out of range (1..{len(goals)})"
@@ -1055,7 +1230,7 @@ async def hol_goals(
         if asm < 1 or asm > len(asms):
             return (f"ERROR: asm={asm} out of range "
                     f"(goal {n} has {len(asms)} assumptions)")
-        return f"Goal {n} assumption {asm}:\n{asms[asm - 1]}"
+        return qualified(f"Goal {n} assumption {asm}:\n{asms[asm - 1]}")
 
     lines = [f"Goal {n} of {len(goals)} ({len(asms)} asm):"]
     for j, a in enumerate(asms, start=1):
@@ -1063,7 +1238,7 @@ async def hol_goals(
     if asms:
         lines.append("  " + "-" * 40)
     lines.append(f"  {trunc(g['goal'], max_term, flatten=False)}")
-    return "\n".join(lines)
+    return qualified("\n".join(lines))
 
 
 @mcp.tool()
@@ -1617,6 +1792,13 @@ async def hol_state_at(
         the chain names the first broken ancestor to fix.
       - "unmatched smart quote at line L col C" — likely cause of a parse
         error; fix with the printed command.
+      - "[HOL diagnostics during this navigation: ...]" — what HOL said while
+        running YOUR tactics. "variables of same name but different types" is
+        always an error and is invisible in the goal text, which prints no
+        types.
+      - "Goals withheld: ..." — replay stopped before the requested position,
+        so the live goals are the failure point's. Navigate there, or pass
+        show_partial=True.
 
     Returns: Proof position, goals at that position, errors if any
     """
@@ -1658,26 +1840,13 @@ async def hol_state_at(
     lines = []
     error_footer = ""  # Errors go in footer so truncation never hides them
     
-    # Check if "no goals" error is actually success (proof complete)
-    is_proof_complete = (
-        result.error and 
-        "no goals" in result.error.lower() and
-        result.tactics_replayed == result.tactics_total and
-        not result.goals
-    )
-    
+    is_proof_complete, is_structural, is_broken = _classify_state_at(result)
+
     # Structural error (not in theorem, etc.) - no goals to show
-    if result.error and result.tactics_total == 0:
+    if is_structural:
         lines.append(f"ERROR: {result.error}")
         lines.extend(_quote_diagnosis_if_parse_error(cursor.file, result.error))
         return "\n".join(lines)
-
-    # Detect broken proof: replay couldn't reach the requested position
-    is_broken = (
-        result.error
-        and not is_proof_complete
-        and result.tactics_replayed < result.tactic_idx
-    )
 
     # Show theorem name (useful for hol_check_proof after edits)
     if active_theorem:
@@ -1741,8 +1910,8 @@ async def hol_state_at(
                 f"opaque break (99% of the time). Do NOT bisect by moving a `cheat` "
                 f"through the chain, and do NOT reconstruct the goal with "
                 f"`hol_send`/`e`/`sg` (a scratch goal diverges from the file form). "
-                f"The goal shown below is the state ENTERING this opaque step, not "
-                f"the failure point."
+                f"The goal available here is the state ENTERING this opaque step, "
+                f"not the failure point."
             )
             if thm:
                 s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
@@ -1795,9 +1964,17 @@ async def hol_state_at(
                 f"--tactic-timeout."
             )
 
-        if result.goals:
-            # Always show goals at failure point (useful for debugging)
-            # show_partial controls whether ALL goals or just the first are shown
+        if result.goals and not show_partial:
+            # The replay stopped short of the requested position, so the live
+            # goals belong to the failure point, not to the position asked for.
+            lines.append("")
+            lines.append(
+                "Goals withheld: replay stopped before the requested position, "
+                "so the live goals are NOT the goals there. Navigate to the "
+                "failure point above to obtain them in their own right, or pass "
+                "show_partial=True to see them from here."
+            )
+        elif result.goals:
             display_goals = result.goals if all_goals else result.goals[:1]
             total = len(result.goals)
             if opaque_multiline:
@@ -1862,74 +2039,21 @@ async def hol_state_at(
             lines.append("=== Goals ===")
             lines.append("No goals (proof complete)")
 
-        # Chain-entry landing: the requested position is strictly inside one
-        # opaque step (lumped/parenthesized chain). The state shown is the
-        # step's ENTRY, which is easy to misread as the state at that line.
-        if (result.inside_step_idx is not None and not result.error
-                and thm and thm.proof_body):
-            k = result.inside_step_idx
-            step_plan = cursor._step_plan
-            if k < len(step_plan):
-                text_start = step_text_start(step_plan, k, thm.proof_body)
-                start_line = _file_offset_to_line_col(
-                    thm.proof_body_offset + text_start, cursor._content)[0]
-                end_line = _file_offset_to_line_col(
-                    thm.proof_body_offset + step_plan[k].end,
-                    cursor._content)[0]
-                if end_line > start_line:
-                    lines.append("")
-                    lines.append(
-                        f"NOTE: target line {line} is INSIDE step {k} "
-                        f"(lumped/parenthesized chain, lines {start_line}-"
-                        f"{end_line}); the state shown is this step's ENTRY "
-                        f"at line {start_line}, not the state at line {line}. "
-                        f"To navigate inside, split the arm with `>- suspend` "
-                        f"into a Resume body."
-                    )
-
-    # Suggest extracting by/>- subproof into a suspend/Resume block
-    if result.inside_by and not result.error:
-        lines.append("")
-        lines.append("[Inside by/>- subproof. Consider extracting into a suspend/Resume block "
-                     "for independent verification and easier editing.]")
-
-    # Smart-quote diagnosis on parse/lex-flavoured errors (the raw replay
-    # error may carry lexer text the formatted output above does not show).
-    if result.error:
-        lines.extend(_quote_diagnosis_if_parse_error(cursor.file, result.error))
-
-    # Lost-suspension diagnosis: a Resume whose label cannot be found usually
-    # means an ancestor (dispatcher or earlier Resume) broke during loading.
-    if result.error and active_theorem and (
-            "No such label" in result.error
-            or "Failed to set up Resume goal" in result.error):
-        diag = await cursor.diagnose_resume_failure(active_theorem)
-        if diag:
-            lines.append("")
-            lines.append(diag)
-
-    # Refuse a false-green: if the TARGET theorem itself was auto-cheated
-    # during load, the goals/"No goals" above rest on its STATEMENT, not its
-    # replayed proof — say so loudly instead of letting it read as a pass.
-    self_cheat = _target_self_cheated_reason(cursor, active_theorem)
-    if self_cheat is not None:
-        lines.extend(_target_self_cheated_lines(self_cheat))
-
-    # Name any deps auto-cheated while loading the file prefix (the state
-    # shown was computed with those theorems replaced by `cheat`).
-    lines.extend(_auto_cheated_deps_lines(cursor, active_theorem))
-
-    # Notice when prefix-skip navigation deliberately cheated the prefix.
-    lines.extend(_prefix_skip_lines(cursor))
+    lines.extend(await _state_caveat_lines(cursor, result, active_theorem, thm, line))
 
     # Add timing info if available
     if result.timings:
         t = result.timings
         lines.append("")
         method = t.get('strategy', 'replay')
+        # asms=N is INFORMATION, not prediction: it lets a reader correlate a
+        # slow step with the context it ran in. It implies nothing — fs, gs,
+        # gvs, simp and metis_tac can all fail to terminate at any count.
+        asms_str = (f", asms={len(result.goals[0].get('asms', []))}"
+                    if result.goals else "")
         lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
-                     f"method={method}]")
+                     f"method={method}{asms_str}]")
         # Cache-state diagnostics: show what _pos was BEFORE the call,
         # the target, and what got reused vs replayed. Useful for
         # reproducing cache bugs.
@@ -1950,7 +2074,7 @@ async def hol_state_at(
                 f"pos_before=(idx={before_idx}{offset_str},{init_str},{hash_str})",
                 f"target=(idx={target_idx},{partial_str})",
                 f"file={changed_str}",
-                f"replayed={result.tactics_replayed}/{result.tactics_total}",
+                f"reached={result.tactics_replayed}/{result.tactics_total}",
             ]
             if 'incr_first_diff' in t:
                 parts.append(
@@ -2066,13 +2190,15 @@ async def hol_check_proof(
             # Definition blocks can't use execute_proof_traced (TC goal context).
             # Fall back to state_at at the End line to check proof completion.
             result = await _state_at_bounded(cursor, thm.proof_end_line - 1, col=1)
-            # "no goals" error from goals_json means proof completed successfully
-            no_goals_ok = result.error and "no goals" in result.error
-            if not result.goals or no_goals_ok:
-                lines.append(f"Status: OK (Definition termination proof)")
-            elif result.error:
+            # "no goals" from goals_json means the proof completed; ANY other
+            # error (a TIMEOUT above all) leaves goals empty too, so the error
+            # must be tested FIRST or a timeout reads as a pass.
+            no_goals_ok = bool(result.error and "no goals" in result.error.lower())
+            if result.error and not no_goals_ok:
                 lines.append(f"Status: FAILED")
                 lines.append(f"Error: {result.error}")
+            elif not result.goals or no_goals_ok:
+                lines.append(f"Status: OK (Definition termination proof)")
             else:
                 lines.append(f"Status: INCOMPLETE ({len(result.goals)} goals remaining)")
             return "\n".join(lines)

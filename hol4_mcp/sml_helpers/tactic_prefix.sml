@@ -35,6 +35,18 @@ fun parseTacticBlockFromString s =
       (fn _ => fn _ => fn _ => ()) (* ignore parse warnings *)
       HOLSourceParser.initialScope
     val dec = #parseDec result ()
+    (* A tactic body is ONE declaration. A stray delimiter ends the expression
+       early and leaves the REST of the body as further declarations, which the
+       caller never sees: the step plan silently loses every tactic after it.
+       A second declaration is therefore always a broken body. *)
+    val nextDec = (SOME (#parseDec result ()))
+                  handle Interrupt => raise Interrupt | _ => NONE
+    val () =
+      case nextDec of
+        SOME (SOME _) =>
+          raise Fail "parseTacticBlockFromString: trailing text after the \
+                     \tactic expression (surplus or missing delimiter?)"
+      | _ => ()
   in
     case dec of
       SOME (HOLSourceAST.DecExp e) => TacticParse.parseTacticBlock e
@@ -74,9 +86,39 @@ fun goal_to_json (asms, concl) =
 fun goals_to_json_array goals =
   "[" ^ String.concatWith "," (map goal_to_json goals) ^ "]"
 
+(* HOL's goal printer warns when a goal carries two variables of the same name
+   and different types (goalStack.check_vars), but that printer never runs here:
+   goals are rendered with term_to_string, which shows no types at all, so the
+   colliding variables reach the caller indistinguishable. Report them. *)
+fun same_name_clashes (asms, concl) =
+  let
+    val vs = List.foldl (fn (t, acc) => acc @ free_vars t) [] (concl :: asms)
+    fun add (v, acc) = if List.exists (fn u => aconv u v) acc then acc else acc @ [v]
+    val uniq = List.foldl add [] vs
+    fun nameOf v = #1 (dest_var v)
+    fun typeOf v = #2 (dest_var v)
+    fun clashes v =
+      List.exists (fn u => nameOf u = nameOf v
+                           andalso Type.compare (typeOf u, typeOf v) <> EQUAL)
+                  uniq
+    val bad = List.filter clashes uniq
+    fun descr v = nameOf v ^ " : " ^ Parse.type_to_string (typeOf v)
+  in
+    if null bad then []
+    else ["WARNING: goal contains variables of same name but different types: " ^
+          String.concatWith ", " (map descr bad)]
+  end
+
 fun goals_json () =
-  let val goals = top_goals()
-  in print (json_ok (goals_to_json_array goals) ^ "\n") end
+  let
+    val goals = top_goals()
+    val warns = List.concat (map same_name_clashes goals)
+    val body = "\"ok\":" ^ goals_to_json_array goals
+  in
+    print ("{" ^ body ^
+           (if null warns then ""
+            else ",\"warnings\":" ^ json_string_array warns) ^ "}\n")
+  end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
 (* db_search_json: first-class DB search for the hol_search MCP tool.
