@@ -35,7 +35,7 @@ Only with explicit user authorization for THAT use; a green result under it prov
 A navigation/check that times out (or visibly hangs) is almost always a **looping tactic you just wrote**, not the already-built prefix (prefix theorems replay fast — they're cached/compiled). ⛔ Do NOT default to "the prefix is too slow"; that is the wrong first diagnosis and wastes the budget retrying with bigger timeouts.
 - **#1 cause: `simp`/`fs`/`gvs`/`rw[<recursive_def>]` WITHOUT `Once`** — recursive defs AND recursive semantics predicates unfold forever, worst inside their own induction. Fix + variants: [[feedback_hol4_mcp_proving]] §Rewriting that loops, oscillates, or blows up.
 - Other loops: a `GSYM`/symmetric-equality rewrite that oscillates (`a=b` and `b=a` both in scope); an unbounded `metis_tac`/`every_case_tac`/distributive-`simp` blowup.
-- **Diagnose, don't widen the timeout**: put a `cheat` at the frontier *before your newest tactic*, navigate to THAT cheat (cheap) to read the goal, then fix the loop. Only if the cheat-frontier navigation is ALSO slow is the prefix/target genuinely heavy (then sub-suspend / raise `timeout=`). "Repeating the prefix-is-slow excuse" is the documented failure mode here.
+- **Diagnose, don't widen the timeout**: frontier inside a `>-`/`THEN1`/`by (...)` chain → SUB-SUSPEND that arm; on a FLAT body only, put a `cheat` *before your newest tactic* and navigate to it (cheap) to read the goal. Then fix the loop. Only if that navigation is ALSO slow is the prefix/target genuinely heavy (raise `timeout=`). "Repeating the prefix-is-slow excuse" is the documented failure mode here.
 
 ## "desync" is essentially never the real cause
 A wrong-context proof and a true desync show the SAME headline (`replayed=0/N` + `PROOF BROKEN at <first step>`), so the headline tells you nothing — assume bad navigation (the GATE above) and PROVE it by replaying the committed body file-form (`hol_state_at` past QED, or `holmake`); it fails there too because the proof genuinely diverges. Don't reach for backward-nav/restart "resets". A genuine `hol_state_at` position-cache desync is only *theoretically* possible; if you ever truly confirm one on a provably-correct proof, REPORT it (minimal reproducer to `~/hol4-mcp/`) — never work around (RULE D).
@@ -46,7 +46,7 @@ Interactive `hol_send` is fine for navigating/probing the current goal (the GATE
 - **Accumulating a long verified chain only in the session** — lost on compaction, and never file-validated (RULE G).
 
 Correct loop — **persist + interleave**:
-1. The moment a sub-step verifies (a closed conjunct, a derived fact, a reduction), **flush it into the `*Script.sml` body** ending in `cheat`/`>- suspend "Frontier"` (RULE I), so replay scope = that arm.
+1. The moment a sub-step verifies (a closed conjunct, a derived fact, a reduction), **flush it into the `*Script.sml` body** ending in `>- suspend "Frontier"` (or `cheat` on a flat body) (RULE I), so replay scope = that arm.
 2. **Jump to the frontier with `hol_state_at`** to read the live goal — do NOT rebuild it by re-sending the prefix through `hol_send`.
 3. Use `hol_send` ONLY for a small probe at the already-parked frontier; read goal state via `hol_goals` (it sees `hol_send`-driven goals too), never a full `top_goal()` dump.
 4. On failure: isolate the SINGLE failing step and probe it small — do NOT re-send the whole chunk with a tweak.

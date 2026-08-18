@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-H6 -- PostToolUse hook injecting a reminder after hol_check_proof returns
-FAILED / TIMEOUT / PROOF BROKEN / "Tactic execution failed".
+H6 -- PostToolUse hook injecting a reminder after a navigation/check tool
+returns FAILED / TIMEOUT / PROOF BROKEN / "Tactic execution failed".
+
+Fires on hol_check_proof AND on the navigation tools (hol_state_at,
+hol_goals): those are the iteration-loop tools (RULE C reserves
+hol_check_proof for end-of-theorem confirmation), so a session that follows
+the rules meets every one of its failures through them.
 
 Two parts, both advisory (exit 0 always):
 
@@ -26,7 +31,8 @@ Rule source: hol4-proving skill RULE C ('HOL4 - iteration loop').
 """
 
 HOOK_EVENT = "PostToolUse"
-HOOK_MATCHER = "mcp__hol4__hol_check_proof"   # None = all calls for this event
+HOOK_MATCHER = ("mcp__hol4__hol_check_proof|mcp__hol4__hol_state_at"
+                "|mcp__hol4__hol_goals")
 
 import json
 import os
@@ -46,7 +52,10 @@ FAILURE_PATTERNS = [
     re.compile(r"PROOF BROKEN"),
 ]
 
-BANNER = "hol4-hook H6: hol_check_proof returned FAILED / TIMEOUT."
+TOOLS = ("mcp__hol4__hol_check_proof", "mcp__hol4__hol_state_at",
+         "mcp__hol4__hol_goals")
+
+BANNER = "hol4-hook H6: {tool} returned FAILED / TIMEOUT / PROOF BROKEN."
 
 REMINDER = """\
 Per hol4-proving skill RULE C, hol_check_proof is NOT a diagnosis tool — do
@@ -63,9 +72,22 @@ not re-run it to localize the failure.
     diverges silently from the file form (RULE G), and the all-goals drivers
     (`expandf`/`Manager.expand`) are banned.
 
-Re-running hol_check_proof on the same theorem without sub-suspending is a
-RULE C violation: the failure location stays hidden inside the opaque
-"Tactic execution failed" wrapper."""
+Re-running the same check, or re-probing line numbers around the break,
+without sub-suspending leaves the failure hidden inside the opaque wrapper
+(re-running hol_check_proof for this is also a RULE C violation)."""
+
+OPAQUE_HINT = """\
+The break is inside an OPAQUE step, so READ THE REPORT'S GOAL WITH CARE: it
+is the state ENTERING that step, NOT the failure point. Editing against it is
+editing against the wrong goal — the commonest way to burn a session here.
+`hol_state_at` cannot land inside a `THEN1 (...)` / `>- (...)` / `by (...)`
+chain, by design; more probes at nearby lines return that same entry goal
+(`replayed=k/N`, the identical goal at two consecutive lines), which is
+evidence of the parked break, not of a tactic that did nothing.
+Recovery, in order: (1) SUB-SUSPEND the arm — the default; (2) probe IN PLACE
+— the failed replay parks the proofManager at the pre-block goals, so small
+`e` steps work there now, with `b()` to undo and retry, no re-navigation.
+Detail: [[feedback_replay_discipline]] §state_at navigation limit."""
 
 # --- symptom table ----------------------------------------------------------
 #
@@ -167,6 +189,9 @@ def failure_mode(text):
     return "unsolved"
 
 
+OPAQUE = re.compile(r"opaque step at lines|Opaque tactic — cannot inspect")
+
+
 def matched_hint(text):
     tac = failing_tactic(text)
     if not tac:
@@ -183,13 +208,17 @@ def main():
         payload = json.load(sys.stdin)
     except Exception:
         return 0
-    if payload.get("tool_name", "") != "mcp__hol4__hol_check_proof":
+    tool = payload.get("tool_name", "")
+    if tool not in TOOLS:
         return 0
     text = output_text(payload)
     if not any(rx.search(text) for rx in FAILURE_PATTERNS):
         return 0
+    banner = BANNER.format(tool=tool.rsplit("__", 1)[-1])
     hint = matched_hint(text)
-    parts = [BANNER] + ([hint] if hint else []) + [REMINDER]
+    opaque = OPAQUE_HINT if OPAQUE.search(text) else None
+    parts = ([banner] + ([hint] if hint else []) + ([opaque] if opaque else [])
+             + [REMINDER])
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
