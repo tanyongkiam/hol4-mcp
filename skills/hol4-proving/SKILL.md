@@ -132,7 +132,7 @@ The `proofManagerLib` session is scratch, not storage. The moment a sub-step ver
 
 ### ⛔ RULE J — ONE HOL session at a time
 Use a single session; to switch theories, RESTART it into the new theory. A second concurrent session resolves bare theorem names to a built ancestor's OLD version and falsely "passes".
-Server-enforced: `hol_start` REFUSES a second concurrent session (escape hatch: `force=True`, only with a reason you can state), and a `file=` from a different workdir is refused — `hol_stop` the session first, then re-init (`hol_restart` needs user consent).
+Server-enforced: `hol_start` REFUSES a second concurrent session (escape hatch: `force=True`, only with a reason you can state), and a `file=` from a different workdir is refused — `hol_stop` the session first, then re-init.
 
 ### ⛔ RULE K — `skip_prefix=True` needs EXPLICIT user authorization
 `skip_prefix=True` on `hol_state_at`/`hol_goals` binds every PRIOR theorem by `cheat` (statement only, not replayed) — so the target's goal rests on UNVERIFIED prefix statements. The tool says so itself ("This is NOT a verification"). Do NOT use it on your own initiative — not to dodge a slow prefix theorem, not to "navigate faster", not as a substitute for the verification ladder. Default OFF.
@@ -163,7 +163,7 @@ Server-enforced: `hol_start` REFUSES a second concurrent session (escape hatch: 
 - `hol_send` / `proofManagerLib.e`: interactive probing — SMALL probes at a parked frontier. Can't reach into a `THEN1 (...)` / `>- (...)` arm? Sub-suspend it (don't hand-replay the prefix — risky fallback only).
 - `hol_check_proof`: end-of-theorem confirmation only (RULE C).
 - `holmake`: end-of-file gate only (RULE A).
-- `hol_restart`: effectively never — a broken/weird replay is YOUR proof or navigation error; re-diagnose, don't blame "stale state"/cache (essentially never the cause). Restart needs explicit user consent — ASK first ([[feedback_replay_discipline]]).
+- `hol_restart`: only for a stale ancestor `.dat` a live session cannot reload — never for a broken/weird replay, which is YOUR proof or navigation error to re-diagnose ([[feedback_replay_discipline]]).
 
 **End-of-proof verification ladder** (run after the audit gates pass):
 1. **Per-theorem**: `hol_state_at` past `QED` = "No goals (proof complete)" (no `[Inside by/>-]`/`PROOF BROKEN`/`TIMEOUT`) — OR `hol_check_proof` = `Status: OK`.

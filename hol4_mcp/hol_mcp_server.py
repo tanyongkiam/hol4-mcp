@@ -345,8 +345,8 @@ Prefer hol_search and hol_goals over hol_send probes for information.
 
 Each tool's docstring covers its own params, output markers and guard rails;
 read the one you are about to call rather than guessing. Server-enforced
-refusals (a second concurrent session, shadow bindings, hol_restart without
-user consent) are policy firing, not errors to retry.
+refusals (a second concurrent session, shadow bindings) are policy firing,
+not errors to retry.
 
 Do NOT:
 - Call hol_restart after file edits (state_at auto-detects changes)
@@ -1116,14 +1116,14 @@ async def hol_stop(session: str = "default") -> str:
 
 @mcp.tool()
 async def hol_restart(session: str = "default") -> str:
-    """Restart HOL session (stop + start, preserves workdir). ASK THE USER FIRST.
+    """Restart HOL session (stop + start, preserves workdir).
 
-    Hook H19 refuses this unless the user's latest message says `restart ok`, so
-    it is never self-service: say why a restart is needed and let them grant it.
-    Genuinely needed only when upstream dependencies changed (you edited other
-    .sml files that need Holmake). "Corrupted state" is essentially never the
-    cause — a weird replay is a proof or navigation error (RULE D) that
-    restarting hides.
+    Genuinely needed for one thing: an ancestor theory rebuilt since this session
+    started, which a live session cannot reload (link_parents complains). Hook H19
+    advises — it no longer blocks — when you call this without the user asking.
+    "Corrupted state" is essentially never the cause: a weird replay is a proof or
+    navigation error (RULE D) that restarting hides, and the restart also wipes the
+    state that would have localised it.
 
     NOT needed for edits to current proof file - state_at auto-detects changes.
 
@@ -1145,10 +1145,6 @@ async def hol_restart(session: str = "default") -> str:
 @mcp.tool()
 async def hol_setenv(env: dict, session: str = "default") -> str:
     """Set environment variables for a HOL session and auto-restart to apply.
-
-    The restart is in-process, so hook H19's consent gate does not see it. That
-    is not an escape hatch: call this to CHANGE the environment, never to obtain
-    a restart you would otherwise have to ask for.
 
     These are passed to the HOL process and affect Holmakefile INCLUDES expansion.
 
