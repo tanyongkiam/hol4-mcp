@@ -378,6 +378,38 @@ def _byte_to_char_offset(body_bytes: bytes, byte_offset: int) -> int:
     return len(body_bytes[:byte_offset].decode('utf-8', errors='replace'))
 
 
+def _plan_coverage_end(body: str) -> int:
+    """Offset just past the last character a step plan must account for.
+
+    Trailing whitespace and trailing SML comments (nesting allowed) sit
+    outside the plan legitimately; everything before them is executable text.
+    """
+    i = len(body)
+    while True:
+        while i > 0 and body[i - 1].isspace():
+            i -= 1
+        if i < 2 or body[i - 2:i] != '*)':
+            return i
+        # Walk back over a (possibly nested) trailing comment.
+        depth = 0
+        k = i
+        while k >= 2:
+            pair = body[k - 2:k]
+            if pair == '*)':
+                depth += 1
+                k -= 2
+            elif pair == '(*':
+                depth -= 1
+                k -= 2
+                if depth == 0:
+                    break
+            else:
+                k -= 1
+        if depth != 0:
+            return i          # unterminated: not a trailing comment
+        i = k
+
+
 def parse_step_plan_output(output: str, body: str | None = None) -> list[StepPlan]:
     """Parse JSON output from step_plan_json.
 
@@ -409,6 +441,24 @@ def parse_step_plan_output(output: str, body: str | None = None) -> list[StepPla
                 kind = str(item['type'])
                 text = str(item['text'])
                 steps.append(StepPlan(end=end, kind=kind, text=text))
+            if body is not None:
+                # The SML parser takes the FIRST declaration it can read and
+                # reports nothing about the rest, so a stray delimiter ends the
+                # expression early and every tactic after it vanishes from the
+                # plan. A plan that stops short of the body is not a plan.
+                covered = max((s.end for s in steps), default=0)
+                needed = _plan_coverage_end(body)
+                uncovered = body[covered:needed]
+                # A step's `end` legitimately stops before the closing
+                # delimiters of the construct it sits in, so only EXECUTABLE
+                # text left outside the plan means tactics were dropped.
+                if uncovered.strip(" \t\r\n)]},;"):
+                    raise HOLParseError(
+                        f"step plan covers only {covered} of {needed} chars of "
+                        f"the proof body: the parse stopped early and the "
+                        f"remaining tactics were dropped. Uncovered text: "
+                        f"{uncovered[:200]!r}"
+                    )
             return steps
         except (TypeError, ValueError, KeyError) as e:
             raise HOLParseError(f"Malformed step plan in output: {e}") from e
@@ -618,6 +668,31 @@ def _strip_strings(content: str) -> str:
         else:
             i += 1
     return ''.join(result)
+
+
+_BLOCK_OPEN_RE = re.compile(
+    r'^(Theorem|Triviality|Definition|Inductive|CoInductive|Datatype|Resume)\b'
+)
+_BLOCK_CLOSE_RE = re.compile(r'^[^\S\n]*(QED|End)[^\S\n]*$')
+
+
+def construct_start_line(content: str, line: int) -> int:
+    """First line of the block containing ``line``, or ``line`` itself.
+
+    Only some blocks are parsed into TheoremInfo (a plain ``Definition ... End``
+    and a ``Datatype`` are not), yet truncating a loaded prefix inside ANY of
+    them hands HOL a fragment.
+    """
+    lines = content.split('\n')
+    if not lines:
+        return line
+    idx = min(max(line, 1), len(lines)) - 1
+    for i in range(idx, -1, -1):
+        if i < idx and _BLOCK_CLOSE_RE.match(lines[i]):
+            return line          # a block ended before us: we are between blocks
+        if _BLOCK_OPEN_RE.match(lines[i]):
+            return i + 1
+    return line
 
 
 def parse_theorems(content: str) -> list[TheoremInfo]:

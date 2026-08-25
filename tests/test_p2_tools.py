@@ -212,18 +212,22 @@ val _ = export_theory();
 
 @pytest.mark.asyncio
 async def test_quote_diagnosis_in_state_at(tmp_path):
-    """A stray smart quote in a proof body surfaces the quote diagnosis when
-    the replay hits the resulting parse/lex error."""
+    """A stray smart quote in a proof body surfaces the quote diagnosis.
+
+    The quote splits the body into two SML declarations, so the step-plan
+    coverage check refuses it before the replay; either report is acceptable
+    as long as the diagnosis names the quote.
+    """
     test_file = tmp_path / "p2cquoteScript.sml"
     test_file.write_text(BAD_QUOTE_SCRIPT, encoding="utf-8")
     session = "p2c_quote_test"
     try:
-        # Replaying past the bad step (QED line) produces a parse-flavoured
-        # replay error; the diagnosis must name the stray quote.
+        # Navigating past the bad step (QED line) produces a parse-flavoured
+        # error; the diagnosis must name the stray quote.
         r = await hol_state_at(
             file=str(test_file), session=session, line=9, col=1
         )
-        assert "PROOF BROKEN" in r
+        assert "PROOF BROKEN" in r or r.startswith("ERROR"), f"unreported: {r}"
         assert "unmatched smart quote" in r, f"diagnosis missing: {r}"
         assert "--fix" in r
     finally:

@@ -47,6 +47,9 @@ _OPT = (r"(?:(?:-C|-c|--git-dir|--work-tree|--namespace|--exec-path)"
         r"(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*)\s+")
 COMMIT_RE = re.compile(r"\bgit\s+(?:" + _OPT + r")*commit\b")
 WORKDIR_RE = re.compile(r"\bgit\s+(?:-C|--git-dir=?)\s*(\S+)")
+# A leading `cd <dir> && ... git commit` retargets the repo just as `git -C` does;
+# without this the gate audits the session's cwd and judges the wrong repository.
+CD_RE = re.compile(r"(?:^|[;&|]|&&)\s*cd\s+(?!-)(\S+)")
 OVERRIDE_RE = re.compile(r"\bwip\s+ok\b", re.IGNORECASE)
 
 BANNED = [(re.compile(r"\bTRY\b"), "TRY"), (re.compile(r"\bORELSE\b"), "ORELSE"),
@@ -186,7 +189,7 @@ def main():
     if latest and OVERRIDE_RE.search(latest):
         return 0
 
-    m = WORKDIR_RE.search(command)
+    m = WORKDIR_RE.search(command) or CD_RE.search(command)
     cwd = m.group(1) if m else payload.get("cwd") or os.getcwd()
     if git(["rev-parse", "--git-dir"], cwd) is None:
         return 0                                   # not a repo: fail open
