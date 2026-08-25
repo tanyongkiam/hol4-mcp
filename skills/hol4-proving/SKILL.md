@@ -77,6 +77,7 @@ A theory-level final check, NEVER used to "see what happens" / "check if it buil
 - **Allowed**: ONCE at end-of-file, after every theorem passed the per-theorem ladder AND the audit gates pass. Or to unstick a stale dependency `.dat` so a session can load (setup, not iteration).
 - **Forbidden**: running it on a theory you're editing, "to check progress" or "just to confirm" anything mid-proof.
 - Reaching for holmake during proof work → STOP. Use `hol_state_at` to read the goal, `hol_send` to probe tactics. Goal nested inside `THEN1 (...)`? Sub-suspend the arm and read it with `hol_state_at` — not holmake.
+- **Always the `holmake` MCP tool** — never `Holmake` through Bash (backgrounded, `nohup`, or otherwise). The tool owns the build environment, timeout and heap, and its result is what the audit gates read; a shell build is unmanaged and invisible to them.
 
 ### ⛔ RULE B — PLAN before TACTICS, every time
 Before a single tactic against a non-trivial cheat/goal, in user-facing text:
