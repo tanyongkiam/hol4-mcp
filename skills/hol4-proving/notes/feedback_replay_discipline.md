@@ -1,6 +1,6 @@
 ---
 name: feedback_replay_discipline
-description: "#1 rule — navigate in an accurate state (full prefix); tool selection; state_at navigation limit + sub-suspend recovery; desync is essentially never the cause."
+description: "#1 rule — navigate in an accurate state (full prefix); upstream-edit staleness (rebuild before downstream reliance, H30); tool selection; state_at navigation limit + sub-suspend recovery; desync is essentially never the cause."
 metadata:
   type: feedback
 ---
@@ -29,7 +29,12 @@ Telltale symptom of a dropped/reordered prefix step: a tail tactic over-runs wit
 Only with explicit user authorization for THAT use; a green result under it proves nothing (re-confirm without). Manage replay cost the real way: build ancestor theories before proof work (setup `holmake <dep>.dat` — RULE A permits dependency unsticking), fix a file's theorems in file order so navigation replays a green prefix, and shrink scope with sub-suspends — never by skipping the prefix.
 
 ## `hol_restart` — for a stale ancestor `.dat`, never for a confusing replay
-`hol_state_at` auto-detects edits to the file you are proving in, so a restart after editing is never needed. It fixes exactly ONE thing: an ancestor theory rebuilt since the session started, which a live session cannot reload (`link_parents` names the theory). Prefer ordering the work so it cannot arise — build ancestors before proof work — and restart when it does. A broken replay, a wrong-looking goal, or a tactic that will not close is a proof or navigation error: diagnose it (§desync), because the restart wipes the very state that localises it. H19 advises, it does not block; a second restart for the same symptom means the first substituted for a diagnosis you had not made.
+`hol_state_at` auto-detects edits to the file you are proving in, so a restart after editing is never needed. It fixes exactly ONE thing: an ancestor theory rebuilt since the session started, which a live session cannot reload (`link_parents` names the theory). Prefer ordering the work so it cannot arise — build ancestors before proof work — and restart when it does. A broken replay, a wrong-looking goal, or a tactic that will not close is a proof or navigation error: diagnose it (§desync), because the restart wipes the very state that localises it. H29 blocks a REPEAT stop/restart on the same working file within 30 min (first stop and file switches pass; `restart ok` overrides); a second restart for the same symptom means the first substituted for a diagnosis you had not made.
+
+## ⛔ Upstream Script.sml edits stale ALL downstream results — nothing reports it
+Editing a `*Script.sml` invalidates every theory downstream of it, but no tool says so: live sessions AND fresh loads read the BUILT `<thy>Theory.dat` (HOL's `load` inspects no script content and no mtime), so downstream navigation and checks keep passing — against the PRE-EDIT upstream. GATE: after editing a theory other theories depend on, REBUILD it (mcp `holmake`) before relying on any downstream navigation, check, or green result. Batch upstream edits and rebuild once, but the rebuild comes before downstream reliance, never "later". H30 enforces this (make-style staleness over the target's ancestor closure; self-clears once artifacts are newer than sources; `stale ok` = user-approved deferral).
+
+`Missing dependency: <thy>` on navigation is NOT that staleness being reported. It means the dep's compiled artifacts were absent or mid-write when the session initialised (typically a rebuild in progress): the failed `load` is skipped silently at init and surfaces later, mislocated, at the header send. Wait for / run the rebuild and retry; do not stop/restart-loop or edit tactics against it.
 
 ## ⛔ A state_at / check_proof TIMEOUT is YOUR looping tactic — NOT a slow prefix
 A navigation/check that times out (or visibly hangs) is almost always a **looping tactic you just wrote**, not the already-built prefix (prefix theorems replay fast — they're cached/compiled). ⛔ Do NOT default to "the prefix is too slow"; that is the wrong first diagnosis and wastes the budget retrying with bigger timeouts.

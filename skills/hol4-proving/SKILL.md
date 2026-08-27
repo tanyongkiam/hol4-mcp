@@ -33,6 +33,7 @@ You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tacti
 | a navigation or check TIMEOUT | [[feedback_replay_discipline]] §TIMEOUT |
 | a probe took >2 min and it is NOT a cold start (server prints `SLOW NAVIGATION #n`) | this skill, *HOL4 — suspend/Resume/Finalise* — shrink the replayed unit BEFORE the next edit |
 | a green check that may rest on a cheated dependency | [[feedback_replay_discipline]] §auto-cheat |
+| navigation errors with `Missing dependency: <thy>` / `Failed to load dependency`, or you just edited a Script.sml other theories depend on | [[feedback_replay_discipline]] §Upstream Script.sml edits stale ALL downstream results |
 | "No such label" / a lost suspension / a duplicate-label dispatcher | first check the Resume header's label is UNQUOTED — a quoted one reports as this same symptom (§Syntax and structural forms) — then [[feedback_suspend_resume]] |
 | a term parsed differently than you read it — a "trivially true" `by simp[]` that fails, a `qmatch` that raises | §Syntax and structural forms |
 | a `hol_check_proof` trace or status you are not sure how to read | §`hol_check_proof` semantics |

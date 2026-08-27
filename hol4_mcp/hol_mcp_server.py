@@ -1294,8 +1294,9 @@ async def hol_restart(session: str = "default") -> str:
     """Restart HOL session (stop + start, preserves workdir).
 
     Genuinely needed for one thing: an ancestor theory rebuilt since this session
-    started, which a live session cannot reload (link_parents complains). Hook H19
-    advises — it no longer blocks — when you call this without the user asking.
+    started, which a live session cannot reload (link_parents complains). Hook H29
+    blocks a REPEAT stop/restart on the same working file within 30 min (first
+    stop and file switches pass; `restart ok` in the user's message overrides).
     "Corrupted state" is essentially never the cause: a weird replay is a proof or
     navigation error (RULE D) that restarting hides, and the restart also wipes the
     state that would have localised it.
