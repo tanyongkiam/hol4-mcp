@@ -558,7 +558,14 @@ class FileProofCursor:
             # is sticky across every later navigation.
             if first_changed <= self._loaded_to_line:
                 boundary = construct_start_line(content, first_changed)
-                self._loaded_to_line = max(0, boundary - 1)
+                # `_loaded_to_line` is EXCLUSIVE — lines 1..n-1 are loaded and
+                # the resend starts AT n — so the boundary is the value itself.
+                # Storing boundary-1 restarted one line early, handing HOL the
+                # last line of whatever precedes the construct; for a multi-line
+                # comment that tail parses as terms and surfaces as
+                # "Unknown identifier: <word of the comment>". 0 is kept for the
+                # first construct, where it means "cold" to the load path.
+                self._loaded_to_line = boundary if boundary > 1 else 0
                 self._loaded_content_hash = ""  # Empty string = needs recompute
 
             # Fixing a broken suspend/Resume chain: the session-global suspension

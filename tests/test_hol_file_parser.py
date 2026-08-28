@@ -811,6 +811,37 @@ class TestFormatStepContext:
         result = format_step_context(plan, fail_idx=4, step_lines=lines)
         assert result == ["", "=== Failing tactic ===", "cheat", "Opaque tactic — cannot inspect inside of cheat. Use Suspend/Resume or extract as a lemma."]
 
+    def test_long_opaque_body_is_elided_and_not_echoed_twice(self):
+        """A preserved multi-hundred-line arm must not be echoed in full, twice.
+
+        The failure is *inside* the opaque step either way, so the body carries
+        no localisation signal; echoing it once after the header and again
+        inside the "Opaque tactic" notice cost tens of thousands of tokens per
+        failed check on a real 350-line arm.
+        """
+        body = "\n".join(f"  \\\\ tactic_number_{i} []" for i in range(300))
+        plan = [StepPlan(end=10, kind="expand", text=body)]
+        result = format_step_context(plan, fail_idx=0, step_lines=[10])
+        joined = "\n".join(result)
+
+        assert "lines elided" in joined, "long body was not elided"
+        assert joined.count("tactic_number_0 []") == 1, (
+            "body echoed more than once (header + opaque notice)"
+        )
+        assert "Opaque tactic — cannot inspect inside it." in joined
+        assert len(joined) < len(body) / 5, (
+            f"elision left {len(joined)} chars from a {len(body)}-char body"
+        )
+
+    def test_short_opaque_tactic_still_named_in_full(self):
+        """The elision must not degrade the common short-tactic message."""
+        plan = [StepPlan(end=10, kind="expand", text="cheat")]
+        result = format_step_context(plan, fail_idx=0, step_lines=[10])
+        assert result[-1] == (
+            "Opaque tactic — cannot inspect inside of cheat. "
+            "Use Suspend/Resume or extract as a lemma."
+        )
+
     def test_then_chain_no_nesting(self):
         """>> chain tactics should be at the same depth (sequential, not nested)."""
         plan = [

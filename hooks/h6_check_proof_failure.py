@@ -153,6 +153,10 @@ BLOCK_END = re.compile(r"^\s*(===|Remaining:|Use hol_state_at|NOTE:|To localize:
                        r"|Opaque tactic|Status:|ERROR:|TIMEOUT:)")
 COMBINATOR = re.compile(r"\s*(>>|>-|>~|>>~|\\\\|THEN1|THEN)\s*")
 MAX_STEP_CHARS = 200   # above this the step is a lump, not one tactic
+# The server elides a huge failing body down to head+tail; what is left can fall
+# under MAX_STEP_CHARS, so the marker — not the surviving length — is what says
+# "this step is a lump".
+ELIDED = re.compile(r"\.\.\.\s*\d+\s*lines elided\s*\.\.\.")
 
 
 def failing_tactic(text):
@@ -172,7 +176,7 @@ def failing_tactic(text):
             break
         body.append(l.strip())
     step = " ".join(body)
-    if not step or len(step) > MAX_STEP_CHARS:
+    if not step or len(step) > MAX_STEP_CHARS or ELIDED.search(step):
         return None
     step = COMBINATOR.sub(" ", step, count=1).strip() if COMBINATOR.match(step) else step
     # Only the FIRST tactic of the step ran unconditionally; a token after a

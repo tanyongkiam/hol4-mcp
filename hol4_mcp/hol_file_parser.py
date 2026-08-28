@@ -310,6 +310,33 @@ def format_steps(
     return out
 
 
+ELIDE_KEEP_HEAD = 8
+ELIDE_KEEP_TAIL = 2
+
+
+def elide_long_text(
+    text: str,
+    keep_head: int = ELIDE_KEEP_HEAD,
+    keep_tail: int = ELIDE_KEEP_TAIL,
+) -> str:
+    """Bound an echoed tactic/error so a huge body cannot swamp the report.
+
+    A preserved multi-hundred-line arm carries no more diagnostic signal in its
+    middle than in its opening lines — when the step is opaque the failure is
+    somewhere inside it either way — so keep the head (which tactic starts the
+    chain) and the tail, and count what was dropped.
+    """
+    lines = text.split("\n")
+    if len(lines) <= keep_head + keep_tail + 1:
+        return text
+    dropped = len(lines) - keep_head - keep_tail
+    return "\n".join(
+        lines[:keep_head]
+        + [f"    ... {dropped} lines elided ..."]
+        + lines[-keep_tail:]
+    )
+
+
 def format_step_context(
     step_plan: list[StepPlan],
     fail_idx: int,
@@ -335,9 +362,14 @@ def format_step_context(
     failing_kind = step_plan[fail_idx].kind
     # Use structural display name if it's an open/mid step
     failing_display = _STEP_DISPLAY.get(failing_kind, failing_text)
-    out = ["", failing_header, failing_display]
+    shown = elide_long_text(failing_display)
+    out = ["", failing_header, shown]
     if failing_kind in ("expand", "expand_list"):
-        out.append(f"Opaque tactic — cannot inspect inside of {failing_display}. Use Suspend/Resume or extract as a lemma.")
+        # Naming the tactic again is only useful while it is short enough to
+        # read; for an elided body it would repeat what was just printed.
+        target = (f"inside of {failing_display}"
+                  if shown == failing_display else "inside it")
+        out.append(f"Opaque tactic — cannot inspect {target}. Use Suspend/Resume or extract as a lemma.")
 
     if context_before <= 0 and context_after <= 0:
         return out
@@ -682,6 +714,12 @@ def construct_start_line(content: str, line: int) -> int:
     Only some blocks are parsed into TheoremInfo (a plain ``Definition ... End``
     and a ``Datatype`` are not), yet truncating a loaded prefix inside ANY of
     them hands HOL a fragment.
+
+    The gap BETWEEN two blocks needs the same care: it can hold a multi-line
+    comment or a ``val``/``fun`` declaration spanning lines, and resending from
+    the middle of one hands HOL a fragment just the same. A fragment of a
+    comment is the nastiest, since its words then parse as terms and surface as
+    ``Unknown identifier: <word>`` pointing nowhere near the edit.
     """
     lines = content.split('\n')
     if not lines:
@@ -689,7 +727,7 @@ def construct_start_line(content: str, line: int) -> int:
     idx = min(max(line, 1), len(lines)) - 1
     for i in range(idx, -1, -1):
         if i < idx and _BLOCK_CLOSE_RE.match(lines[i]):
-            return line          # a block ended before us: we are between blocks
+            return i + 2         # start of the gap after the block that closed
         if _BLOCK_OPEN_RE.match(lines[i]):
             return i + 1
     return line

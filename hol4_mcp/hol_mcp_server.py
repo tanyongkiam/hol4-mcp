@@ -26,7 +26,7 @@ from .hol_session import HOLSession, HOLDIR, escape_sml_string
 from .hol_cursor import FileProofCursor, StateAtResult, _try_find_json_line
 from .hol_file_parser import (
     HOLParseError, step_line_numbers, format_steps, format_step_context,
-    step_text_start,
+    step_text_start, elide_long_text,
 )
 from .quote_check import quote_diagnosis_lines
 
@@ -2232,7 +2232,9 @@ async def hol_check_proof(
 
     if final.error:
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")
-        lines.append(f"Error: {final.error}")
+        # HOL echoes the whole failing ML expression, so for a big opaque arm
+        # this line alone can be hundreds of lines of the body being replayed.
+        lines.append(f"Error: {elide_long_text(final.error)}")
         # Timeout attribution: name the step's source span so the user can
         # shrink the lump instead of guessing which tactic is slow.
         fe = trace_data[failed_idx]
