@@ -22,9 +22,114 @@ Two things every hook needs and none should reimplement:
   text the shell would execute. What the shell WOULD run inside a string is
   kept: `$(...)` and backtick substitutions, the argument of `-c`/`eval`,
   and the substitutions of an unquoted heredoc.
+- `soft_block(...)` / `pregranted(...)` / `session_overrides(...)` — the
+  soft-hook protocol: a situation is blocked ONCE per session window with
+  the full message; an identical retry passes with a prominent override
+  note and a log entry; a consent phrase in ANY user turn of the session
+  pre-grants. The hard hooks (H14, H27) do not use these — they read the
+  latest user message only.
 """
 import json
+import os
 import re
+import sys
+import time
+
+STATE_ROOT = os.path.expanduser("~/.claude/hook-state")
+SOFT_WINDOW_S = 30 * 60
+
+
+def session_state_dir(payload):
+    return os.path.join(STATE_ROOT, payload.get("session_id") or "nosession")
+
+
+def _load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def _save_json(path, obj):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+    except OSError:
+        pass
+
+
+def emit_context(text, event="PreToolUse"):
+    """Allow the call and put `text` in front of the model (and the user)."""
+    print(json.dumps({
+        "hookSpecificOutput": {"hookEventName": event, "additionalContext": text},
+        "systemMessage": text,
+    }))
+
+
+def granted(payload, phrase_re):
+    """True if the phrase appears in ANY real user turn of the session, None
+    if the transcript is unreadable (fail open)."""
+    msgs = user_messages(payload)
+    if msgs is None:
+        return None
+    return any(phrase_re.search(m) for m in msgs)
+
+
+def pregranted(payload, hook, phrase_re, phrase, note):
+    """Allow with a note when the user pre-granted `phrase` earlier in the
+    session; False (nothing printed) otherwise."""
+    if not granted(payload, phrase_re):
+        return False
+    emit_context(f"[{hook}: {note} — pre-granted by your `{phrase}`]")
+    return True
+
+
+def soft_block(payload, hook, fingerprint, lines, override_note, window_s=SOFT_WINDOW_S):
+    """Block the situation `fingerprint` once; an identical retry inside the
+    window passes with an override note and is logged. Returns the exit code."""
+    path = os.path.join(session_state_dir(payload), "soft_blocks.json")
+    state = _load_json(path, {})
+    blocks = state.setdefault("blocks", {})
+    key = f"{hook}:{fingerprint}"
+    now = time.time()
+    ts = blocks.get(key)
+    if ts is not None and 0 <= now - float(ts) < window_s:
+        state.setdefault("overrides", []).append(
+            {"hook": hook, "ts": now, "what": override_note})
+        _save_json(path, state)
+        emit_context(f"⚠ {hook} OVERRIDDEN by repeat: {override_note}")
+        return 0
+    blocks[key] = now
+    _save_json(path, state)
+    for ln in lines:
+        print(ln, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Blocked once. If, having read this, you still judge the call right, repeat",
+          file=sys.stderr)
+    print("it unchanged: it passes with a note and is logged as your decision (the",
+          file=sys.stderr)
+    print("session's overrides are listed at the next git commit).", file=sys.stderr)
+    return 2
+
+
+def session_overrides(payload):
+    """The overrides logged this session, oldest first."""
+    path = os.path.join(session_state_dir(payload), "soft_blocks.json")
+    return list(_load_json(path, {}).get("overrides", []))
+
+
+def overrides_summary(payload):
+    """One line per hook: `H30 ×3 (what)`, or '' when nothing was overridden."""
+    counts = {}
+    for o in session_overrides(payload):
+        h = o.get("hook", "?")
+        counts.setdefault(h, [0, o.get("what", "")])
+        counts[h][0] += 1
+    if not counts:
+        return ""
+    return "; ".join(f"{h} ×{n} ({what})" for h, (n, what) in sorted(counts.items()))
 
 _HEREDOC = re.compile(r"<<-?\s*(?:(['\"])(\w+)\1|\\?(\w+))")
 _KEEP_ARG_OF = ("-c", "-lc", "-ec", "-lec", "eval")
@@ -147,8 +252,27 @@ def _text_of(content):
     return str(content)
 
 
-def latest_user_message(payload):
-    """Text of the newest real user turn, or None if unreadable (fail open)."""
+def _user_turn_text(line):
+    """Text of a transcript line that is a real user turn, else None."""
+    try:
+        event = json.loads(line)
+    except Exception:
+        return None
+    content = None
+    if event.get("role") == "user":                       # flat
+        content = event.get("content", "")
+    msg = event.get("message")
+    if content is None and isinstance(msg, dict) and msg.get("role") == "user":
+        content = msg.get("content", "")                  # nested
+    if content is None and event.get("type") == "user":   # type field
+        content = event.get("content", "") or event.get("text", "")
+    if content is None or _is_tool_result_only(content):
+        return None
+    return _text_of(content)
+
+
+def user_messages(payload):
+    """Texts of every real user turn, oldest first, or None if unreadable."""
     path = payload.get("transcript_path", "")
     if not path:
         return None
@@ -157,23 +281,18 @@ def latest_user_message(payload):
             lines = f.readlines()
     except (FileNotFoundError, OSError):
         return None
-    for line in reversed(lines):
+    out = []
+    for line in lines:
         line = line.strip()
         if not line:
             continue
-        try:
-            event = json.loads(line)
-        except Exception:
-            continue
-        content = None
-        if event.get("role") == "user":                       # flat
-            content = event.get("content", "")
-        msg = event.get("message")
-        if content is None and isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content", "")                  # nested
-        if content is None and event.get("type") == "user":   # type field
-            content = event.get("content", "") or event.get("text", "")
-        if content is None or _is_tool_result_only(content):
-            continue
-        return _text_of(content)
-    return None
+        text = _user_turn_text(line)
+        if text is not None:
+            out.append(text)
+    return out
+
+
+def latest_user_message(payload):
+    """Text of the newest real user turn, or None if unreadable (fail open)."""
+    msgs = user_messages(payload)
+    return msgs[-1] if msgs else None

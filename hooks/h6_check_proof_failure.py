@@ -43,6 +43,7 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_payload import output_text  # noqa: E402
@@ -314,6 +315,9 @@ def main():
     theorem = theorem_of(payload, text)
     short = tool.rsplit("__", 1)[-1]
     shape_hints = output_hints(text)
+    if BUDGET_ROW.search(text) or "TIMEOUT after" in text:
+        # H29 lets a stop/restart through shortly after a budget TIMEOUT.
+        save_state(os.path.join(os.path.dirname(path), "last_timeout"), time.time())
     if not any(rx.search(text) for rx in FAILURE_PATTERNS):
         if state.get("theorem") == theorem:
             save_state(path, {})

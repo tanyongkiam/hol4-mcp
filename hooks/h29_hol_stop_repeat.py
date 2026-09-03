@@ -15,9 +15,12 @@ needs one: hol_state_at auto-detects file edits and rebuilt ancestors and
 moves the session across workdirs itself (MCP server), and every stop forces
 a cold prefix reload of the whole theory on the next navigation.
 
-Fail-open: unknown working file, unreadable state, or unreadable transcript
-never blocks. Escape hatch: literal phrase `restart ok` in the latest user
-message (the retired hook's phrase, kept).
+Soft hook: the repeat is blocked once, then an identical retry passes with an
+override note and is logged (hook_payload.soft_block). A stop within ten
+minutes of a budget TIMEOUT recorded by H6 passes outright (a wedged session
+is a real possibility there). The literal phrase `restart ok` anywhere in
+the session's user turns pre-grants. Fail-open: unknown working file,
+unreadable state, or unreadable transcript never blocks.
 """
 
 HOOK_EVENT = "PreToolUse"
@@ -30,10 +33,23 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_payload import latest_user_message  # noqa: E402
+from hook_payload import emit_context, granted, pregranted, soft_block  # noqa: E402
 
 STATE = os.path.expanduser("~/.claude/hook-state")
 COOLDOWN_S = 30 * 60
+TIMEOUT_GRACE_S = 10 * 60
+
+
+def recent_timeout_age(payload):
+    """Seconds since H6 recorded a budget TIMEOUT on a navigation this
+    session, if within the grace window; else None."""
+    try:
+        with open(os.path.join(session_dir(payload), "last_timeout"),
+                  encoding="utf-8") as fh:
+            age = time.time() - float(fh.read().strip())
+    except Exception:
+        return None
+    return age if 0 <= age < TIMEOUT_GRACE_S else None
 CONSENT_RE = re.compile(r"\brestart\s+ok\b", re.IGNORECASE)
 TOOLS = ("mcp__hol4__hol_stop", "mcp__hol4__hol_restart")
 
@@ -94,46 +110,47 @@ def main():
     tool = payload.get("tool_name", "")
     if tool not in TOOLS:
         return 0
-    latest = latest_user_message(payload)
-    if latest is None:
+    consent = granted(payload, CONSENT_RE)
+    if consent is None:
         return 0  # fail-open
-    if CONSENT_RE.search(latest):
-        record_stop(payload, tool, working_file(payload))
-        return 0  # the user asked for it
     path = working_file(payload)
+    if pregranted(payload, "H29", CONSENT_RE, "restart ok", f"{tool}"):
+        record_stop(payload, tool, path)
+        return 0
     prev = last_stop(payload)
     prev_file = prev.get("file") if prev else None
     if (path and prev_file
             and os.path.dirname(prev_file) == os.path.dirname(path)):
         age = time.time() - float(prev.get("ts", 0))
         if 0 <= age < COOLDOWN_S:
+            since_timeout = recent_timeout_age(payload)
+            if since_timeout is not None:
+                record_stop(payload, tool, path)
+                emit_context(
+                    f"[H29: {tool} allowed -- a navigation hit its budget "
+                    f"(TIMEOUT) {int(since_timeout // 60)} min ago, so a wedged "
+                    f"session is a real possibility. Otherwise a repeat stop in "
+                    f"the same directory is the ritual-stop pattern.]")
+                return 0
             mins = int(age // 60)
-            print(f"hol4-hook H29: refused {tool} -- repeat stop/restart "
-                  f"{mins} min after the last one, still working in the same "
-                  f"directory:", file=sys.stderr)
-            print(f"  {os.path.dirname(path)}", file=sys.stderr)
-            print("", file=sys.stderr)
-            print("A stop/restart is NEVER part of the edit-check loop:",
-                  file=sys.stderr)
-            print("hol_state_at auto-detects file edits, reloads the session "
-                  "after an ancestor", file=sys.stderr)
-            print("rebuild and moves it to a new workdir itself (MCP server "
-                  "contract), and every", file=sys.stderr)
-            print("stop forces a cold prefix reload of the whole theory on "
-                  "the next navigation.", file=sys.stderr)
-            print("", file=sys.stderr)
-            print("Auto-allowed: the first stop/restart, and any stop once "
-                  "the working file", file=sys.stderr)
-            print("is in another directory (finished a theory / switched "
-                  "theories).", file=sys.stderr)
-            print("", file=sys.stderr)
-            print("If this one is genuinely needed (session pollution; a "
-                  "changed", file=sys.stderr)
-            print("Definition misbehaving in a live session), say so and ask "
-                  "the user to", file=sys.stderr)
-            print("include the literal phrase `restart ok` in their next "
-                  "message.", file=sys.stderr)
-            return 2
+            code = soft_block(payload, "H29", os.path.dirname(path), [
+                f"hol4-hook H29: refused {tool} -- repeat stop/restart {mins} min "
+                f"after the last one, still working in the same directory:",
+                f"  {os.path.dirname(path)}",
+                "",
+                "A stop/restart is NEVER part of the edit-check loop:",
+                "hol_state_at auto-detects file edits, reloads the session after an ancestor",
+                "rebuild and moves it to a new workdir itself (MCP server contract), and every",
+                "stop forces a cold prefix reload of the whole theory on the next navigation.",
+                "A weird replay or a goal that looks wrong is a proof or navigation error to",
+                "diagnose (RULE D), which the restart would erase.",
+                "",
+                "Auto-allowed: the first stop/restart, any stop once the working file is in",
+                "another directory, and a stop shortly after a budget TIMEOUT.",
+            ], f"repeat stop/restart in {os.path.dirname(path)} within 30 min")
+            if code == 0:
+                record_stop(payload, tool, path)
+            return code
     record_stop(payload, tool, path)
     return advise(tool)
 

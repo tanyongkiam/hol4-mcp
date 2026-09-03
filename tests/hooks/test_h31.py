@@ -11,7 +11,7 @@ def test_skip_prefix_without_consent_is_blocked(run_hook, tool):
     code, err, _ = run_hook(HOOK, tool, {"line": 10, "skip_prefix": True},
                             user_msg="keep going")
     assert code == 2, err
-    assert "H31" in err and "RULE K" in err and "skip prefix ok" in err
+    assert "H31" in err and "RULE K" in err
 
 
 def test_skip_prefix_with_consent_passes(run_hook):

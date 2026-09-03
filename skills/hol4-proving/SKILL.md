@@ -5,7 +5,7 @@ description: HOL4 proof-work ruleset (RULES A–K, audit gates, iteration loop, 
 
 # HOL4 proving rules
 
-You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tactic applies, distinguish wrong proof structure from a missing step. Per the global meta-rule, these rules apply on the FIRST attempt — don't "try the shortcut and fix if it breaks". Several rules are also runtime-enforced by hooks — a blocked tool call citing an H-number is enforcement firing, not an error to retry.
+You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tactic applies, distinguish wrong proof structure from a missing step. Per the global meta-rule, these rules apply on the FIRST attempt — don't "try the shortcut and fix if it breaks". Hooks enforce several rules. A HARD block (H1, H14, H17, H20, H23, H27) is not an error to retry. A SOFT block (H28–H32) fires once: fix what it names, or — if you still judge the call right — repeat it unchanged; it passes with an override note logged for the user. Never ask the user for a consent phrase.
 
 **Trigger moments** — "I think I'm done", "ready for holmake", a tactic that won't close, the SECOND failed inline tactic attempt on the same goal, an MCP output that looks wrong, about to write a proof plan, ANY symptom in the index below → STOP and consult the named section before acting.
 
@@ -38,7 +38,7 @@ You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tacti
 | a term parsed differently than you read it — a "trivially true" `by simp[]` that fails, a `qmatch` that raises | §Syntax and structural forms |
 | a `hol_check_proof` trace or status you are not sure how to read | §`hol_check_proof` semantics |
 
-Unqualified `§` names are sections of [[feedback_hol4_mcp_proving]]. H6 injects six of these rows at the moment they apply (three failing-tactic shapes; `INSIDE step`, a budget `TIMEOUT`, `No such label`), so those reach you without being remembered — the rest do not, which is why the index above is a rule and not a convenience.
+Unqualified `§` names are sections of [[feedback_hol4_mcp_proving]]. H6 injects six of these rows when they apply (three failing-tactic shapes; `INSIDE step`, a budget `TIMEOUT`, `No such label`); the rest you must come and get, which is why the index above is a rule and not a convenience.
 
 ⛔ **MUST READ IN FULL at these triggers** — the trigger fires once and you read the whole file, before doing the thing named:
 
@@ -74,10 +74,10 @@ After all seven pass, proceed to the End-of-proof verification ladder (HOL4 — 
 ## ⛔ CRITICAL HOL4 RULES — APPLY ON EVERY PROOF, FIRST ATTEMPT
 
 ### ⛔ RULE A — `holmake` is the file gate, never the way to check an edit
-The violation has one shape: **the same target built twice with an edit between and no goal read** — "see if it builds", "check the cheat is gone", "just to confirm". H7 names it when it happens. The build state of a cheated theory is known a priori.
+The violation has one shape: **the same target built twice with an edit between and no goal read** — "see if it builds", "check the cheat is gone", "just to confirm". H7 names it. The build state of a cheated theory is known a priori.
 - **Allowed**: ONCE at end-of-file, after every theorem passed the per-theorem ladder AND the audit gates; or to unstick a stale dependency `.dat` so a session can load (setup, not iteration).
 - Reaching for holmake mid-proof → STOP: `hol_state_at` reads the goal (it auto-detects the edit); an arm nested inside `THEN1 (...)` is sub-suspended and read there — not built.
-- **Build ownership**: always name the `target`; never an untargeted directory-wide build, and never one whose stale ancestors live in another directory, without the user's `build ok` (H32). Always the `holmake` MCP tool, never `Holmake` through Bash (H28); a long build is `holmake(detach=True)` + `hol_build_status`.
+- **Build ownership**: always name the `target`; an untargeted directory-wide build is the user's call (H32, soft). Always the `holmake` MCP tool, never `Holmake` through Bash (H28, soft); a long build is `holmake(detach=True)` + `hol_build_status`.
 
 ### ⛔ RULE B — PLAN before TACTICS, every time
 Before a single tactic against a non-trivial cheat/goal, in user-facing text:
@@ -134,7 +134,7 @@ The `proofManagerLib` session is scratch, not storage. The moment a sub-step ver
 A second concurrent session resolves bare theorem names to a built ancestor's OLD version and falsely "passes"; `hol_start` refuses it (`force=True` only with a reason you can state). Switching theories is `file=` — the session moves with it (`[Session restarted: workdir …]`; the old workdir's context and open suspensions are gone) — and a rebuilt ancestor reloads itself on the next call (`[Session reloaded: …]`). Neither needs a stop/restart.
 
 ### ⛔ RULE K — `skip_prefix=True` needs EXPLICIT user authorization
-`skip_prefix=True` binds every PRIOR theorem by `cheat`, so the target's goal rests on UNVERIFIED statements; a green result under it proves NOTHING (re-confirm without it before any done-claim). Only the user authorizes it, for THAT use — H31 refuses the call unless their latest message contains `skip prefix ok`. Otherwise navigate the real way: full replay, a sub-suspended arm, or built ancestors.
+`skip_prefix=True` binds every PRIOR theorem by `cheat`, so the target's goal rests on UNVERIFIED statements; a green result under it proves NOTHING (re-confirm without it before any done-claim). Only the user authorizes it, for THAT use — by `skip prefix ok` anywhere in the session, or by your deliberate repeat after H31's soft block, which is logged for them. Otherwise navigate the real way: full replay, a sub-suspended arm, or built ancestors.
 
 ## HOL4-specific working principles
 
@@ -142,8 +142,8 @@ A second concurrent session resolves bare theorem names to a built ancestor's OL
 - **No accidental proofs.** Tactics that close by stumbling (`metis_tac` loops, `gs[]` blowups, `every_case_tac`) are tech debt — name the lemma, name the case-split.
 - **Read the original before adapting.** Fixing a cheated/broken proof → read the original (`git show HEAD:<file>`) first; minimal targeted edits, fix the theorem in place (no sibling/wrapper/variant). Substantially different tactics are fine; shipping an easier-to-prove *statement* is case 3 in [[feedback_unprovable_vs_unfound_proof]] — report up, don't ship a divergent statement.
 - **New definitions/statements: informal argument first; interface over unfolds.** Sketch the informal proof before any HOL text; be critical the definition/statement captures the intent BEFORE proving against it; prove a new definition's interface lemmas and prefer them to raw unfolds ([[feedback_hol4_mcp_proving]] §Proof strategy; plan ordering: [[feedback_proof_plan_pointers]]).
-- **No side-quests without a request.** A tool oddity, a slow build, a suspected MCP bug: report it in one line and continue the proof. RULE D's reproducer duty is "report, don't chase" — the reproducer is written when the user asks for it, not instead of the theorem.
-- **Act only after the decision is settled.** A question to the user, a plan awaiting approval, an option you presented: nothing downstream of it is edited, built or navigated until the answer is in. Guessing the answer and proceeding is the violation, not the guess being wrong.
+- **No side-quests without a request.** A tool oddity, a slow build, a suspected MCP bug: report it in one line and continue the proof; RULE D's reproducer is written when the user asks, not instead of the theorem.
+- **Act only after the decision is settled.** While a question, a plan approval or a presented option is pending, nothing downstream of it is edited, built or navigated. Proceeding on a guessed answer is the violation, whether or not the guess is right.
 (The generic working principles in global CLAUDE.md — fall back to simpler, privilege contradicting signals, one unit at a time, verification matches the claim — apply with full force to proof work.)
 
 ## HOL4 — iteration loop

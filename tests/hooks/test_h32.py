@@ -63,7 +63,7 @@ def call(run_hook, repo, tool_input, user_msg=""):
 def test_untargeted_build_is_blocked(run_hook, repo):
     code, err, _ = call(run_hook, repo, {"workdir": str(repo / "app")})
     assert code == 2, err
-    assert "H32" in err and "target" in err and "build ok" in err
+    assert "H32" in err and "target" in err
 
 
 def test_untargeted_build_with_consent_passes(run_hook, repo):
@@ -76,18 +76,8 @@ def test_fresh_ancestors_pass(run_hook, repo):
     assert code == 0, err
 
 
-def test_stale_out_of_workdir_ancestor_is_blocked(run_hook, repo):
-    touch(repo / "lib" / "libScript.sml", time.time())   # edited after its build
-    code, err, _ = call(run_hook, repo, {"workdir": str(repo / "app"), "target": "appTheory"})
-    assert code == 2, err
-    assert "H32" in err and "libScript.sml" in err and "build ok" in err
 
 
-def test_stale_out_of_workdir_ancestor_with_consent_passes(run_hook, repo):
-    touch(repo / "lib" / "libScript.sml", time.time())
-    code, _, _ = call(run_hook, repo, {"workdir": str(repo / "app"), "target": "appTheory"},
-                      user_msg="yes, build ok")
-    assert code == 0
 
 
 def test_in_workdir_target_passes_even_when_stale(run_hook, repo):

@@ -23,10 +23,12 @@ or older than a direct ancestor's artifact. The target file itself is exempt
 target's repo (HOL stdlib) are skipped.
 
 Self-clearing: rebuilding (mcp__hol4__holmake) makes artifacts newer than
-sources and the block disappears. Fail-open on any internal error, unknown
-target file, unreadable transcript, or closure larger than the cap. Escape
-hatch for a deliberate, user-approved deferral: literal phrase `stale ok` in
-the latest user message.
+sources and the block disappears. Soft hook: a given (file, stale set) is
+blocked once, then an identical retry passes with an override note and is
+logged (hook_payload.soft_block); a newly stale theory blocks again. The
+literal phrase `stale ok` anywhere in the session's user turns pre-grants
+the deferral. Fail-open on any internal error, unknown target file,
+unreadable transcript, or closure larger than the cap.
 """
 
 HOOK_EVENT = "PreToolUse"
@@ -41,7 +43,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_payload import latest_user_message  # noqa: E402
+from hook_payload import granted, pregranted, soft_block  # noqa: E402
 
 STATE = os.path.expanduser("~/.claude/hook-state")
 H30_DIR = os.path.join(STATE, "h30")
@@ -345,43 +347,46 @@ def main():
             return 0
     except Exception:
         return 0  # never disturb work because of a checker bug
-    latest = latest_user_message(payload)
-    if latest is None:
+    consent = granted(payload, CONSENT_RE)
+    if consent is None:
         return 0  # fail-open
-    if CONSENT_RE.search(latest):
-        return 0  # user-approved deferral
-    err = sys.stderr
-    print(f"hol4-hook H30: refused {tool} on "
-          f"{os.path.basename(target)} -- stale ancestor theories.", file=err)
+    stale_names = sorted(os.path.basename(p) for p, _ in roots)
+    if pregranted(payload, "H30", CONSENT_RE, "stale ok",
+                  f"stale ancestors {', '.join(stale_names)} of "
+                  f"{os.path.basename(target)}; results here are not trustworthy "
+                  f"until they are rebuilt"):
+        return 0
+    lines = [f"hol4-hook H30: refused {tool} on {os.path.basename(target)} -- "
+             f"stale ancestor theories."]
     for spath, why in roots[:MAX_ROOTS_SHOWN]:
-        print(f"  {spath}", file=err)
-        print(f"    {why}", file=err)
+        lines += [f"  {spath}", f"    {why}"]
     if len(roots) > MAX_ROOTS_SHOWN:
-        print(f"  ... and {len(roots) - MAX_ROOTS_SHOWN} more edited-unbuilt "
-              f"ancestors", file=err)
+        lines.append(f"  ... and {len(roots) - MAX_ROOTS_SHOWN} more edited-unbuilt "
+                     f"ancestors")
     if n_down:
-        print(f"  (+ {n_down} theories built before their own ancestors)",
-              file=err)
-    print("", file=err)
-    print("Downstream sessions and fresh loads read the BUILT .dat, so every",
-          file=err)
-    print("check on this file would silently run against the PRE-EDIT "
-          "upstream;", file=err)
-    print("no tool reports that. Rebuild before relying on anything here:",
-          file=err)
-    tgt = " or ".join(t + "Theory" for t in direct_stale[:3]) or "the stale theories"
-    print(f"  mcp__hol4__holmake workdir={os.path.dirname(target)} "
-          f"target={tgt} timeout=1800", file=err)
-    print("(Holmake pulls stale ancestors across directories; repeat/split "
-          "calls if it", file=err)
-    print("exceeds the timeout. The block clears itself once artifacts are "
-          "newer than", file=err)
-    print("their sources.)", file=err)
-    print("", file=err)
-    print("For a deliberate, user-approved deferral, ask the user to include "
-          "the", file=err)
-    print("literal phrase `stale ok` in their next message.", file=err)
-    return 2
+        lines.append(f"  (+ {n_down} theories built before their own ancestors)")
+    lines += [
+        "",
+        "Downstream sessions and fresh loads read the BUILT .dat, so every check",
+        "on this file would silently run against the PRE-EDIT upstream; no tool",
+        "reports that. Rebuild each stale theory from its own directory, then",
+        "the target's direct dependencies:",
+    ]
+    for spath, _ in roots[:MAX_ROOTS_SHOWN]:
+        thy = os.path.basename(spath)[:-len("Script.sml")]
+        lines.append(f"  mcp__hol4__holmake workdir={os.path.dirname(spath)} "
+                     f"target={thy}Theory")
+    for name in direct_stale[:3]:
+        if name + "Script.sml" not in stale_names:
+            lines.append(f"  mcp__hol4__holmake workdir=<{name}'s directory> "
+                         f"target={name}Theory")
+    lines += ["(Long builds: detach=True + hol_build_status. The block clears itself",
+              "once artifacts are newer than their sources.)"]
+    fingerprint = target + "|" + "|".join(sorted(p for p, _ in roots))
+    return soft_block(payload, "H30", fingerprint, lines,
+                      f"navigating {os.path.basename(target)} against STALE ancestors "
+                      f"{', '.join(stale_names)}; nothing checked here is trustworthy "
+                      f"until they are rebuilt")
 
 
 if __name__ == "__main__":

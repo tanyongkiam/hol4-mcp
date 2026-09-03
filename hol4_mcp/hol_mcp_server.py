@@ -1441,8 +1441,8 @@ async def hol_restart(session: str = "default") -> str:
     been rebuilt ("[Session reloaded: ancestor ...]"), and move it to another
     workdir when file= points there ("[Session restarted: workdir ...]"). Hook
     H29 blocks a REPEAT stop/restart in the same theory directory within 30 min
-    (first stop and directory switches pass; `restart ok` in the user's message
-    overrides). "Corrupted state" is essentially never the cause: a weird replay
+    once (first stop, directory switches and a stop right after a budget TIMEOUT
+    pass; a deliberate repeat passes and is logged for the user). "Corrupted state" is essentially never the cause: a weird replay
     is a proof or navigation error (RULE D) that restarting hides, and the
     restart also wipes the state that would have localised it.
 
@@ -1544,8 +1544,8 @@ _PROGRESS_INTERVAL = 10  # seconds
 async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 600, heap_size: int = 12288, jobs: int = None, detach: bool = False) -> str:
     """Run Holmake --qof in directory.
 
-    Name the target (hook H32 refuses an untargeted build, and a target whose
-    stale ancestors live outside workdir, without the user's `build ok`).
+    Name the target (hook H32 blocks an untargeted, whole-directory build once;
+    it is the user's call, pre-grantable with `build ok`).
 
     Args:
         workdir: Directory containing Holmakefile

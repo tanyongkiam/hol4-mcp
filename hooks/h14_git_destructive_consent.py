@@ -32,7 +32,9 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_payload import latest_user_message, visible_command  # noqa: E402
+from hook_payload import (  # noqa: E402
+    emit_context, latest_user_message, overrides_summary, visible_command,
+)
 
 # `git` takes global options BEFORE the verb (`git -C dir commit`,
 # `git --no-pager push`, `git -c k=v commit`), so the verb is not always the
@@ -85,10 +87,16 @@ def main():
     latest = latest_user_message(payload)
     if latest is None:
         return 0  # fail-open
+    tally = overrides_summary(payload) if matched == "git commit" else ""
     if CONSENT_RE.search(latest):
+        if tally:
+            # The soft hooks' overrides surface where the work gets recorded.
+            emit_context(f"[H14: this session overrode soft hooks -- {tally}]")
         return 0
     # Block
     print(f"hol4-hook H14: refused destructive git op: {matched!r}", file=sys.stderr)
+    if tally:
+        print(f"(this session overrode soft hooks -- {tally})", file=sys.stderr)
     print("", file=sys.stderr)
     print("CLAUDE.md '⛔ Editing and git':", file=sys.stderr)
     print("  No git command that modifies working-tree or repo state runs", file=sys.stderr)

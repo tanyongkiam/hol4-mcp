@@ -19,8 +19,10 @@ grep pattern or a Python line inside a heredoc is not a command either;
 `name=...` is an assignment, and a lone `-v`/`--help` query is not a build
 or a REPL.
 
-Escape hatch: the literal phrase `shell holmake ok` in the latest user
-message. Fails open if the transcript is missing or unreadable.
+Soft hook: the same command is blocked once, then an identical retry passes
+with an override note and is logged (hook_payload.soft_block). The literal
+phrase `shell holmake ok` anywhere in the session's user turns pre-grants.
+Fails open if the transcript is missing or unreadable.
 
 Rule source: hol4-proving skill '⛔ RULE A' (holmake is the file-build gate)
 and the corpus layer table (MCP tools are the point of contact).
@@ -35,7 +37,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_payload import latest_user_message, visible_command  # noqa: E402
+from hook_payload import granted, pregranted, soft_block, visible_command  # noqa: E402
 
 # A command position: string start, or after a shell separator. Prevents
 # matching `grep Holmake log`, `--- holmake procs ---`, paths, and comments.
@@ -80,23 +82,23 @@ def main():
     matched = find_match(cmd)
     if not matched:
         return 0
-    latest = latest_user_message(payload)
-    if latest is None:
+    consent = granted(payload, CONSENT_RE)
+    if consent is None:
         return 0  # fail-open
-    if CONSENT_RE.search(latest):
+    if pregranted(payload, "H28", CONSENT_RE, "shell holmake ok",
+                  f"shell invocation of {matched!r}"):
         return 0
-    print(f"hol4-hook H28: refused shell invocation of {matched!r}.", file=sys.stderr)
-    print("", file=sys.stderr)
-    print(f"Use {REPLACEMENT[matched]} instead.", file=sys.stderr)
-    print("", file=sys.stderr)
-    print("The MCP tool reports its own completion and returns the failing log", file=sys.stderr)
-    print("excerpt; a shell build needs a hand-rolled sentinel, and Holmake's", file=sys.stderr)
-    print("failure lines do not match the obvious guesses -- the poller hangs", file=sys.stderr)
-    print("while the build is already dead.", file=sys.stderr)
-    print("", file=sys.stderr)
-    print("If a shell build is genuinely required, include the literal phrase", file=sys.stderr)
-    print("`shell holmake ok` in your next message.", file=sys.stderr)
-    return 2
+    return soft_block(payload, "H28", " ".join(cmd.split()), [
+        f"hol4-hook H28: refused shell invocation of {matched!r}.",
+        "",
+        f"Use {REPLACEMENT[matched]} instead; a build longer than the synchronous",
+        "budget is holmake(detach=True) + hol_build_status.",
+        "",
+        "The MCP tool reports its own completion and returns the failing log",
+        "excerpt; a shell build needs a hand-rolled sentinel, and Holmake's",
+        "failure lines do not match the obvious guesses -- the poller hangs",
+        "while the build is already dead.",
+    ], f"shell {matched} run outside the MCP tools; nothing reports on it")
 
 
 if __name__ == "__main__":
