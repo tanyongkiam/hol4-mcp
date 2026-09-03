@@ -8,14 +8,19 @@ hol_goals): those are the iteration-loop tools (RULE C reserves
 hol_check_proof for end-of-theorem confirmation), so a session that follows
 the rules meets every one of its failures through them.
 
-Two parts, both advisory (exit 0 always):
+Two parts, both advisory (exit 0 always), keyed on repeats per session
+(state under ~/.claude/hook-state/<session_id>/h6_failures.json):
 
-1. A RULE C reminder: hol_check_proof is not a diagnosis tool, sub-suspend the
-   failing arm instead of re-running it.
-2. When the failing tactic matches the symptom table below, the corpus fact
-   that explains that symptom. The facts are written down already and are
-   still rediscovered by debugging, because the notes are indexed by CAUSE
-   and the reader arrives with a SYMPTOM. The hook has the symptom in hand.
+1. When the failing tactic matches the symptom table below, the corpus fact
+   that explains that symptom -- on every failure. The facts are written down
+   already and are still rediscovered by debugging, because the notes are
+   indexed by CAUSE and the reader arrives with a SYMPTOM. The hook has the
+   symptom in hand.
+2. A RULE C reminder -- hol_check_proof is not a diagnosis tool, sub-suspend
+   the failing arm instead of re-running it -- only from the SECOND
+   consecutive failure on the same theorem, the moment the rule is actually
+   being broken. A first failure with no symptom row is silent; a failure on
+   another theorem, or a pass, starts the count over.
 
 Calibration: the hint fires ONLY on a table match against a SHORT failing
 step whose FIRST tactic is a listed one -- a token buried in a lumped opaque
@@ -44,6 +49,7 @@ from hook_payload import output_text  # noqa: E402
 
 FAILURE_PATTERNS = [
     re.compile(r"TIMEOUT after \d+(\.\d+)?s"),
+    re.compile(r"TIMEOUT: state_at exceeded"),
     re.compile(r"Status:\s*FAILED"),
     re.compile(r"Status:\s*INCOMPLETE"),
     re.compile(r"Status:\s*ERROR"),
@@ -77,17 +83,13 @@ without sub-suspending leaves the failure hidden inside the opaque wrapper
 (re-running hol_check_proof for this is also a RULE C violation)."""
 
 OPAQUE_HINT = """\
-The break is inside an OPAQUE step, so READ THE REPORT'S GOAL WITH CARE: it
-is the state ENTERING that step, NOT the failure point. Editing against it is
-editing against the wrong goal — the commonest way to burn a session here.
-`hol_state_at` cannot land inside a `THEN1 (...)` / `>- (...)` / `by (...)`
-chain, by design; more probes at nearby lines return that same entry goal
-(`replayed=k/N`, the identical goal at two consecutive lines), which is
-evidence of the parked break, not of a tactic that did nothing.
-Recovery, in order: (1) SUB-SUSPEND the arm — the default; (2) probe IN PLACE
-— the failed replay parks the proofManager at the pre-block goals, so small
-`e` steps work there now, with `b()` to undo and retry, no re-navigation.
-Detail: [[feedback_replay_discipline]] §state_at navigation limit."""
+The break is inside an OPAQUE step: the report's first line already names the
+step and the sub-suspend recipe — do that, not another probe. Any goal shown
+(show_partial) is the state ENTERING the step, not the failure point; probes
+at nearby lines return that same entry goal. Alternative: probe IN PLACE —
+the failed replay parks the proofManager at the pre-block goals, so small
+`e` steps work there, with `b()` to undo. Detail:
+[[feedback_replay_discipline]] §state_at navigation limit."""
 
 # --- symptom table ----------------------------------------------------------
 #
@@ -145,6 +147,64 @@ TABLE = [
      SIMP_HINT),
 ]
 
+# --- output-shape rows ------------------------------------------------------
+#
+# Keyed on the SERVER'S OWN diagnostic line rather than the failing tactic, so
+# they need no tactic block and fire whether or not the call counted as a
+# failure. Each names the corpus fact for that output shape.
+
+INSIDE_ROW = re.compile(r"NOTE: target line \d+ is INSIDE step (\d+)")
+BUDGET_ROW = re.compile(r"TIMEOUT: state_at exceeded .*?prefix=([\d.]+)s.*?target=([\d.]+)s")
+LABEL_ROW = re.compile(r"No such label")
+
+INSIDE_HINT = """\
+The position is INSIDE an opaque step, so the goal shown is the step's ENTRY,
+not the state at your line. Do not edit against it. Sub-suspend the arm now:
+replace the arm with `>- suspend "X"` and append `Resume {thm}[X]: cheat QED`
+after the parent QED; then `hol_state_at` inside the Resume body lands on the
+real goal with the file owning the prefix. Detail: [[feedback_hol4_mcp_proving]]
+§Reading a `>-` / `THEN1` / `\\\\`-chain arm's goal."""
+
+BUDGET_HINT = """\
+Read the split: prefix={prefix}s went to dependency load + earlier theorems,
+target={target}s to this theorem's own tactics. {verdict} Detail:
+[[feedback_replay_discipline]] §TIMEOUT."""
+
+BUDGET_VERDICT_TARGET = ("The budget ran out in YOUR tactics: a looping rewrite "
+                         "(`simp[<recursive_def>]` without `Once`, a GSYM oscillation) "
+                         "or a blown-up prover -- sub-suspend the arm and read the goal; "
+                         "do not widen timeout=.")
+BUDGET_VERDICT_PREFIX = ("Your tactics never ran: the prefix is the cost. Build the "
+                         "ancestors (holmake) so they load from .dat and read `startup=` "
+                         "on a passing call.")
+
+LABEL_HINT = """\
+`No such label`: a Resume whose suspension was never registered. Check, in
+order: (1) the Resume header's label is UNQUOTED (`Resume thm[Arm]:`, not
+`["Arm"]`) -- a quoted one reports as this same symptom; (2) the dispatcher's
+own QED navigates to "No goals" -- a dispatcher that broke before its
+`suspend` registers nothing, and the output's "Ancestor chain" line names
+the first broken ancestor; fix that one first. Detail:
+[[feedback_suspend_resume]]."""
+
+
+def output_hints(text):
+    """Hints keyed on the server's own diagnostic lines, in output order."""
+    out = []
+    m = INSIDE_ROW.search(text)
+    if m:
+        t = THEOREM_RE.search(text)
+        out.append(INSIDE_HINT.format(thm=t.group(1) if t else "thm"))
+    m = BUDGET_ROW.search(text)
+    if m:
+        target = float(m.group(2))
+        verdict = BUDGET_VERDICT_TARGET if target >= 0.5 else BUDGET_VERDICT_PREFIX
+        out.append(BUDGET_HINT.format(prefix=m.group(1), target=m.group(2), verdict=verdict))
+    if LABEL_ROW.search(text):
+        out.append(LABEL_HINT)
+    return out
+
+
 FAIL_HEADERS = ("=== Failing tactic ===",
                 "=== Where replay stopped (raised exception) ===")
 # The failing-tactic block ends at the first line that starts a new report
@@ -193,7 +253,7 @@ def failure_mode(text):
     return "unsolved"
 
 
-OPAQUE = re.compile(r"opaque step at lines|Opaque tactic — cannot inspect")
+OPAQUE = re.compile(r"in opaque step \d+|opaque step at lines|Opaque tactic — cannot inspect")
 
 
 def matched_hint(text):
@@ -207,6 +267,39 @@ def matched_hint(text):
     return None
 
 
+STATE = os.path.expanduser("~/.claude/hook-state")
+THEOREM_RE = re.compile(r"^Theorem:\s*([A-Za-z0-9_']+)", re.M)
+
+
+def state_file(payload):
+    return os.path.join(STATE, payload.get("session_id") or "nosession",
+                        "h6_failures.json")
+
+
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_state(path, state):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+    except OSError:
+        pass
+
+
+def theorem_of(payload, text):
+    m = THEOREM_RE.search(text)
+    if m:
+        return m.group(1)
+    return payload.get("tool_input", {}).get("theorem") or "?"
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -216,13 +309,29 @@ def main():
     if tool not in TOOLS:
         return 0
     text = output_text(payload)
+    path = state_file(payload)
+    state = load_state(path)
+    theorem = theorem_of(payload, text)
+    short = tool.rsplit("__", 1)[-1]
+    shape_hints = output_hints(text)
     if not any(rx.search(text) for rx in FAILURE_PATTERNS):
+        if state.get("theorem") == theorem:
+            save_state(path, {})
+        if not shape_hints:
+            return 0
+        parts = [f"hol4-hook H6: {short} output needs reading."] + shape_hints
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse", "additionalContext": "\n\n".join(parts)}}))
         return 0
-    banner = BANNER.format(tool=tool.rsplit("__", 1)[-1])
+    count = state.get("count", 0) + 1 if state.get("theorem") == theorem else 1
+    save_state(path, {"theorem": theorem, "count": count})
+    banner = BANNER.format(tool=short)
     hint = matched_hint(text)
     opaque = OPAQUE_HINT if OPAQUE.search(text) else None
-    parts = ([banner] + ([hint] if hint else []) + ([opaque] if opaque else [])
-             + [REMINDER])
+    parts = ([banner] + ([hint] if hint else []) + shape_hints
+             + ([opaque] if opaque else []) + ([REMINDER] if count >= 2 else []))
+    if len(parts) == 1:
+        return 0
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",

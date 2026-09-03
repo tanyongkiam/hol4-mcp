@@ -30,30 +30,32 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H3  | ⏭     | PreToolUse            | `Write`                 | ~~Block writes to `~/.claude/memory/` containing project-specific anchors~~ — skipped (token fingerprint list is high-maintenance; not worth the upkeep for a placement rule the audit gates already catch on read) |
 | H4  | 📝     | PreToolUse            | `Edit\|Write\|MultiEdit` | Warn on `Resume` body starting with `‘Q’ by tac` (step-plan splits at `by`) |
 | H5  | ⏭     | PreToolUse            | `mcp__hol4__hol_check_proof` | ~~Block re-call after FAILED with no intervening `hol_state_at` (RULE C)~~ — skipped (H6 covers the failure-time nudge; the block-step needs per-session state that wasn't worth the machinery) |
-| H6  | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof` | Inject reminder on `FAILED` / `TIMEOUT` / `PROOF BROKEN` / "Tactic execution failed" (advisory only; never blocks) |
-| H7  | ✅     | PostToolUse           | `mcp__hol4__holmake`    | Inject RULE A reminder on every `holmake` call (advisory only; calibrated for legitimate end-of-file gate to disregard) |
+| H6  | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|hol_state_at\|hol_goals` | On `FAILED` / `TIMEOUT` / `PROOF BROKEN`: the symptom-table hint for the failing tactic on every failure; the RULE C reminder only from the SECOND consecutive failure on the same theorem (per-session state; a pass or another theorem resets). Silent first failure with no matching row. Advisory only |
+| H7  | ✅     | PostToolUse           | `mcp__hol4__holmake`    | RULE A reminder only on the edit-then-rebuild signature: a rebuild of the same (workdir, target) within 30 min after a `*Script.sml` edit (per-session state). First build and edit-free retries are silent. Advisory only |
 | H8  | ✅     | PostToolUse           | `mcp__hol4__hol_state_at` | Inject cost-discipline reminder on any single `hol_state_at` call whose `replay` time ≥ 30s (stateless; cache hits and error paths skipped) |
 | H9  | ⏭     | PreToolUse            | `mcp__hol4__hol_restart` | ~~Default-block; CLAUDE.md says "effectively never"~~ — skipped (escape-hatch design too messy for the rare legitimate case; CLAUDE.md text is sufficient deterrent) |
 | H10 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Inject Finalise reminder when a Resume block introduces a new theorem to a `Script.sml` without a matching `Finalise <thm>;` (diff-aware on theorem names; sub-Resumes on existing theorems silent) |
 | H11 | ⏭     | PreToolUse            | `mcp__hol4__holmake`    | ~~Gate 1: no leftover sub-Resume labels outside the dispatcher's `suspend` set~~ — skipped (parsing complexity not justified now; Gate 1 audit at end-of-discharge still covers) |
 | H12 | ⏭     | PreToolUse            | `mcp__hol4__holmake`    | ~~Gate 3: no `(* preserved/original/master *)` comment blocks in discharged regions~~ — skipped (low-value debris check) |
 | H13 | ⏭     | PreToolUse            | `mcp__hol4__holmake`    | ~~Gate 5 cross-check: scan git-modified theorems for banned tactics~~ — skipped (subsumed by H1 at write-time; safety-net value low) |
-| H14 | ✅     | PreToolUse            | `Bash`                  | Block destructive git ops without literal `git ok` in the latest user message (transcript-aware; fail-open if transcript unreadable) |
+| H14 | ✅     | PreToolUse            | `Bash`                  | Block destructive git ops without literal `git ok` in the latest user message (transcript-aware; fail-open if transcript unreadable). Quoted strings are blanked first; `merge-base`, `stash list/show` and `clean -n/--dry-run` are read-only and pass |
 | H15 | ⏭     | PreToolUse            | `Write`                 | ~~On `~/.claude/plans/` writes, advise if "Operating principles" section is missing~~ — skipped (high FP on non-proof plans; marker regex fragile; plan template is the better forcing function) |
 | H16 | ✅     | PostToolUse           | `mcp__hol4__hol_state_at\|mcp__hol4__hol_send\|mcp__hol4__hol_check_proof` | Inject advisory when goal display contains `⅋ᵣ` / `resconj` — the canonical indicator that multiple subgoals were bundled into one Resume body via a shared `suspend` label (hol4-proving skill "one label = one goal" violation) |
 | H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored non-canonical `suspend` in `*Script.sml` edits: THEN-form (`>>` / `\\` / `THEN` then `suspend "..."`) and the `by (suspend "...")` justification form — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects) |
 | H18 | ✅     | PreToolUse            | `mcp__hol4__hol_send\|Edit\|Write\|MultiEdit` | Block the `markerLib` suspension-lookup query (the `(string*thm) option` one — returns NONE in a bare session, tempts guessing the suspended goal); point to `set_suspended_goal` to actually load it |
 | H19 | ⏭     | PreToolUse            | `mcp__hol4__hol_restart` | ~~Advise (never block) on `hol_restart` without the user asking~~ — superseded by H29 (repeat-keyed block covering `hol_stop` + `hol_restart`); the file is a silent shim until its settings.json entry is removed by hand |
 | H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥6 THEN-combinators, or ≥8 non-blank lines with ≥2 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
-| H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work |
+| H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work. In any directory, name hook-wiring drift (`install_hooks.drift`: scripts here not in settings.json, or wired but absent) |
 | H23 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block the standalone-`prove` workflow in `hol_send` (`prove(` / `store_thm(` / `save_thm(` / `TAC_PROOF(`) — RULE I + RULE G: a proof closed in the scratch session with a hand-typed goal proves nothing about the file form; write a `Theorem … QED` or sub-suspend the arm (`>- suspend` + `Resume`) |
 | H24 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Advise (never block) on newly-defined tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) in `*Script.sml` — lifting a tactic needs a strong stated justification; defaults are lift a LEMMA or leave the duplication. Diff-aware on binding names; `*Lib.sml`/`*Syntax.sml` out of scope by the path test |
 | H25 | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|mcp__hol4__hol_state_at\|mcp__hol4__holmake` | Sweep finished proof text for composition defects (adjacent normalisers, `impl_tac` sandwich, `>-` not marking a sibling, near-identical sibling arms, nested splitter ladders, n-ary tactic forms, self-feeding lambdas). Fires per theorem on `hol_check_proof` → `Status: OK`; counts-only backstop on `holmake` for git-modified scripts. Advisory; checks live in `proof_sweep.py` |
 | H26 | ✅     | —                     | —                      | **Implemented inside H6**, not as its own hook: it fires on the same event with the same payload, so a separate hook would mean two messages on one failure. See "The symptom table" under H6 |
-| H27 | ✅     | PreToolUse            | `Bash`                  | Run the audit gates against a `git commit` touching `*Script.sml` and block on what it finds — diff-scoped, so only theorems the commit touches are judged. Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem. Override with `wip ok` |
-| H28 | ✅     | PreToolUse            | `Bash`                  | Block shell invocations of `Holmake` / raw `poly`\|`hol`, redirecting to `mcp__hol4__holmake` / `hol_start`. Command-position match only, so prose and log paths pass. Override with `shell holmake ok` |
-| H29 | ✅     | PreToolUse            | `mcp__hol4__hol_stop\|mcp__hol4__hol_restart` | Block a REPEAT `hol_stop`/`hol_restart` within 30 min while the cached working file (H25's `hol4_file`) is unchanged — the ritual-stop signature; stop/restart is never part of the edit-check loop (`hol_state_at` auto-detects edits, every stop costs a cold prefix reload). First stop and any stop after a file switch pass with a one-line reminder. Supersedes H19; lands what H9 skipped, the repeat-key answering H9's escape-hatch objection. Override with `restart ok` |
+| H27 | ✅     | PreToolUse            | `Bash`                  | Run the audit gates against a `git commit` touching `*Script.sml` and block on what it finds — diff-scoped (index vs HEAD, `--amend` included), so only theorems whose PROOF TEXT the commit touches are swept. Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem, minus the lone-`>-` prompt (H25's advisory); findings grouped per theorem. Override with `wip ok` |
+| H28 | ✅     | PreToolUse            | `Bash`                  | Block shell invocations of `Holmake` / raw `poly`\|`hol`, redirecting to `mcp__hol4__holmake` / `hol_start`. Command-position match only, after quoted strings and heredoc bodies are blanked (`hook_payload.visible_command`), so prose, log paths, grep patterns, `hol=...` assignments and `--help`/`-v` queries pass. Override with `shell holmake ok` |
+| H29 | ✅     | PreToolUse            | `mcp__hol4__hol_stop\|mcp__hol4__hol_restart` | Block a REPEAT `hol_stop`/`hol_restart` within 30 min while the cached working file (H25's `hol4_file`) is still in the same directory — the ritual-stop signature; stop/restart is never part of the edit-check loop (`hol_state_at` auto-detects edits, reloads after an ancestor rebuild and moves the session across workdirs itself; every stop costs a cold prefix reload). First stop and any stop once the working file is in another directory pass with a one-line reminder. Supersedes the retired advisory-only restart hook. Override with `restart ok` |
 | H30 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|hol_goals\|hol_check_proof\|hol_send\|hol_start` | Block HOL navigation of a file whose ANCESTOR theories are stale — script newer than its built artifacts, artifacts missing (mid-rebuild), or built before their own ancestors' artifacts. Forecloses "edited upstream, kept working downstream": sessions and fresh loads read the built `.dat`, so downstream checks silently run against the pre-edit upstream with no native symptom. Make-style check over the `Ancestors`/`open` closure (comment-stripped, duplicate names resolved nearest-first, mtime-memoized under `~/.claude/hook-state/h30/`); self-clears on rebuild; target file itself exempt; also keeps H25's `hol4_file` cache current for `hol_goals`/`hol_start`. Override with `stale ok` |
+| H31 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|mcp__hol4__hol_goals` | Block `skip_prefix: true` without the literal `skip prefix ok` in the latest user message (RULE K: prefix-skip binds every earlier theorem by `cheat`; only the user can authorize that use). `false`/absent never fires |
+| H32 | ✅     | PreToolUse            | `mcp__hol4__holmake`    | Build ownership (RULE A): refuse a `holmake` with no `target`, and a target whose stale ancestors (H30's closure check, imported) live OUTSIDE the workdir — Holmake would follow INCLUDES and rebuild other directories' theories. In-workdir targets with fresh or in-workdir-stale ancestors pass. Override with `build ok` |
 
 Skipped: H2, H3, H5, H9, H11, H12, H13, H15. H21 (holmake-on-cheated-theory
 blocker) was proposed and rejected. H4 is the only live proposal.
@@ -136,9 +138,12 @@ hot-reload).
 **File**: `h6_check_proof_failure.py`
 **Event**: `PostToolUse`
 **Matcher**: `mcp__hol4__hol_check_proof`
-**Effect**: never blocks. Injects a RULE C reminder on a failed
-`hol_check_proof`, plus — when the failing tactic matches the symptom table —
-the corpus fact that explains that symptom.
+**Effect**: never blocks. On a failed check or navigation, injects — when the
+failing tactic matches the symptom table — the corpus fact that explains that
+symptom, and from the SECOND consecutive failure on the same theorem the RULE C
+reminder as well. A first failure with no matching row is silent. State:
+`~/.claude/hook-state/<session_id>/h6_failures.json` (theorem, count); a pass
+on that theorem or a failure on another one resets it.
 
 ### What triggers it
 
@@ -169,6 +174,15 @@ right moment and already has the failing tactic in its payload.
 | `drule*` / `irule*` / `match_mp_tac` / `mp_then` | raised | free tyvar in the lemma's OWN statement; or the constant is `[simp]`-tagged and no longer an atom; or the assumption is not yet in the lemma's shape |
 | `simp` / `simp_tac` / `asm_simp_tac` / `srw_tac` | left goals | `simp` uses assumptions as they stand; `fs`/`gvs`/`rw` simplify them first — and split a disjunctive assumption |
 
+Three more rows key on the server's own diagnostic line instead of a tactic,
+and fire whether or not the call counted as a failure:
+
+| output line | injected hint |
+|---|---|
+| `NOTE: target line N is INSIDE step k` | the goal shown is the step's entry; the sub-suspend recipe with its `Resume thm[X]: cheat QED` terminator |
+| `TIMEOUT: state_at exceeded ... prefix=Ps, target=Ts` | how to read the split: target nonzero → your tactic; "never ran" → the prefix, build the ancestors |
+| `No such label` | header label unquoted first, then the dispatcher's own QED and the "Ancestor chain" line |
+
 **Calibration.** The hint fires only when all of these hold, because a hint
 that is wrong at the moment of failure is worse than silence — it is read when
 trust is highest:
@@ -196,9 +210,8 @@ the same family.
   field names and collects every string leaf. If a future version uses a name
   outside that list the trigger silently doesn't fire — failing open is the
   right default.
-- No dedupe. If you fail `hol_check_proof` 5 times in a row on the same
-  theorem, you get 5 reminders. Each says the same useful thing — that's
-  intentional.
+- The repeat count is per session and per theorem name; a failure whose
+  output carries no `Theorem:` line is keyed on the tool's `theorem` argument.
 - The hint is keyed on the failing tactic alone. It cannot see the goal, so
   it is a checklist to run, not a verdict; it says so.
 
@@ -213,7 +226,7 @@ the hol4-proving skill cost-discipline trigger.
 
 ### What triggers it
 
-The hook parses the trailing `[Timing: total=Nms, replay=Mms, method=...]`
+The hook parses the trailing `[Timing: total=Nms, replay=Mms, startup=Sms, method=...]`
 line emitted by hol4-mcp's `hol_state_at`. If `replay >= 30000ms` (30s) and
 the call did real replay (not a cache hit), inject. Otherwise silent.
 
@@ -254,18 +267,15 @@ neither tactic would help and the nudge would be misleading.
 **File**: `h7_holmake_advisory.py`
 **Event**: `PostToolUse`
 **Matcher**: `mcp__hol4__holmake`
-**Effect**: never blocks. Every `holmake` call gets a RULE A reminder
-injected via `additionalContext`.
+**Effect**: never blocks. Injects a RULE A reminder via `additionalContext`
+only when the call fits the edit-then-rebuild loop: the same (workdir, target)
+was built within the last 30 minutes AND a `*Script.sml` in the workdir was
+modified after that build. The first build of a target and an edit-free retry
+(a timeout, a dependency unstick) are silent.
 
-The reminder ends with an explicit "if this was the legitimate end-of-file
-gate or a setup step to unstick a stale .dat, disregard" — so the cost on
-legitimate use is just a few lines of system reminder noise. The cost on
-illegitimate use (iteration-mode holmake) is the RULE A nudge appearing at
-exactly the moment of the violation.
-
-This is the lightest form of H7. A stateful variant that *blocks* on the
-edit-then-holmake-without-verification pattern is possible but adds session
-state machinery; the advisory-only form was chosen as adequate.
+State: `~/.claude/hook-state/<session_id>/h7_builds.json`, one timestamp per
+(workdir, target). The reminder names the interval and says what to do with
+the edit instead (hol_state_at, hol_check_proof; rebuild once at the end).
 
 ## H10 — Resume-needs-Finalise reminder
 
@@ -315,6 +325,17 @@ Plus: `git branch -D`, `git branch -d`, `git branch --delete`.
 
 Read-only verbs (status, log, diff, show, grep, blame, fetch, ls-*, rev-*,
 remote without -add/-rm, branch listing) are unmatched and pass through.
+
+### What is not a destructive op
+
+- A verb is matched as a whole token: `git merge-base` is not `git merge`.
+- Read-only forms of destructive verbs: `git stash list`, `git stash show`,
+  `git clean -n` / `--dry-run` (any short-flag cluster containing `n`).
+- Text the shell would not execute: quoted strings and heredoc bodies are
+  blanked before matching (`hook_payload.visible_command`), so a commit
+  message or an `echo` mentioning `git checkout` passes. What the shell WOULD
+  run inside a string is kept and still matched: `$(git stash)`, backticks,
+  and the argument of `bash -c` / `eval`.
 
 ### Consent mechanism
 
@@ -493,14 +514,20 @@ hands.
 
 ### Diff-scoped
 
-Only what the commit introduces is judged. A theorem is swept only if the commit
-touches it; `cheat`, banned tactics and `Resume` count only on ADDED lines.
-Pre-existing debris in untouched theorems is tolerated until that theorem is
-restructured — exactly what Gate 5 says. `-a` and `--amend` shift the diff base.
+Only what the commit introduces is judged: the index against HEAD (`-a` widens
+that to tracked working-tree edits). An `--amend` is judged the same way — the
+content already in HEAD passed this gate when it was committed. A theorem is
+swept only if the commit touches its PROOF TEXT (the lines after `Proof` or a
+`Resume` header): retyping a statement is not a proof edit. `cheat`, banned
+tactics and `Resume` count only on ADDED lines. Pre-existing debris in
+untouched theorems is tolerated until that theorem is restructured — exactly
+what Gate 5 says. Findings are printed grouped per theorem.
 
 ### What it checks, and what it deliberately does not
 
-Blocks on Gates 1, 2, 3, 5 and the `proof_sweep` composition checks.
+Blocks on Gates 1, 2, 3, 5 and the `proof_sweep` composition checks, except
+the lone-`>-` prompt ("the only dispatcher at its level"): its fix (`>>`)
+changes no proof, so it stays H25's post-check advisory and never blocks.
 
 **Gate 6 (single-use `[local]` helpers) is deliberately excluded.** Its keeper
 case — a small, intent-documenting named fact — is the common and correct idiom,
@@ -524,13 +551,47 @@ removed or narrowed, not tolerated.
 
 ### Limitations
 
-- `--amend` uses `HEAD~1` as the base, which also picks up unstaged working-tree
-  changes. Approximate by design; it errs toward showing more.
 - Fails open on anything unexpected — not a repo, a git error, an unreadable
   file. A gate bug must never block real work.
 - Runs alongside H14, which gates the same commits on `git ok`. Two hooks on one
   call is intentional here: they answer different questions (may you commit at
   all, and is this code fit to commit).
+
+## H31 — `skip_prefix=True` needs `skip prefix ok`
+
+**File**: `h31_skip_prefix_consent.py`
+**Event**: `PreToolUse`
+**Matcher**: `mcp__hol4__hol_state_at|mcp__hol4__hol_goals`
+**Effect**: blocks (exit 2) a call with `skip_prefix: true` unless the latest
+user message contains the literal phrase `skip prefix ok`. `false` or absent
+never fires. Fail-open when the transcript is unreadable.
+
+The server prints the prefix-skip caveat but cannot know whether the user
+asked for it; RULE K says only the user can. The hook reads the transcript
+and enforces the rule at the call, the same one-shot consent shape as H14.
+
+## H32 — holmake preflight: name the target, own the build
+
+**File**: `h32_holmake_preflight.py`
+**Event**: `PreToolUse`
+**Matcher**: `mcp__hol4__holmake`
+**Effect**: blocks (exit 2) two build shapes unless the latest user message
+contains `build ok`:
+
+- no `target` — Holmake builds every theory in the directory;
+- a target whose ancestor closure has stale theories OUTSIDE the workdir —
+  Holmake follows `INCLUDES` and rebuilds those directories too, so the call
+  quietly becomes a build of someone else's theory.
+
+Staleness is H30's make-style check (`check_closure`, imported from
+`h30_stale_ancestors`), so the two hooks always agree. An in-workdir target
+whose ancestors are fresh, or stale only inside the workdir, passes silently.
+Fails open when the target is not a theory of the workdir, the workdir is not
+in a git repo, or the closure exceeds H30's cap.
+
+For builds longer than the synchronous budget the answer is
+`holmake(detach=True)` + `hol_build_status`, never a shell `nohup Holmake`
+(H28).
 
 ## Installing the full suite
 
@@ -629,9 +690,12 @@ Two files here are **not** hooks — `install_hooks.py` discovers only
 `h<N>_<name>.py`, so a plain name is never wired by accident:
 
 - `hook_payload.py` — `output_text(payload)` (a PostToolUse result flattened to
-  searchable text, strings kept raw) and `latest_user_message(payload)` (newest
-  real user turn, for the consent-gated hooks). Every hook that reads a payload
-  uses these; reimplementing one is how the copies drift apart.
+  searchable text, strings kept raw), `latest_user_message(payload)` (newest
+  real user turn, for the consent-gated hooks) and `visible_command(command)`
+  (a Bash command with quoted strings and heredoc bodies blanked, keeping the
+  substitutions and `-c`/`eval` arguments the shell would still run — what
+  H14 and H28 match against). Every hook that reads a payload uses these;
+  reimplementing one is how the copies drift apart.
 - `proof_sweep.py` — the composition checks H25 runs, also usable standalone:
   `./proof_sweep.py FILE [FIRST_LINE LAST_LINE]`.
 

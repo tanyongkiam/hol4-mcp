@@ -232,3 +232,37 @@ async def test_quote_diagnosis_in_state_at(tmp_path):
         assert "--fix" in r
     finally:
         await hol_stop(session=session)
+
+
+async def test_holmake_detached_mode(tmp_path):
+    import asyncio
+    import re
+    import shutil
+    import time as _time
+    from hol4_mcp import hol_mcp_server as srv
+
+    for f in FIXTURES_DIR.iterdir():
+        if f.is_file():
+            shutil.copy(f, tmp_path / f.name)
+    t0 = _time.monotonic()
+    started = await srv.holmake(workdir=str(tmp_path), target="testTheory", detach=True)
+    assert _time.monotonic() - t0 < 2.0, started
+    m = re.search(r"job=(\S+)", started)
+    assert m and "log" in started, started
+    job = m.group(1)
+
+    status = None
+    for _ in range(120):
+        status = await srv.hol_build_status(job=job)
+        if "done" in status:
+            break
+        assert "running" in status, status
+        await asyncio.sleep(1)
+    assert status and "done" in status and "Build succeeded" in status, status
+    assert (tmp_path / ".hol" / "objs" / "testTheory.dat").exists()
+
+    # cancel kills a running job's process group
+    started = await srv.holmake(workdir=str(tmp_path), target="failTheory", detach=True)
+    job = re.search(r"job=(\S+)", started).group(1)
+    cancelled = await srv.hol_build_status(job=job, cancel=True)
+    assert "cancelled" in cancelled or "done" in cancelled, cancelled

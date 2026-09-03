@@ -1,8 +1,16 @@
 # Mid-arm navigation inside parens-grouped LT chains — investigation notes
 
-Date: 2026-06-10. Timeboxed investigation (plan item P4b); outcome:
-**not implemented** — P1b's explicit chain-entry NOTE is the shipped
+Date: 2026-06-10. Timeboxed investigation (plan item P4b); outcome at the
+time: **not implemented** — P1b's explicit chain-entry NOTE was the shipped
 fallback. This file records why, and the one feasible path identified.
+
+**Status (2026-09-03): the single-goal special case below is implemented.**
+`FileProofCursor._navigate_inside_group` replays the opaque step's flat
+sub-plan (`goalfrag_step_plan_json_flat`, which re-expands positional
+groups) up to the target, checking live that every positional group entered
+under a THEN combinator receives exactly one goal; otherwise it restores the
+entry state and the NOTE stands. Inside-group positions are never cached
+(the session is marked dirty). Tests: `tests/test_parens_single_goal_nav.py`.
 
 ## Background
 

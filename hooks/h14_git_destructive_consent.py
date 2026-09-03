@@ -32,7 +32,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_payload import latest_user_message  # noqa: E402
+from hook_payload import latest_user_message, visible_command  # noqa: E402
 
 # `git` takes global options BEFORE the verb (`git -C dir commit`,
 # `git --no-pager push`, `git -c k=v commit`), so the verb is not always the
@@ -43,16 +43,30 @@ _OPT = (r"(?:(?:-C|-c|--git-dir|--work-tree|--namespace|--exec-path)"
 _VERBS = (r"commit|push|stash|revert|reset|checkout|switch|restore|clean"
           r"|rm|mv|pull|merge|rebase|cherry-pick|apply|am")
 
-DESTRUCTIVE_GIT_RE = re.compile(r"\bgit\s+(?:" + _OPT + r")*(" + _VERBS + r")\b")
+# `(?![\w-])`: `merge-base` is not `merge`. The rest of the simple command is
+# captured so read-only subcommands of a destructive verb can be exempted.
+DESTRUCTIVE_GIT_RE = re.compile(r"\bgit\s+(?:" + _OPT + r")*(" + _VERBS
+                                + r")(?![\w-])([^|&;\n]*)")
 BRANCH_DELETE_RE = re.compile(r"\bgit\s+(?:" + _OPT + r")*branch\s+(-D|-d|--delete)\b")
+
+# Read-only forms of otherwise destructive verbs.
+READ_ONLY = {
+    "stash": lambda rest: re.match(r"\s+(list|show)(?![\w-])", rest) is not None,
+    "clean": lambda rest: any(t == "--dry-run" or (t.startswith("-") and not
+                              t.startswith("--") and "n" in t)
+                              for t in rest.split()),
+}
 
 CONSENT_RE = re.compile(r"\bgit\s+ok\b", re.IGNORECASE)
 
 def find_match(command):
-    m = DESTRUCTIVE_GIT_RE.search(command)
-    if m:
-        return f"git {m.group(1)}"
-    m = BRANCH_DELETE_RE.search(command)
+    text = visible_command(command)
+    for m in DESTRUCTIVE_GIT_RE.finditer(text):
+        verb, rest = m.group(1), m.group(2)
+        if verb in READ_ONLY and READ_ONLY[verb](rest):
+            continue
+        return f"git {verb}"
+    m = BRANCH_DELETE_RE.search(text)
     if m:
         return f"git branch {m.group(1)}"
     return None

@@ -65,3 +65,15 @@ async def test_shadow_binding_blocked(tmp_path):
         assert "42" in r
     finally:
         await hol_stop(session=session)
+
+
+@pytest.mark.parametrize("cmd", ['load "basis";', 'use "helpers.sml";', ' load "fooTheory"; foo_def;'])
+async def test_hol_send_rejects_load_use(tmp_path, cmd):
+    session = "p3_load_use"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        r = await hol_send(command=cmd, session=session)
+        assert r.startswith("ERROR: hol_send BLOCKED"), r
+        assert "Ancestors" in r and "open" in r and "hol_state_at(file=" in r, r
+    finally:
+        await hol_stop(session)

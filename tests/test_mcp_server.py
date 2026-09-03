@@ -17,6 +17,7 @@ from hol4_mcp.hol_mcp_server import (
     hol_logs as _hol_logs,
     holmake as _holmake,
     _init_file_cursor,  # Internal helper (not MCP tool)
+    _get_cursor,
     hol_state_at as _hol_state_at,
     hol_check_proof as _hol_check_proof,
     _kill_process_group,
@@ -254,14 +255,10 @@ async def test_file_init_lists_theorems(tmp_path):
         await hol_stop(session="file_init_test")
 
 
-async def test_file_init_refuses_on_workdir_change(tmp_path):
-    """hol_file_init refuses a file from a different workdir (RULE J).
-
-    History: originally the session silently kept the OLD workdir
-    (BUG_workdir_mismatch), then silently restarted into the new one.
-    Both lose state invisibly; the contract is now an explicit refusal —
-    stop the session first, then re-init.
-    """
+async def test_file_init_moves_session_on_workdir_change(tmp_path):
+    """hol_file_init moves the session to a file's workdir and says so: one
+    session at a time (RULE J), so the session follows the file, and the
+    notice names both workdirs because the old one's context is gone."""
     # Create two directories with test files
     dir_a = tmp_path / "dirA"
     dir_b = tmp_path / "dirB"
@@ -282,23 +279,19 @@ async def test_file_init_refuses_on_workdir_change(tmp_path):
         sessions = await hol_sessions()
         assert "dirA" in sessions
 
-        # Init for a file in dir_b: refused, session untouched
-        result = await hol_file_init(
-            file=str(file_b), session="workdir_test", workdir=str(dir_b)
-        )
-        assert result.startswith("ERROR")
-        assert "bound to workdir" in result
-        sessions = await hol_sessions()
-        assert "dirA" in sessions  # still the old session
-
-        # Explicit stop + re-init into dir_b works
-        await hol_stop(session="workdir_test")
+        # Init for a file in dir_b: the session moves there, once, with a notice
+        # queued for the next tool output.
         result = await hol_file_init(
             file=str(file_b), session="workdir_test", workdir=str(dir_b)
         )
         assert "Theorems:" in result
         sessions = await hol_sessions()
-        assert "dirB" in sessions
+        assert "dirB" in sessions and "dirA" not in sessions
+        assert sessions.count("running") == 1
+        cursor = await _get_cursor("workdir_test")
+        notices = cursor.take_notices()
+        assert len(notices) == 1 and notices[0].startswith("[Session restarted: workdir")
+        assert str(dir_a) in notices[0] and str(dir_b) in notices[0]
     finally:
         await hol_stop(session="workdir_test")
 

@@ -84,6 +84,23 @@ def wired_paths(settings):
     return set(re.findall(r'"command":\s*"([^"]+)"', json.dumps(settings.get("hooks", {}))))
 
 
+def load_settings(path=SETTINGS):
+    if os.path.exists(path):
+        return json.load(open(path, encoding="utf-8"))
+    return {}
+
+
+def drift(settings, specs=None):
+    """(missing, stale): hook scripts here that settings.json does not wire,
+    and wired paths under this directory whose script no longer exists."""
+    specs = discover() if specs is None else specs
+    live = wired_paths(settings)
+    missing = [p for p in specs if p not in live]
+    stale = [p for p in live
+             if os.path.dirname(p) == HERE and not os.path.exists(p)]
+    return missing, stale
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="report drift, write nothing")
@@ -95,14 +112,8 @@ def main():
         print(json.dumps({"hooks": build_block(specs)}, indent=2))
         return 0
 
-    settings = {}
-    if os.path.exists(SETTINGS):
-        settings = json.load(open(SETTINGS, encoding="utf-8"))
-    live = wired_paths(settings)
-
-    missing = [p for p in specs if p not in live]
-    stale = [p for p in live
-             if os.path.dirname(p) == HERE and not os.path.exists(p)]
+    settings = load_settings()
+    missing, stale = drift(settings, specs)
 
     if args.check:
         for p in missing:

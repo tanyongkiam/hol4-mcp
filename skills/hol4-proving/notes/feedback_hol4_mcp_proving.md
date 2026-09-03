@@ -10,7 +10,7 @@ Sections are named for the SYMPTOM you arrive with, not the cause.
 ⛔ This file is not optional background. The skill's symptom index makes each of
 these sections a MANDATORY read at its trigger (skill RULE E): hit the symptom,
 read the section, THEN adjust tactics — first occurrence, not second. H6 injects
-three of them at the moment of failure; the rest you have to come and get.
+six of them at the moment they apply; the rest you have to come and get.
 
 ## Syntax and structural forms
 - `>~`/`>-`/`>>` same precedence, left-associative.
@@ -171,7 +171,7 @@ Naive in-place TRY substitutes also fail; only suspend/Resume works. See [[feedb
 - ⛔ Auto-cheats prefix theorems that error or exceed the per-theorem timeout, so a green `Status: OK` can mask a broken/slow dependency. Full mechanism + the `⚠ depends on cheat` marker: [[feedback_replay_discipline]] §auto-cheat.
 
 ## Reading a `>-` / `THEN1` / `\\`-chain arm's goal → SUB-SUSPEND
-`hol_state_at` can't navigate inside a live `>-`/`THEN1`/`\\`-chain (returns the lumped step ENTRY, `target INSIDE step k`). Sub-suspend the arm to read/develop/diagnose it — the default, ~99% of the time. Canonical rule (incl. cheat-frontier-FORWARD vs sub-suspend-for-FAILURE): hol4-proving skill, HOL4 — suspend/Resume + RULE I. Navigation-limit recovery: [[feedback_replay_discipline]] §state_at navigation limit.
+`hol_state_at` can't navigate inside a parenthesized `>-`/`THEN1`/`\\`-chain group that is applied to several goals (returns the lumped step ENTRY, `target INSIDE step k`); a group receiving one goal it enters on its own (`[inside opaque step k …]`). Sub-suspend the arm to read/develop/diagnose it — the default, ~99% of the time. Canonical rule (incl. cheat-frontier-FORWARD vs sub-suspend-for-FAILURE): hol4-proving skill, HOL4 — suspend/Resume + RULE I. Navigation-limit recovery: [[feedback_replay_discipline]] §state_at navigation limit.
 
 **Extract a `[local]` lemma INSTEAD only when the parent's heavy asm context is ITSELF the problem** (gvs/metis blowups): `Resume` replays the full parent prefix so it does NOT shrink that context; a fresh lemma stating exactly the needed facts does. When extracting, mirror the needed hyps (hyp-only vars become `∃` under `irule` — fill with `qexists`/`irule_at Any`), then apply Gate 6 (single-use nav-helpers inline back).
 

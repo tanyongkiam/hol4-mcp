@@ -13,7 +13,11 @@ Holmake's real failure lines (`Proof of ... failed`, `error in quse`) do not
 match the obvious guesses -- so the poller hangs while the build is dead.
 
 Matched in a command position only (start, or after | & ; ( && || newline),
-so prose mentions and paths like .hol/logs/... pass through.
+so prose mentions and paths like .hol/logs/... pass through. Quoted strings
+and heredoc bodies are blanked first (hook_payload.visible_command), so a
+grep pattern or a Python line inside a heredoc is not a command either;
+`name=...` is an assignment, and a lone `-v`/`--help` query is not a build
+or a REPL.
 
 Escape hatch: the literal phrase `shell holmake ok` in the latest user
 message. Fails open if the transcript is missing or unreadable.
@@ -31,7 +35,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_payload import latest_user_message  # noqa: E402
+from hook_payload import latest_user_message, visible_command  # noqa: E402
 
 # A command position: string start, or after a shell separator. Prevents
 # matching `grep Holmake log`, `--- holmake procs ---`, paths, and comments.
@@ -40,8 +44,12 @@ _CMD_POS = r"(?:^|[|&;(\n]|&&|\|\|)\s*"
 # Optional env-var assignments and `nohup`/`time`/`env` wrappers.
 _PREFIX = r"(?:(?:[A-Za-z_]\w*=\S*|nohup|time|env|command|exec)\s+)*"
 
-BUILD_RE = re.compile(_CMD_POS + _PREFIX + r"(Holmake)\b")
-REPL_RE = re.compile(_CMD_POS + _PREFIX + r"(poly|hol)\b(?!\w)")
+# `(?![\w=])`: `hol=$(...)` assigns a variable, it does not run `hol`.
+BUILD_RE = re.compile(_CMD_POS + _PREFIX + r"(Holmake)(?![\w=])")
+REPL_RE = re.compile(_CMD_POS + _PREFIX + r"(poly|hol)(?![\w=])")
+
+# `Holmake --help`, `poly -v`: the binary answers and exits, no build, no REPL.
+QUERY_ONLY_RE = re.compile(r"\s+(?:-v|--version|-h|-help|--help)\s*(?:$|[|&;)\n])")
 
 CONSENT_RE = re.compile(r"\bshell\s+holmake\s+ok\b", re.IGNORECASE)
 
@@ -53,12 +61,11 @@ REPLACEMENT = {
 
 
 def find_match(command):
-    m = BUILD_RE.search(command)
-    if m:
-        return m.group(1)
-    m = REPL_RE.search(command)
-    if m:
-        return m.group(1)
+    text = visible_command(command)
+    for rx in (BUILD_RE, REPL_RE):
+        for m in rx.finditer(text):
+            if not QUERY_ONLY_RE.match(text, m.end()):
+                return m.group(1)
     return None
 
 

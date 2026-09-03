@@ -306,6 +306,12 @@ fun fragEnd (TacticParse.FAtom a) =
    Group atoms (e.g., nested >- inside >> inside >-).
    Subgoal atoms (\`Q`) get "sg " prefix in frag_text so they become valid tactics
    (sg \`Q`) that goalFrag.expand can execute. *)
+(* Flat mode: re-expand parenthesised groups even when they contain a
+   goal-positional LT operator. Sound only where the group is applied to
+   exactly ONE goal; the caller (hol_cursor's inside-group navigation)
+   checks that at each such group's entry before replaying past it. *)
+val reexpand_positional_groups = ref false
+
 fun reexpand_group_atoms frags =
   let
     (* Only re-expand Group atoms containing compound expressions (Then, ThenLT, etc.)
@@ -372,10 +378,12 @@ fun reexpand_group_atoms frags =
       | exprHasGoalPositional _ = false
     fun isComposable (TacticParse.Then _) = true
       | isComposable (TacticParse.ThenLT (_, ls)) =
-          not (lsHasStructuralOnly ls) andalso not (lsHasGoalPositional ls)
+          not (lsHasStructuralOnly ls) andalso
+          (!reexpand_positional_groups orelse not (lsHasGoalPositional ls))
       | isComposable (TacticParse.LThen1 _) = true
       | isComposable (TacticParse.LThenLT ls) =
-          not (lsHasStructuralOnly ls) andalso not (lsHasGoalPositional ls)
+          not (lsHasStructuralOnly ls) andalso
+          (!reexpand_positional_groups orelse not (lsHasGoalPositional ls))
       | isComposable (TacticParse.Group _) = true  (* peels outer wrapper; inner expr is checked by recursion *)
       | isComposable _ = false
     fun isGroupAtom (TacticParse.FAtom (TacticParse.Group (_, _, e))) =
@@ -647,6 +655,15 @@ fun goalfrag_step_plan_json proofBody =
     print (json_ok stepsJson ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+(* Same plan with parenthesised goal-positional groups re-expanded (see
+   reexpand_positional_groups). *)
+fun goalfrag_step_plan_json_flat proofBody =
+  (reexpand_positional_groups := true;
+   goalfrag_step_plan_json proofBody;
+   reexpand_positional_groups := false)
+  handle e => (reexpand_positional_groups := false;
+               print (json_err (exnMessage e) ^ "\n"));
 
 (* backup_n - undo N ef()/e() calls via History.undo *)
 fun backup_n 0 = ()

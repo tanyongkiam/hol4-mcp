@@ -64,6 +64,9 @@ MAX_SHOWN = 12
 # per-case Resume ladder, so only a short one reads as the deferred tail it calls
 # junk; below this it is flagged, at or above it is the sanctioned form.
 LADDER_MIN = 2
+# Sweep findings that stay H25's post-check advisory and never block a commit:
+# a lone `>-` is a style prompt whose fix (`>>`) changes no proof.
+ADVISORY_ONLY = ("`>-` is the only dispatcher",)
 
 # Gate 6 (single-use `[local]` helpers) is deliberately NOT enforced here. Its
 # keeper case — a small, intent-documenting named fact — is the common, correct
@@ -83,9 +86,9 @@ def git(args, cwd):
 
 
 def diff_base(command):
-    """What this commit will actually record, approximately."""
-    if re.search(r"--amend\b", command):
-        return ["HEAD~1"]          # the commit being replaced, plus current work
+    """What this commit newly introduces: the index against HEAD. An `--amend`
+    folds the index into HEAD, whose content already passed this gate when it
+    was committed, so it is judged the same way."""
     if re.search(r"(?:^|\s)-[a-zA-Z]*a|--all\b", command):
         return ["HEAD"]            # -a stages tracked edits at commit time
     return ["--cached"]
@@ -111,16 +114,27 @@ def added_lines(path, base, cwd):
 
 
 def blocks(text):
-    """[(name, kind, first, last)] for every Theorem/Definition/Resume block."""
+    """[(name, kind, first, body, last)] for every Theorem/Definition/Resume
+    block; `body` is the first line of proof text (the line after `Proof`, or
+    after a `Resume` header), so statement-only edits are not proof edits."""
     out, cur = [], None
     for i, line in enumerate(text.split("\n"), 1):
         m = BLOCK_START.match(line)
         if m and cur is None:
-            cur = (m.group(2), m.group(1), i)
+            cur = [m.group(2), m.group(1), i, i + 1 if m.group(1) == "Resume" else None]
+        elif cur and cur[3] is None and re.match(r"^Proof\b", line):
+            cur[3] = i + 1
         elif cur and BLOCK_END.match(line):
-            out.append((cur[0], cur[1], cur[2], i))
+            out.append((cur[0], cur[1], cur[2], cur[3] or i, i))
             cur = None
     return out
+
+
+def block_of(blks, ln):
+    for name, _, first, _, last in blks:
+        if first <= ln <= last:
+            return name
+    return None
 
 
 def audit(path, base, cwd):
@@ -165,12 +179,13 @@ def audit(path, base, cwd):
             found.append((0, f"Gate 2: `Resume {name}` present with no `Finalise "
                              f"{name};` — the theorem stays cheated"))
 
-    # Composition sweep, only over theorems this commit touches.
-    for name, kind, first, last in blks:
-        if kind == "Definition" or not any(first <= n <= last for n in added):
+    # Composition sweep, only over theorems whose PROOF TEXT this commit touches.
+    for name, kind, first, body, last in blks:
+        if kind == "Definition" or not any(body <= n < last for n in added):
             continue
         for ln, msg in proof_sweep.sweep(text, first, last):
-            found.append((ln, f"{name}: {msg}"))
+            if not msg.startswith(ADVISORY_ONLY):
+                found.append((ln, msg))
     return found
 
 
@@ -202,10 +217,12 @@ def main():
     if not scripts:
         return 0
 
-    findings = []
+    findings = []                                  # [(file, theorem, line, msg)]
     for f in scripts:
         try:
-            findings += [(f, ln, msg) for ln, msg in audit(f, base, cwd)]
+            blks = blocks(open(os.path.join(cwd, f), encoding="utf-8",
+                               errors="replace").read())
+            findings += [(f, block_of(blks, ln), ln, msg) for ln, msg in audit(f, base, cwd)]
         except Exception:
             continue                               # one bad file must not block
     if not findings:
@@ -214,12 +231,17 @@ def main():
     print(f"hol4-hook H27: refused the commit — the audit gates flag "
           f"{len(findings)} thing(s) in the proof code it would record.",
           file=sys.stderr)
-    print("", file=sys.stderr)
-    for f, ln, msg in findings[:MAX_SHOWN]:
-        where = f"{f}:{ln}" if ln else f
-        print(f"  {where}: {msg}", file=sys.stderr)
-    if len(findings) > MAX_SHOWN:
-        print(f"  ... and {len(findings) - MAX_SHOWN} more", file=sys.stderr)
+    shown, group = 0, None
+    for f, thm, ln, msg in sorted(findings, key=lambda x: (x[0], x[1] or "", x[2])):
+        if shown == MAX_SHOWN:
+            print(f"  ... and {len(findings) - MAX_SHOWN} more", file=sys.stderr)
+            break
+        if (f, thm) != group:
+            group = (f, thm)
+            print("", file=sys.stderr)
+            print(f"  {f}" + (f" — {thm}" if thm else ""), file=sys.stderr)
+        print(f"    {'line ' + str(ln) + ': ' if ln else ''}{msg}", file=sys.stderr)
+        shown += 1
     print("", file=sys.stderr)
     print("Only theorems this commit TOUCHES were judged. Each sweep item is a "
           "PROMPT TO CHECK, not a proven defect — simplification is not "

@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -52,6 +53,15 @@ def _try_find_json_line(output: str, context: str = "") -> dict:
 # (e.g. large induction bodies ~80-100s) must validate per-theorem rather than
 # being silently auto-cheated, so this is well above the 60s default.
 PER_THEOREM_TIMEOUT = 120
+
+
+def dep_load_timeout() -> float:
+    """Budget in seconds for one dependency `load` at session init
+    (env HOL4_MCP_DEP_LOAD_TIMEOUT, default 300)."""
+    try:
+        return float(os.environ.get("HOL4_MCP_DEP_LOAD_TIMEOUT", "300"))
+    except ValueError:
+        return 300.0
 
 
 def _line_is_error_marker(s: str) -> bool:
@@ -328,6 +338,10 @@ class StateAtResult:
     timings: dict[str, float] | None = None  # Timing breakdown (ms)
     inside_by: bool = False   # Position is inside a decomposed by/>- subproof (between open/close)
     inside_step_idx: int | None = None  # Step index when position is strictly INSIDE
+    # Set when the position inside an opaque step was reached by replaying
+    # the step's flat sub-plan (single-goal group entry): {"step", "sub_idx",
+    # "sub_total", "start_line", "end_line", "error", "fail_line"}.
+    inside_group: dict | None = None
                                         # an opaque step (state shown = step entry)
     warnings: list[str] | None = None   # HOL diagnostics emitted while producing
                                         # this state (success path included)
@@ -494,6 +508,29 @@ class FileProofCursor:
         # Such changes require rebuilding HOL session context from scratch.
         self._needs_session_reinit: bool = False
 
+        # Built artifact each dependency was loaded from, with its mtime at
+        # load time; a rebuilt ancestor is detected by re-stat and forces a
+        # session rebuild (a live session cannot reload a theory).
+        self._dep_artifacts: dict[str, tuple[Path, int]] = {}
+
+        # One-line notices about session-level events (reload after an
+        # ancestor rebuild, restart into another workdir) for the next tool
+        # output; the server takes and clears them (take_notices).
+        self._session_notices: list[str] = []
+
+        # Seconds spent (re)starting HOL and loading dependencies since the
+        # last navigation reported them (`startup=` in the Timing line).
+        self._startup_seconds: float = 0.0
+
+        # perf_counter at which the current navigation began replaying the
+        # TARGET theorem's own tactics (None until the prefix is in place), so
+        # a budget timeout can be attributed to prefix vs target.
+        self._target_replay_started: float | None = None
+
+        # (theorem, step index, count) of consecutive edit→navigate cycles
+        # that broke at the same step; a passing navigation clears it.
+        self._break_streak: tuple[str, int, int] | None = None
+
         # Prefix-skip mode (state_at(skip_prefix=True)): when on, prefix theorems
         # are bound via `cheat` (statement only) instead of being replayed, so
         # navigation into a target theorem is instant even in a cold, unbuilt
@@ -522,13 +559,95 @@ class FileProofCursor:
 
         return None
 
+    def _dep_load_error(self, dep: str, result: str, elapsed: float,
+                        budget: float) -> str:
+        """Error text for a dependency that failed to load at init."""
+        if not result.lstrip().startswith("TIMEOUT"):
+            return f"Failed to load dependency {dep}: {result}"
+        holmakefile = Path(self.session.workdir) / "Holmakefile"
+        try:
+            declares = re.search(r"^\s*HOLHEAP\s*=", holmakefile.read_text(),
+                                 re.M) is not None
+        except OSError:
+            declares = False
+        heap = ("declares HOLHEAP" if declares else
+                "does not declare HOLHEAP; a heap with the heavy ancestors "
+                "pre-loaded makes this load instant")
+        return (f"Dependency {dep} timed out loading after {elapsed:.1f}s "
+                f"(budget {budget:g}s per dependency, env "
+                f"HOL4_MCP_DEP_LOAD_TIMEOUT). The Holmakefile {heap}.")
+
+    async def _record_dep_artifacts(self, deps: list[str]) -> None:
+        """Remember the built artifact (and its mtime) each dependency loaded
+        from: the session workdir first, then HOL's loadPath, each with its
+        `.hol/objs/` build directory."""
+        dirs = [Path(self.session.workdir)]
+        out = await self.session.send("!loadPath;", timeout=10)
+        dirs += [Path(p) for p in re.findall(r'"((?:[^"\\]|\\.)*)"', out)]
+        for dep in deps:
+            for d in dirs:
+                found = next((c for c in (d / ".hol" / "objs" / f"{dep}.uo",
+                                          d / f"{dep}.uo") if c.exists()), None)
+                if found is not None:
+                    self._dep_artifacts[dep] = (found, found.stat().st_mtime_ns)
+                    break
+
+    def _check_dep_artifacts(self) -> str | None:
+        """First dependency whose built artifact changed since it was loaded,
+        or None. An absent artifact (mid-rebuild) is judged again next call."""
+        for dep, (path, mtime_ns) in self._dep_artifacts.items():
+            try:
+                if path.stat().st_mtime_ns != mtime_ns:
+                    return dep
+            except OSError:
+                continue
+        return None
+
+    def _schedule_full_reinit(self) -> None:
+        """Rebuild the session from scratch on the next call: drop every
+        cache and checkpoint, the deps-only one included."""
+        self._needs_session_reinit = True
+        self._loaded_to_line = 0
+        self._loaded_content_hash = ""
+        self._pos = SessionPosition()
+        self._active_theorem = None
+        self._invalidate_all_checkpoints()
+        self._proof_traces.clear()
+        self._tc_goals.clear()
+        self._resume_goals.clear()
+        self._failed_proofs.clear()
+        self._theorem_oracles.clear()
+        for ckpt_path in [self._base_checkpoint_path, self._deps_checkpoint_path]:
+            if ckpt_path and ckpt_path.exists():
+                try:
+                    ckpt_path.unlink()
+                except OSError:
+                    pass
+        self._base_checkpoint_path = None
+        self._deps_checkpoint_path = None
+        self._base_checkpoint_saved = False
+        self._deps_checkpoint_saved = False
+
+    def take_notices(self) -> list[str]:
+        """Session-level notices accumulated since the last call, cleared."""
+        out, self._session_notices = self._session_notices, []
+        return out
+
     def _reparse_if_changed(self) -> bool:
         """Re-read and parse file if content changed. Returns True if changed.
-        
+
         Raises FileNotFoundError if file was deleted.
         """
         content = self.file.read_text()  # Let FileNotFoundError propagate
         content_hash = self._compute_hash(content)
+
+        rebuilt = self._check_dep_artifacts()
+        if rebuilt is not None:
+            self._dep_artifacts = {}
+            self._schedule_full_reinit()
+            self._session_notices.append(
+                f"[Session reloaded: ancestor {rebuilt} rebuilt since it was "
+                f"loaded; dependencies and prefix replayed from the new artifacts]")
 
         if content_hash == self._content_hash:
             return False
@@ -593,31 +712,7 @@ class FileProofCursor:
             # (e.g., open/Theory/Ancestors). Rebuild HOL session on next query.
             first_thm_line = self._theorems[0].start_line if self._theorems else None
             if first_thm_line and first_changed < first_thm_line:
-                self._needs_session_reinit = True
-                self._loaded_to_line = 0
-                self._loaded_content_hash = ""
-                self._pos = SessionPosition()
-                self._active_theorem = None
-
-                # Invalidate all caches/checkpoints that depend on old context
-                self._invalidate_all_checkpoints()
-                self._proof_traces.clear()
-                self._tc_goals.clear()
-                self._resume_goals.clear()
-                self._failed_proofs.clear()
-                self._theorem_oracles.clear()
-
-                # Invalidate saved base/deps checkpoints (stale imports/ancestors)
-                for ckpt_path in [self._base_checkpoint_path, self._deps_checkpoint_path]:
-                    if ckpt_path and ckpt_path.exists():
-                        try:
-                            ckpt_path.unlink()
-                        except OSError:
-                            pass
-                self._base_checkpoint_path = None
-                self._deps_checkpoint_path = None
-                self._base_checkpoint_saved = False
-                self._deps_checkpoint_saved = False
+                self._schedule_full_reinit()
 
         # Clear active theorem if it was renamed/deleted
         if self._active_theorem:
@@ -682,6 +777,7 @@ class FileProofCursor:
         """
         if not self._needs_session_reinit:
             return None
+        t_start = time.perf_counter()
 
         # Restart HOL process for a clean top-level environment
         if self.session.is_running:
@@ -699,6 +795,7 @@ class FileProofCursor:
 
         # Re-run full initialization to rebuild deps/context/checkpoints
         init_result = await self.init()
+        self._startup_seconds += time.perf_counter() - t_start
         if init_result.get("error"):
             self._needs_session_reinit = True
             return init_result["error"]
@@ -1212,6 +1309,7 @@ class FileProofCursor:
               - cheats: list of cheat locations
               - error: error message if init failed
         """
+        self._dep_artifacts = {}
         try:
             self._reparse_if_changed()
         except FileNotFoundError:
@@ -1231,8 +1329,10 @@ class FileProofCursor:
         # but report other errors (actual load failures)
         try:
             deps = await get_script_dependencies(self.file)
+            budget = dep_load_timeout()
             for dep in deps:
-                result = await self.session.send(f'load "{dep}";', timeout=60)
+                t_dep = time.perf_counter()
+                result = await self.session.send(f'load "{dep}";', timeout=budget)
                 if _is_hol_error(result):
                     # "Cannot find file X.ui" means build-time dep or holmake not run - skip
                     if "Cannot find file" in result:
@@ -1240,8 +1340,10 @@ class FileProofCursor:
                     return {
                         "theorems": [],
                         "cheats": [],
-                        "error": f"Failed to load dependency {dep}: {result}",
+                        "error": self._dep_load_error(
+                            dep, result, time.perf_counter() - t_dep, budget),
                     }
+            await self._record_dep_artifacts(deps)
         except (FileNotFoundError, RuntimeError):
             pass  # holdeptool not available or failed (parse error), skip dep loading
 
@@ -2200,9 +2302,126 @@ class FileProofCursor:
         # prior hol_send pollution has been discarded by the checkpoint/replay.
         self._session_dirty = False
 
+    # Operators that make a parenthesised group's flat replay depend on how
+    # many goals the group receives.
+    _POSITIONAL_RE = re.compile(r">-|>\||>~|>>~|\bTHEN1\b|\bTHENL\b")
+
+    def _file_line(self, file_offset: int) -> int:
+        return self._content.count("\n", 0, file_offset) + 1
+
+    @classmethod
+    def _group_entry_checks(cls, text: str, sub: list[StepPlan]) -> set[int]:
+        """Sub-step indices at which the goal count must be 1 before
+        continuing: the first sub-step of each positional group that is
+        applied by a THEN combinator (or starts the step) rather than being
+        the arm of a THEN1-like selector, which already hands it one goal."""
+        checks: set[int] = set()
+        for j in range(len(sub)):
+            start = step_text_start(sub, j, text)
+            i = start - 1
+            while i >= 0 and text[i].isspace():
+                i -= 1
+            if i < 0 or text[i] != "(":
+                continue
+            depth, close = 1, i + 1
+            while close < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[close], 0)
+                close += 1
+            if not cls._POSITIONAL_RE.search(text[i + 1:close]):
+                continue
+            before = text[:i].rstrip()
+            if before.endswith((">-", "THEN1")):
+                continue
+            checks.add(j)
+        return checks
+
+    @staticmethod
+    def _is_then_group(body: str, text_start: int) -> bool:
+        """True when the step text at `text_start` sits in parentheses that a
+        THEN combinator (or the proof start) applies, rather than the arm of
+        a THEN1-like selector."""
+        i = text_start - 1
+        while i >= 0 and body[i].isspace():
+            i -= 1
+        if i < 0 or body[i] != "(":
+            return False
+        return not body[:i].rstrip().endswith((">-", "THEN1"))
+
+    async def _navigate_inside_group(self, target: _TargetInfo, nav: _NavResult) -> dict | None:
+        """Replay the flat sub-plan of the opaque step the target sits inside,
+        when that is sound: every positional group the replay enters under a
+        THEN combinator receives exactly one goal (checked live). On success
+        the live state is the state AT the position; it is never cached — the
+        session is marked dirty so the next navigation re-establishes it.
+        Returns the inside_group record, or None to keep the entry state."""
+        k = self._detect_inside_step(target)
+        if k is None or nav.error_msg is not None:
+            return None
+        step = self._step_plan[k]
+        if step.kind != "expand":
+            return None
+        thm = target.thm
+        body = thm.proof_body or ""
+        text = step.text
+        text_start = step_text_start(self._step_plan, k, body)
+        out = await self.session.send(
+            f'goalfrag_step_plan_json_flat "{escape_sml_string(text)}";', timeout=30)
+        try:
+            sub = parse_step_plan_output(out, text)
+        except HOLParseError:
+            return None
+        if len(sub) <= 1:
+            return None
+        rel = target.proof_offset - text_start
+        sub_idx = 0
+        for j, s in enumerate(sub):
+            if rel >= s.end:
+                sub_idx = j + 1
+            else:
+                break
+        base = thm.proof_body_offset + text_start
+        info = {
+            "step": k, "sub_idx": sub_idx, "sub_total": len(sub),
+            "start_line": self._file_line(base),
+            "end_line": self._file_line(thm.proof_body_offset + step.end),
+            "error": None, "fail_line": None,
+        }
+        if sub_idx == 0:
+            return info
+        checks = self._group_entry_checks(text, sub)
+        # The planner reports a parenthesised group by its INNER span, so the
+        # step's own parentheses are in the body, not in `text`: a group that
+        # a THEN combinator applies per goal must itself receive one goal.
+        if self._is_then_group(body, text_start):
+            checks.add(0)
+        step_timeout = self._tactic_timeout or 30
+        for j in range(sub_idx):
+            if j in checks:
+                try:
+                    n = len(self._parse_goals_json(
+                        await self.session.send('goals_json();', timeout=10)))
+                except HOLParseError:
+                    n = -1
+                if n != 1:
+                    # Not the single-goal case: put the entry state back.
+                    await self._replay_to_boundary(thm, k, target.total_tactics)
+                    return None
+            result = await self.session.send(sub[j].cmd, timeout=step_timeout)
+            if _is_hol_error(result):
+                line = self._file_line(base + step_text_start(sub, j, text))
+                info["sub_idx"] = j
+                info["fail_line"] = line
+                info["error"] = (
+                    f"PROOF BROKEN inside opaque step {k} at sub-step {j} "
+                    f"(line {line}, {_step_label(sub[j].cmd)}): "
+                    f"{result.strip().splitlines()[0] if result.strip() else 'tactic failed'}")
+                break
+        self._session_dirty = True
+        return info
+
     async def _build_result(
         self, target: _TargetInfo, nav: _NavResult, timings: dict[str, float],
-        t0: float, t3: float
+        t0: float, t3: float, inside: dict | None = None,
     ) -> StateAtResult:
         """Fetch goals and assemble final result."""
         timings['replay'] = time.perf_counter() - t3
@@ -2210,6 +2429,8 @@ class FileProofCursor:
 
         t4 = time.perf_counter()
         error_msg = nav.error_msg
+        if inside and inside.get("error"):
+            error_msg = inside["error"]
         goals_output = await self.session.send('goals_json();', timeout=10)
         try:
             goals = self._parse_goals_json(goals_output)
@@ -2228,7 +2449,8 @@ class FileProofCursor:
             error=error_msg,
             timings=timings,
             inside_by=self._detect_inside_by(target.tactic_idx),
-            inside_step_idx=self._detect_inside_step(target),
+            inside_step_idx=None if inside else self._detect_inside_step(target),
+            inside_group=inside,
         )
 
     def _detect_inside_step(self, target: _TargetInfo) -> int | None:
@@ -2310,7 +2532,12 @@ class FileProofCursor:
                 self._theorem_oracles = {}
 
         timings: dict[str, float] = {}
-        t0 = time.perf_counter()
+        # Startup accrued before this navigation (a cold init) belongs to the
+        # call the user is waiting on: start the clock that much earlier.
+        pre_startup = self._startup_seconds
+        self._startup_seconds = 0.0
+        self._target_replay_started = None
+        t0 = time.perf_counter() - pre_startup
 
         # Snapshot cache state BEFORE any work — for diagnostics
         timings['pos_before_idx'] = self._pos.tactic_idx
@@ -2321,6 +2548,8 @@ class FileProofCursor:
         )
 
         changed = await self._prepare_session(line, col, timings)
+        timings['startup'] = pre_startup + self._startup_seconds
+        self._startup_seconds = 0.0
         if isinstance(changed, StateAtResult):
             return changed
         timings['file_changed'] = 1 if changed else 0
@@ -2340,9 +2569,36 @@ class FileProofCursor:
             timings['incr_old_idx'] = target.incremental_update[1]
 
         t3 = time.perf_counter()
+        self._target_replay_started = t3
         nav = await self._navigate_to_target(target)
         self._update_position(target, nav)
-        return await self._build_result(target, nav, timings, t0, t3)
+        self._note_break_streak(thm.name, nav, changed)
+        inside = await self._navigate_inside_group(target, nav)
+        return await self._build_result(target, nav, timings, t0, t3, inside)
+
+    LOOP_STREAK = 4
+
+    def _note_break_streak(self, theorem: str, nav: "_NavResult", changed: bool) -> None:
+        """Count edit→navigate cycles that break at the same step; from the
+        LOOP_STREAK-th on, queue a notice naming the sub-suspend recipe."""
+        if nav.error_msg is None:
+            self._break_streak = None
+            return
+        key = (theorem, nav.reached_idx)
+        if self._break_streak and self._break_streak[:2] == key:
+            if not changed:
+                return
+            count = self._break_streak[2] + 1
+        else:
+            count = 1
+        self._break_streak = (theorem, nav.reached_idx, count)
+        if count >= self.LOOP_STREAK:
+            self._session_notices.append(
+                f"[Loop: {count} edit→navigate cycles on {theorem} broke at the "
+                f"same step {nav.reached_idx}. Stop editing blind: sub-suspend "
+                f"the arm — replace it with `>- suspend \"X\"`, add "
+                f"`Resume {theorem}[X]: cheat QED` after the parent QED, then "
+                f"hol_state_at inside the Resume body to read the real goal]")
 
     def mark_interrupted(self) -> None:
         """Resync cursor state after the HOL process was SIGINT'd mid-replay.
@@ -2585,8 +2841,9 @@ class FileProofCursor:
             await self.session.start()
             try:
                 deps = await get_script_dependencies(self.file)
+                budget = dep_load_timeout()
                 for dep in deps:
-                    result = await self.session.send(f'load "{dep}";', timeout=60)
+                    result = await self.session.send(f'load "{dep}";', timeout=budget)
                     if _is_hol_error(result) and "Cannot find file" not in result:
                         break  # Stop on real errors
             except (FileNotFoundError, RuntimeError):

@@ -44,6 +44,21 @@ TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "60.0"))
 # raise per-call with the tool's timeout= argument when a prefix is genuinely huge.
 STATE_AT_TIMEOUT = float(os.environ.get("HOL_STATE_AT_TIMEOUT", "300.0"))
 
+# Largest per-call timeout= accepted, in seconds. Anything above it is a unit
+# mistake (milliseconds passed as seconds), not a budget.
+MAX_STATE_AT_TIMEOUT = 3600.0
+
+
+def _timeout_arg_error(timeout: float | None) -> str | None:
+    """Error text for a timeout= argument that cannot be a budget in seconds."""
+    if timeout is None or timeout <= MAX_STATE_AT_TIMEOUT:
+        return None
+    return (
+        f"ERROR: timeout={timeout:g} exceeds the maximum {MAX_STATE_AT_TIMEOUT:.0f}s. "
+        f"The unit is seconds ({timeout / 3600:.1f} h requested). Pass e.g. "
+        f"timeout=600 for a heavy prefix, or timeout=0 to disable the bound."
+    )
+
 
 def _nav_lock(cursor) -> asyncio.Lock:
     """The cursor's navigation lock, created on first use.
@@ -88,12 +103,18 @@ async def _state_at_budgeted(
         budget = None
     if budget is None:
         return await cursor.state_at(line, col, skip_prefix=skip_prefix)
+    t_begin = time.perf_counter()
     try:
         return await asyncio.wait_for(
             cursor.state_at(line, col, skip_prefix=skip_prefix),
             timeout=budget,
         )
     except asyncio.TimeoutError:
+        # Where the budget went: the prefix (dependency load + earlier
+        # theorems) runs until the cursor marks the target's own replay.
+        started = getattr(cursor, "_target_replay_started", None)
+        prefix_s = min(budget, started - t_begin) if started else budget
+        target_s = max(0.0, budget - prefix_s)
         try:
             cursor.session.interrupt()
         except Exception:
@@ -112,24 +133,45 @@ async def _state_at_budgeted(
         return StateAtResult(
             goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
             file_hash="",
-            error=(
-                f"TIMEOUT: state_at exceeded its overall {budget:.0f}s budget and was "
-                f"aborted (HOL interrupted; session recovered). This is almost always a "
-                f"LOOPING TACTIC you just wrote — NOT a slow prefix (already-built prefix "
-                f"theorems replay fast). Prime suspects: simp/fs/gvs/rw[<recursive_def>] "
-                f"WITHOUT `Once` (unfolds forever, esp. inside its own induction IH); a "
-                f"GSYM or symmetric-equality rewrite that oscillates; an unbounded "
-                f"metis_tac/every_case_tac blowup. DIAGNOSE FIRST: if the frontier sits "
-                f"inside a `>-`/`THEN1`/`by (...)` chain, SUB-SUSPEND that arm — never "
-                f"cheat-bisect; only on a FLAT body (no such chain above the frontier) put "
-                f"a `cheat` before your newest tactic and navigate to it (cheap) to read "
-                f"the goal. Then fix the loop (simp[Once <def>]; drop the GSYM; narrow "
-                f"the rewrite set). Do NOT default to blaming the prefix. Only if that "
-                f"frontier navigation is ALSO slow is the prefix/target genuinely "
-                f"heavy — then split a lumped `\\`-chain with `>- suspend`, or retry with a "
-                f"larger timeout= argument."
-            ),
+            error=_timeout_error_text(budget, prefix_s, target_s,
+                                      target_started=started is not None),
         )
+
+
+def _timeout_error_text(budget: float, prefix_s: float, target_s: float,
+                        target_started: bool) -> str:
+    """The TIMEOUT message, attributed: `prefix=` is dependency load plus the
+    theorems before the target, `target=` the target's own tactics."""
+    head = (
+        f"TIMEOUT: state_at exceeded its overall {budget:.0f}s budget and was "
+        f"aborted (HOL interrupted; session recovered). Spent: prefix={prefix_s:.1f}s "
+        f"(dependency load + earlier theorems), target={target_s:.1f}s (this "
+        f"theorem's own tactics). "
+    )
+    if not target_started:
+        return head + (
+            "The budget went to the PREFIX; your tactics never ran. This is not a "
+            "looping tactic: build the ancestors (holmake) so they load from .dat, "
+            "read `startup=` on a passing call to see the load cost, and only for a "
+            "genuinely huge prefix retry with a larger timeout= (seconds)."
+        )
+    heavy_prefix = ("" if prefix_s <= target_s else
+                    " (the prefix took the larger share: if that repeats on a "
+                    "passing call's `startup=`, build the ancestors so they load "
+                    "from .dat)")
+    return head + (
+        f"The budget ran out in YOUR tactics{heavy_prefix}: this is almost always "
+        "a LOOPING TACTIC you just wrote. Prime suspects: simp/fs/gvs/rw[<recursive_def>] WITHOUT "
+        "`Once` (unfolds forever, esp. inside its own induction IH); a GSYM or "
+        "symmetric-equality rewrite that oscillates; an unbounded "
+        "metis_tac/every_case_tac blowup. DIAGNOSE FIRST: if the frontier sits "
+        "inside a `>-`/`THEN1`/`by (...)` chain, SUB-SUSPEND that arm — never "
+        "cheat-bisect; only on a FLAT body (no such chain above the frontier) put "
+        "a `cheat` before your newest tactic and navigate to it (cheap) to read "
+        "the goal. Then fix the loop (simp[Once <def>]; drop the GSYM; narrow "
+        "the rewrite set). A long-running but correct tactic needs `>- suspend` "
+        "to shrink the lump, or a larger timeout= (seconds)."
+    )
 
 
 def _classify_state_at(result: StateAtResult) -> tuple[bool, bool, bool]:
@@ -198,9 +240,34 @@ async def _state_caveat_lines(
                     f"(lumped/parenthesized chain, lines {start_line}-"
                     f"{end_line}); the state shown is this step's ENTRY "
                     f"at line {start_line}, not the state at line {line}. "
-                    f"To navigate inside, split the arm with `>- suspend` "
-                    f"into a Resume body."
+                    f"The group is applied to several goals here, so a flat "
+                    f"replay inside it would not be the file's state. To "
+                    f"navigate inside, split the arm with `>- suspend` into "
+                    f"a Resume body."
                 )
+
+    # Inside-group landing: the position inside an opaque step was reached by
+    # replaying the step's flat sub-plan, sound because every positional
+    # group entered received exactly one goal. Say so, and that the position
+    # is not cached.
+    ig = result.inside_group
+    if ig:
+        lines.append("")
+        if ig.get("error"):
+            lines.append(
+                f"[inside opaque step {ig['step']} (lines {ig['start_line']}-"
+                f"{ig['end_line']}): sub-step {ig['sub_idx']} of {ig['sub_total']} "
+                f"FAILED at line {ig['fail_line']}; the goals shown are the state "
+                f"it was applied to]"
+            )
+        else:
+            lines.append(
+                f"[inside opaque step {ig['step']} (lines {ig['start_line']}-"
+                f"{ig['end_line']}): state after sub-step {ig['sub_idx']} of "
+                f"{ig['sub_total']} — the group receives exactly one goal here, so "
+                f"this flat replay coincides with the file's per-goal application; "
+                f"position not cached]"
+            )
 
     # Suggest extracting by/>- subproof into a suspend/Resume block
     if result.inside_by and not result.error:
@@ -247,6 +314,14 @@ def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
     last_nl = before.rfind('\n')
     col = file_offset - last_nl if last_nl >= 0 else file_offset + 1
     return line, col
+
+
+def _session_notice_lines(cursor) -> list[str]:
+    """Session-level events since the last output (ancestor rebuilt and
+    reloaded, restart into another workdir), each on its own line."""
+    take = getattr(cursor, "take_notices", None)
+    notices = take() if take else []
+    return [""] + notices if notices else []
 
 
 def _auto_cheated_deps_lines(cursor, target_name: str | None = None) -> list[str]:
@@ -929,6 +1004,60 @@ def _check_interactive_goal(command: str) -> str | None:
     )
 
 
+_UNDECLARED_RE = re.compile(
+    r"(?:Value or constructor|Structure) \(([A-Za-z0-9_']+)\) has not been declared")
+
+
+def _undeclared_name_hint(session: str, output: str) -> str | None:
+    """When HOL rejects a name that is a theorem of the cursor's file at or
+    after the parked position, say so: the name exists in the session only
+    once navigation has passed its QED."""
+    m = _UNDECLARED_RE.search(output)
+    entry = _sessions.get(session) if m else None
+    cursor = entry.cursor if entry else None
+    if cursor is None:
+        return None
+    name = m.group(1)
+    thm = cursor._get_theorem(name)
+    loaded = cursor._loaded_to_line
+    if thm is None or thm.start_line < loaded:
+        return None
+    parked = (f"in {cursor._active_theorem}" if cursor._active_theorem
+              else "before the first theorem")
+    return (
+        f"[hint: `{name}` is a {thm.kind if hasattr(thm, 'kind') else 'theorem'} "
+        f"at line {thm.start_line} of {Path(cursor.file).name}, AFTER the parked "
+        f"position (loaded through line {max(loaded - 1, 0)}, {parked}). A name "
+        f"exists in the session only once navigation has passed its QED: "
+        f"hol_state_at at or after line {thm.proof_end_line} first, or work at a "
+        f"position where it is already in scope.]"
+    )
+
+
+_LOAD_USE_RE = re.compile(r'(?<![\w.])(load|use)\s*\(?\s*"')
+
+
+def _check_load_use(command: str) -> str | None:
+    """Reject `load "..."` / `use "..."` through hol_send. Either one changes
+    what is in scope for the rest of the session behind the cursor's back:
+    a theory the file does not declare resolves names the build will not,
+    and a `use`d file is invisible to every later navigation and check."""
+    m = _LOAD_USE_RE.search(_strip_noncode(command))
+    if not m:
+        return None
+    verb = m.group(1)
+    return (
+        f"ERROR: hol_send BLOCKED — `{verb}` changes the session's scope behind "
+        f"the cursor: names it brings in resolve here and not in the build, and "
+        f"every later hol_state_at/hol_check_proof runs in a session the file "
+        f"does not describe.\n"
+        f"Put the dependency in the FILE — `Ancestors` (or `open fooTheory`) for "
+        f"a theory, the script itself for SML helpers — then hol_state_at(file=...) "
+        f"loads it for you; a missing built dependency is a holmake target, not a "
+        f"load."
+    )
+
+
 def _check_proof_state_command(command: str) -> str | None:
     """Block hol_send commands that interact with proof state.
 
@@ -981,6 +1110,10 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     as one — it takes a frag_tactic, so running a tactic through it means
     goalFrag.expand/expandf, which apply to EVERY goal in the fragment.
 
+    Also rejected: `load "..."` / `use "..."` — they change the session's scope
+    behind the cursor. Dependencies belong in the file (`Ancestors`/`open`);
+    hol_state_at(file=...) loads them.
+
     Args:
         command: SML command to execute
         session: Session name (default: "default")
@@ -1002,6 +1135,10 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     if blocked:
         return blocked
 
+    blocked = _check_load_use(command)
+    if blocked:
+        return blocked
+
     s = await _get_session(session)
     if not s:
         return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
@@ -1019,6 +1156,9 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     t0 = time.monotonic()
     result = await s.send(command, timeout=timeout)
     elapsed = time.monotonic() - t0
+    hint = _undeclared_name_hint(session, result)
+    if hint:
+        result = f"{result.rstrip()}\n{hint}"
 
     # If this command may have mutated the live proofManager, taint the cursor so
     # the next hol_state_at re-establishes its goal instead of reusing the now-
@@ -1155,6 +1295,9 @@ async def hol_goals(
         if not cursor:
             return (f"ERROR: No cursor for session '{session}'. "
                     f"Pass file= to auto-init.")
+        bad_timeout = _timeout_arg_error(timeout)
+        if bad_timeout:
+            return bad_timeout
         result = await _state_at_bounded(cursor, line, col, skip_prefix=skip_prefix, timeout=timeout)
         if result.error and not result.goals:
             return f"ERROR: {result.error}"
@@ -1293,15 +1436,15 @@ async def hol_stop(session: str = "default") -> str:
 async def hol_restart(session: str = "default") -> str:
     """Restart HOL session (stop + start, preserves workdir).
 
-    Genuinely needed for one thing: an ancestor theory rebuilt since this session
-    started, which a live session cannot reload (link_parents complains). Hook H29
-    blocks a REPEAT stop/restart on the same working file within 30 min (first
-    stop and file switches pass; `restart ok` in the user's message overrides).
-    "Corrupted state" is essentially never the cause: a weird replay is a proof or
-    navigation error (RULE D) that restarting hides, and the restart also wipes the
-    state that would have localised it.
-
-    NOT needed for edits to current proof file - state_at auto-detects changes.
+    Nothing in the ordinary loop needs it: hol_state_at/hol_check_proof detect
+    edits to the current file, reload the session when an ancestor theory has
+    been rebuilt ("[Session reloaded: ancestor ...]"), and move it to another
+    workdir when file= points there ("[Session restarted: workdir ...]"). Hook
+    H29 blocks a REPEAT stop/restart in the same theory directory within 30 min
+    (first stop and directory switches pass; `restart ok` in the user's message
+    overrides). "Corrupted state" is essentially never the cause: a weird replay
+    is a proof or navigation error (RULE D) that restarting hides, and the
+    restart also wipes the state that would have localised it.
 
     Args:
         session: Session name to restart
@@ -1398,19 +1541,27 @@ _PROGRESS_INTERVAL = 10  # seconds
 
 
 @mcp.tool()
-async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 90, heap_size: int = 12288, jobs: int = None) -> str:
+async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 600, heap_size: int = 12288, jobs: int = None, detach: bool = False) -> str:
     """Run Holmake --qof in directory.
+
+    Name the target (hook H32 refuses an untargeted build, and a target whose
+    stale ancestors live outside workdir, without the user's `build ok`).
 
     Args:
         workdir: Directory containing Holmakefile
-        target: Optional specific target to build
+        target: Specific target to build (e.g. "fooTheory")
         env: Optional environment variables (e.g. {"MY_VAR": "/some/path"})
         log_limit: Max bytes per log file to include on failure (default 1024)
-        timeout: Max seconds to wait (default 90, max 1800)
+        timeout: Max seconds to wait (default 600, max 1800). Ignored with detach.
         heap_size: Max heap size in MB for Poly/ML builds (default 12288)
         jobs: Max parallel jobs (-j flag). Default from HOL4_MCP_HOLMAKE_JOBS env var, or 1.
+        detach: Start the build in the background and return at once with
+                `job=<id>` and the log path; poll hol_build_status(job=...).
+                For builds longer than the synchronous budget — never a shell
+                `nohup Holmake` (hook H28), which nothing reports on.
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
+             With detach: the job id and log path.
     """
     # Validate limits
     timeout = max(1, min(timeout, 1800))
@@ -1449,6 +1600,9 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     proc_env = os.environ.copy()
     if env:
         proc_env.update(env)
+
+    if detach:
+        return await _start_detached_build(cmd, workdir_path, proc_env, target)
 
     proc = None
     try:
@@ -1534,6 +1688,90 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         return f"ERROR: {e}"
     finally:
         await _kill_process_group(proc)
+
+
+@dataclass
+class _BuildJob:
+    proc: asyncio.subprocess.Process
+    workdir: Path
+    target: str | None
+    log: Path
+    started: float
+    finished: float | None = None
+
+
+_build_jobs: dict[str, _BuildJob] = {}
+
+
+async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: dict,
+                                target: str | None) -> str:
+    """Spawn Holmake with its output on a log file under `.hol/` and register
+    it as a job for hol_build_status."""
+    import uuid
+    job_id = uuid.uuid4().hex[:8]
+    log_dir = workdir_path / ".hol"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = log_dir / f"mcp-build-{job_id}.log"
+    log_fh = open(log, "wb")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=workdir_path, env=proc_env,
+            stdout=log_fh, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_fh.close()
+    job = _BuildJob(proc=proc, workdir=workdir_path, target=target, log=log,
+                    started=time.time())
+    _build_jobs[job_id] = job
+
+    async def _reap():
+        await proc.wait()
+        job.finished = time.time()
+    asyncio.create_task(_reap())
+    return (f"Build started in background: job={job_id} target={target or '(all)'} "
+            f"workdir={workdir_path}\nlog={log}\n"
+            f"Poll hol_build_status(job=\"{job_id}\"); it reports running/done "
+            f"with the log tail, and cancel=True stops it.")
+
+
+@mcp.tool()
+async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> str:
+    """Status of a detached holmake job (holmake(detach=True)).
+
+    Args:
+        job: Job id from the detached holmake call
+        cancel: Kill the build's process group (default False)
+        tail: Bytes of log to include (default 2000)
+
+    Returns: `running`/`done`/`cancelled` with elapsed time, exit code and the
+             log tail; a done job's line says `Build succeeded` or `Build failed`.
+    """
+    entry = _build_jobs.get(job)
+    if entry is None:
+        known = ", ".join(sorted(_build_jobs)) or "none"
+        return f"ERROR: unknown build job '{job}' (known: {known})."
+    proc = entry.proc
+    if cancel and proc.returncode is None:
+        await _kill_process_group(proc)
+        entry.finished = time.time()
+        state = "cancelled"
+    elif proc.returncode is None:
+        state = "running"
+    else:
+        state = "done"
+    end = entry.finished or time.time()
+    elapsed = end - entry.started
+    try:
+        data = entry.log.read_bytes()
+        text = data[-tail:].decode("utf-8", errors="replace") if tail > 0 else ""
+    except OSError:
+        text = ""
+    head = f"{state}: job={job} target={entry.target or '(all)'} workdir={entry.workdir} [{elapsed:.0f}s]"
+    if state == "done":
+        verdict = "Build succeeded" if proc.returncode == 0 else f"Build failed (exit code {proc.returncode})"
+        head += f"\n{verdict}."
+    return f"{head}\nlog={entry.log}\n\n{text}".rstrip()
 
 
 @mcp.tool()
@@ -1631,24 +1869,23 @@ async def _init_file_cursor(
     # Auto-start or restart session if workdir changed or file content changed
     s = await _get_session(session)
     entry = _sessions.get(session)
+    notices: list[str] = []
+    t_begin = time.perf_counter()
 
     if s and s.is_running:
-        # Workdir mismatch: refuse instead of silently rebasing the session
-        # (RULE J trap: a session mid-proof in clone A, a file= from clone B —
-        # the old silent restart destroyed open suspensions/loaded context).
+        # Workdir switch: one session at a time (RULE J), so the session
+        # moves with the file. The previous workdir's loaded context and open
+        # suspensions do not survive; the notice says so.
         if entry and entry.workdir != target_workdir:
-            return (
-                f"ERROR: session '{session}' is bound to workdir "
-                f"{entry.workdir},\nbut {file_path} resolves to workdir "
-                f"{target_workdir}.\n"
-                f"RULE J: one session per workdir/theory — switching "
-                f"workdirs mid-session would\nsilently drop the session's "
-                f"loaded context and open suspensions.\n"
-                f"Stop it first (hol_stop(session='{session}')) and re-run "
-                f"with file= to re-init\ninto the new workdir."
+            notices.append(
+                f"[Session restarted: workdir {entry.workdir} → {target_workdir}; "
+                f"the previous workdir's loaded context and open suspensions "
+                f"were dropped]"
             )
+            await hol_stop(session)
+            s = None
         # Check if file content changed - session has stale definitions
-        if entry and entry.cursor:
+        elif entry and entry.cursor:
             old_cursor = entry.cursor
             if Path(old_cursor.file).resolve() == file_path:
                 # Same file - check if content changed
@@ -1676,8 +1913,10 @@ async def _init_file_cursor(
     
     cursor = FileProofCursor(file_path, s, tactic_timeout=TACTIC_TIMEOUT)
     result = await cursor.init()
-    
+
     init_time = time.perf_counter() - t0
+    cursor._startup_seconds = time.perf_counter() - t_begin
+    cursor._session_notices.extend(notices)
 
     _sessions[session].cursor = cursor
 
@@ -1781,12 +2020,32 @@ async def hol_state_at(
       - "[auto-cheated deps: name (reason); ...]" — prefix theorems that
         failed/timed out at load were replaced by cheat; the state shown
         rests on their STATEMENTS only. Verify them before trusting an OK.
-      - "NOTE: target line N is INSIDE step k ..." — the position is inside
-        one opaque (lumped/parenthesized) step; the state shown is that
-        step's ENTRY, not the state at line N. Split the arm with
-        `>- suspend` to navigate inside.
+      - "[inside opaque step k (lines A-B): state after sub-step j of n ...]"
+        — the position is inside one opaque (parenthesized) step and the
+        group receives exactly one goal there, so the step's flat sub-plan
+        was replayed to the position: the goals ARE the state at line N.
+        Not cached (the next call re-establishes the boundary).
+      - "NOTE: target line N is INSIDE step k ..." — same situation but the
+        group receives several goals, where a flat replay would diverge from
+        the file; the state shown is that step's ENTRY, not the state at
+        line N. Split the arm with `>- suspend` to navigate inside.
       - "TIMEOUT: step k (lines A-B) ..." — the failing step's source span;
         split it with `>- suspend` or raise the per-tactic timeout.
+      - "TIMEOUT: state_at exceeded ... prefix=Ps, target=Ts" — where the
+        overall budget went: prefix is dependency load plus earlier
+        theorems, target is this theorem's own tactics. target≈0 with
+        "your tactics never ran" is a heavy prefix (build the ancestors);
+        otherwise the tactic you just wrote is the suspect.
+      - "PROOF BROKEN in opaque step k (lines A-B); ..." — the failure is
+        inside one opaque step and its goal is not observable; the line
+        carries the sub-suspend recipe. Goals are withheld unless
+        show_partial=True, and then they are the step's ENTRY state.
+      - "Theorem: X ⚠ depends on cheat" (first line) — the state rests on
+        auto-cheated dependencies; "[auto-cheated deps: ...]" below names
+        them.
+      - "[Loop: N edit→navigate cycles on X broke at the same step k ...]" —
+        the same step has failed after N successive edits; stop editing
+        blind and sub-suspend the arm as the line says.
       - "Ancestor chain for suspension '...'" — a Resume's label was missing;
         the chain names the first broken ancestor to fix.
       - "unmatched smart quote at line L col C" — likely cause of a parse
@@ -1798,6 +2057,17 @@ async def hol_state_at(
       - "Goals withheld: ..." — replay stopped before the requested position,
         so the live goals are the failure point's. Navigate there, or pass
         show_partial=True.
+      - "[Session reloaded: ancestor X rebuilt ...]" — a dependency's built
+        artifact changed since the session loaded it; the session was rebuilt
+        and the prefix replayed from the new artifacts. Nothing to do.
+      - "[Session restarted: workdir A → B ...]" — file= lives in another
+        workdir; the session moved there. A's loaded context and open
+        suspensions are gone.
+      - "[Timing: total=..., replay=..., startup=...]" — startup is HOL
+        start plus dependency loads (cold init or reload); replay is this
+        theorem's tactics only. A slow call with startup≈total is a heavy
+        dependency load (see HOL4_MCP_DEP_LOAD_TIMEOUT / HOLHEAP), not a
+        slow proof.
 
     Returns: Proof position, goals at that position, errors if any
     """
@@ -1817,6 +2087,9 @@ async def hol_state_at(
     if not cursor:
         return f"ERROR: No cursor for session '{session}'. Pass file= to auto-init."
 
+    bad_timeout = _timeout_arg_error(timeout)
+    if bad_timeout:
+        return bad_timeout
     result = await _state_at_bounded(cursor, line, col, skip_prefix=skip_prefix, timeout=timeout)
     active_theorem = cursor._active_theorem
     thm = cursor._get_theorem(active_theorem) if active_theorem else None
@@ -1847,10 +2120,14 @@ async def hol_state_at(
         lines.extend(_quote_diagnosis_if_parse_error(cursor.file, result.error))
         return "\n".join(lines)
 
-    # Show theorem name (useful for hol_check_proof after edits)
+    # Show theorem name (useful for hol_check_proof after edits). A state that
+    # rests on auto-cheated dependencies says so on this first line; the named
+    # list follows in the caveats.
     if active_theorem:
-        lines.append(f"Theorem: {active_theorem}")
-    
+        marker = (" ⚠ depends on cheat"
+                  if _auto_cheated_deps_lines(cursor, active_theorem) else "")
+        lines.append(f"Theorem: {active_theorem}{marker}")
+
     if is_broken:
         # Proof is broken before the requested position.
         stuck_loc = tactic_to_loc(result.tactics_replayed)
@@ -1888,7 +2165,12 @@ async def hol_state_at(
         if opaque_multiline:
             range_str = f"lines {fail_loc[0]}-{fail_end_loc[0]}"
             fail_str = range_str  # footer uses this too
-            lines.append(f"PROOF BROKEN somewhere in the opaque step at {range_str}")
+            lines.append(
+                f"PROOF BROKEN in opaque step {fail_idx} ({range_str}); the goal "
+                f"at the failure is not observable — sub-suspend the arm "
+                f"(`>- suspend \"X\"` + `Resume {active_theorem}[X]: cheat QED`) "
+                f"to navigate inside it"
+            )
             lines.append(
                 f"ERROR: the failing step is a SINGLE opaque tactic spanning "
                 f"{range_str}; the replay cannot localize WHERE inside it the "
@@ -2039,6 +2321,7 @@ async def hol_state_at(
             lines.append("No goals (proof complete)")
 
     lines.extend(await _state_caveat_lines(cursor, result, active_theorem, thm, line))
+    lines.extend(_session_notice_lines(cursor))
 
     # Add timing info if available
     if result.timings:
@@ -2052,6 +2335,7 @@ async def hol_state_at(
                     if result.goals else "")
         lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
+                     f"startup={t.get('startup', 0)*1000:.0f}ms, "
                      f"method={method}{asms_str}]")
         # Cache-state diagnostics: show what _pos was BEFORE the call,
         # the target, and what got reused vs replayed. Useful for
@@ -2166,11 +2450,14 @@ async def hol_check_proof(
     if not thm:
         return f"ERROR: Theorem '{theorem}' not found"
 
+    dep_marker = (" ⚠ depends on cheat"
+                  if _auto_cheated_deps_lines(cursor, theorem) else "")
     lines = [
-        f"Theorem: {theorem}",
+        f"Theorem: {theorem}{dep_marker}",
         f"Lines: {thm.start_line}-{thm.proof_end_line - 1}",
-        "",
     ]
+    lines.extend(_session_notice_lines(cursor))
+    lines.append("")
 
     if thm.has_cheat:
         lines.append("Status: CHEAT (not verified)")

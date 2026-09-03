@@ -17,8 +17,95 @@ Two things every hook needs and none should reimplement:
   the session transcript, for the consent-gated PreToolUse hooks. Tool
   results ride the transcript as `role=user`; those are plumbing, not
   prompts, and are skipped.
+- `visible_command(command)` — a Bash command with its quoted strings and
+  heredoc bodies blanked, so a hook that matches command names sees only
+  text the shell would execute. What the shell WOULD run inside a string is
+  kept: `$(...)` and backtick substitutions, the argument of `-c`/`eval`,
+  and the substitutions of an unquoted heredoc.
 """
 import json
+import re
+
+_HEREDOC = re.compile(r"<<-?\s*(?:(['\"])(\w+)\1|\\?(\w+))")
+_KEEP_ARG_OF = ("-c", "-lc", "-ec", "-lec", "eval")
+
+
+def _substitutions(s):
+    """The `$(...)` and `` `...` `` segments of `s`, space-joined."""
+    out, i = [], 0
+    while i < len(s):
+        if s.startswith("$(", i):
+            depth, j = 0, i
+            while j < len(s):
+                if s[j] == "(":
+                    depth += 1
+                elif s[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            out.append(s[i:j + 1])
+            i = j + 1
+        elif s[i] == "`":
+            j = s.find("`", i + 1)
+            j = len(s) - 1 if j < 0 else j
+            out.append(s[i:j + 1])
+            i = j + 1
+        else:
+            i += 1
+    return " ".join(out)
+
+
+def _blank_heredocs(command):
+    lines = command.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        m = _HEREDOC.search(line)
+        i += 1
+        if not m:
+            continue
+        quoted, tag = m.group(1) is not None, m.group(2) or m.group(3)
+        while i < len(lines) and lines[i].lstrip("\t") != tag:
+            out.append("" if quoted else _substitutions(lines[i]))
+            i += 1
+    return "\n".join(out)
+
+
+def _prev_token(s, i):
+    j = i
+    while j > 0 and s[j - 1] in " \t":
+        j -= 1
+    k = j
+    while k > 0 and s[k - 1] not in " \t\n;|&(":
+        k -= 1
+    return s[k:j]
+
+
+def visible_command(command):
+    """`command` with quoted strings and heredoc bodies blanked (see module doc)."""
+    s = _blank_heredocs(command)
+    out, i = [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            keep = _prev_token(s, i) in _KEEP_ARG_OF
+            j = i + 1
+            while j < len(s) and s[j] != c:
+                j += 2 if (c == '"' and s[j] == "\\") else 1
+            body = s[i + 1:j]
+            out.append(c + (body if keep else
+                            (_substitutions(body) if c == '"' else "")) + c)
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 RESULT_KEYS = ("tool_output", "tool_response", "tool_result",
                "result", "output", "response")
