@@ -133,8 +133,8 @@ The `proofManagerLib` session is scratch, not storage. The moment a sub-step ver
 ### ⛔ RULE J — ONE HOL session at a time
 A second concurrent session resolves bare theorem names to a built ancestor's OLD version and falsely "passes"; `hol_start` refuses it (`force=True` only with a reason you can state). Switching theories is `file=` — the session moves with it (`[Session restarted: workdir …]`; the old workdir's context and open suspensions are gone) — and a rebuilt ancestor reloads itself on the next call (`[Session reloaded: …]`). Neither needs a stop/restart.
 
-### ⛔ RULE K — `skip_prefix=True` needs EXPLICIT user authorization
-`skip_prefix=True` binds every PRIOR theorem by `cheat`, so the target's goal rests on UNVERIFIED statements; a green result under it proves NOTHING (re-confirm without it before any done-claim). Only the user authorizes it, for THAT use — by `skip prefix ok` anywhere in the session, or by your deliberate repeat after H31's soft block, which is logged for them. Otherwise navigate the real way: full replay, a sub-suspended arm, or built ancestors.
+### ⛔ RULE K — `skip_prefix=True` is OFF by default and never a shortcut
+`skip_prefix=True` binds every PRIOR theorem by `cheat`, so the target's goal rests on UNVERIFIED statements; a green result under it proves NOTHING (re-confirm without it before any done-claim). Use it only when the user asked (`skip prefix ok` pre-grants) or when you can state why the real way — full replay, a sub-suspended arm, built ancestors — is unavailable; H31 blocks the first use per file, and a repeat is your logged decision.
 
 ## HOL4-specific working principles
 

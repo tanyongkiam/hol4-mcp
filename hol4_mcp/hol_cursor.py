@@ -231,8 +231,8 @@ def _format_context_error(output: str) -> str:
                 f"Likely cause: unresolved env var $({var}) in Holmakefile INCLUDES\n"
                 f"  Fix:\n"
                 f"    1) holmake(workdir=..., env={{\"{var}\": \"/abs/path\"}})\n"
-                f"    2) hol_setenv(env={{\"{var}\": \"/abs/path\"}})\n"
-                f"    3) hol_restart(session=...)"
+                f"    2) hol_setenv(env={{\"{var}\": \"/abs/path\"}}) — it restarts "
+                f"the session itself"
             )
 
         return (

@@ -360,7 +360,7 @@ Exception- Fail "Cannot find file $(VFMDIR)/spec/prop/vfmComputeTheory.ui" raise
     assert "$(VFMDIR)" in msg
     assert "holmake(workdir=..., env={\"VFMDIR\": \"/abs/path\"})" in msg
     assert "hol_setenv(env={\"VFMDIR\": \"/abs/path\"})" in msg
-    assert "hol_restart(session=...)" in msg
+    assert "hol_restart" not in msg          # hol_setenv restarts the session itself
 
 
 def test_format_context_error_structure_fallback_mentions_env_vars():

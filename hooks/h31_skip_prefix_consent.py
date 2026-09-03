@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-H31 -- PreToolUse hook blocking `skip_prefix: true` on hol_state_at /
-hol_goals unless the latest user message contains the literal phrase
-`skip prefix ok`.
+H31 -- PreToolUse soft hook on `skip_prefix: true` for hol_state_at /
+hol_goals.
 
 RULE K: prefix-skip binds every theorem before the target by `cheat`, so the
 goal shown rests on unverified statements. Soft hook: the first use on a

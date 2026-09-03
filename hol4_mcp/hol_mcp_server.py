@@ -1270,8 +1270,10 @@ async def hol_goals(
         session: Session name (default: "default")
         skip_prefix: With line, bind prefix theorems by cheat (statement only)
               instead of replaying — see hol_state_at for the full semantics.
-              Requires explicit user authorization (RULE K); never on your
-              own initiative. (default: False)
+              Off by default and never a shortcut (RULE K): the user
+              pre-grants with `skip prefix ok`, otherwise H31 blocks the
+              first use per file and a repeat is your logged decision.
+              (default: False)
         timeout: With line, overall wall-clock budget (seconds) for the
               navigation; None uses the server default (HOL_STATE_AT_TIMEOUT /
               300s). On expiry HOL is interrupted and a TIMEOUT is returned
@@ -1996,9 +1998,11 @@ async def hol_state_at(
                       earlier proofs are slow or non-terminating. The target's
                       own tactics still replay, so its live goal is real, but it
                       rests on the skipped statements (NOT a verification).
-                      Requires explicit user authorization (RULE K); never on
-                      your own initiative. Toggling the mode forces a clean
-                      prefix reload. (default: False)
+                      Off by default and never a shortcut (RULE K): the user
+                      pre-grants with `skip prefix ok`, otherwise H31 blocks
+                      the first use per file and a repeat is your logged
+                      decision. Toggling the mode forces a clean prefix
+                      reload. (default: False)
         timeout: Overall wall-clock budget (seconds) for this navigation. None
                       uses the server default (HOL_STATE_AT_TIMEOUT / 300s). On
                       expiry the HOL process is interrupted (recoverable) and a

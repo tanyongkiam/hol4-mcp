@@ -25,10 +25,10 @@ Telltale symptom of a dropped/reordered prefix step: a tail tactic over-runs wit
 
 **STOP-and-check triggers** (each is a wrong-context risk): re-running prefix tactics by hand to "get back to" a subgoal; developing a closer for a subgoal you reached by a shortcut; "this step is obviously redundant, I'll skip it". When unsure the prefix is exact → sub-suspend and let `hol_state_at` replay it.
 
-## ⛔ `skip_prefix=true` — never on your own initiative (rule owner: skill RULE K)
-Only with explicit user authorization for THAT use; a green result under it proves nothing (re-confirm without). Manage replay cost the real way: build ancestor theories before proof work (setup `holmake <dep>.dat` — RULE A permits dependency unsticking), fix a file's theorems in file order so navigation replays a green prefix, and shrink scope with sub-suspends — never by skipping the prefix.
+## ⛔ `skip_prefix=true` — never a shortcut (rule owner: skill RULE K)
+Off by default; the user pre-grants with `skip prefix ok`, otherwise H31 blocks the first use per file and a repeat is your logged decision. A green result under it proves nothing (re-confirm without). Manage replay cost the real way: build ancestor theories before proof work (setup `holmake <dep>.dat` — RULE A permits dependency unsticking), fix a file's theorems in file order so navigation replays a green prefix, and shrink scope with sub-suspends — never by skipping the prefix.
 
-## `hol_restart` — for a stale ancestor `.dat`, never for a confusing replay
+## `hol_restart` — the server reloads for you; never restart for a confusing replay
 `hol_state_at` auto-detects edits to the file you are proving in, so a restart after editing is never needed. The one thing a live session cannot do — reload an ancestor theory rebuilt since it loaded — the server now does for you: the next `hol_state_at`/`hol_check_proof` rebuilds the session and prints `[Session reloaded: ancestor … rebuilt …]`; a `file=` in another workdir moves the session there (`[Session restarted: workdir …]`). So nothing in the ordinary loop needs a manual stop/restart. A broken replay, a wrong-looking goal, or a tactic that will not close is a proof or navigation error: diagnose it (§desync), because the restart wipes the very state that localises it. H29 blocks a REPEAT stop/restart in the same theory directory within 30 min once (first stop, directory switches and a stop right after a budget TIMEOUT pass; a deliberate repeat passes and is logged; `restart ok` pre-grants); a second restart for the same symptom means the first substituted for a diagnosis you had not made.
 
 ## ⛔ Upstream Script.sml edits stale ALL downstream results — nothing reports it
