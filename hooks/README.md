@@ -1,5 +1,11 @@
 # hol4-mcp Claude Code hooks
 
+This document describes the Claude Code registration of the shared `h*.py`
+policy scripts. The additive Codex registration is `hooks/hooks.json`; its
+payload and state-isolation adapter is documented in
+`integrations/codex/README.md`. The Codex layer does not change
+`~/.claude/settings.json` or the Claude hook-state directory.
+
 Runtime-enforced interaction policies for HOL4 proof work. Each hook is a
 standalone script invoked by Claude Code at a defined lifecycle event
 (`PreToolUse`, `PostToolUse`, ...); see

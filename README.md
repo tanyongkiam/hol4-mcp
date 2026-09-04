@@ -59,6 +59,37 @@ Add to `.mcp.json` in your project root (or `~/.claude/mcp.json` globally):
 }
 ```
 
+### Codex
+
+This checkout is also a native Codex plugin. Its
+`.codex-plugin/plugin.json` bundles three pieces:
+
+- the `hol4` stdio MCP server, with an 1800-second tool timeout for long proof
+  replays and builds;
+- the `hol4-proving` skill under `skills/`;
+- Codex-native lifecycle hooks from `hooks/hooks.json`.
+
+Install this directory through a local Codex plugin marketplace, enable the
+`hol4-mcp` plugin, then open `/hooks` and trust its reviewed hook definitions.
+`hol4-mcp` must be on Codex's `PATH`; export `HOLDIR` when HOL is not at
+`~/HOL`. Plugin hook state is kept under Codex's `PLUGIN_DATA` and does not use
+the real `~/.claude` directory.
+
+For an MCP-only setup without installing the plugin, add this to
+`~/.codex/config.toml` (or a trusted project's `.codex/config.toml`):
+
+```toml
+[mcp_servers.hol4]
+command = "hol4-mcp"
+args = ["--transport", "stdio"]
+env_vars = ["HOLDIR"]
+startup_timeout_sec = 30
+tool_timeout_sec = 1800
+```
+
+The MCP-only setup exposes the tools, but not the bundled proof skill or
+lifecycle hooks. See `integrations/codex/README.md` for the adapter boundary.
+
 ### Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
@@ -166,13 +197,15 @@ hol4_mcp/
 
 The repo also carries the guidance an agent needs to *use* this server:
 
-- `skills/hol4-proving/` — the HOL4 proof-interaction ruleset (`SKILL.md`) and its
-  technique notes (`notes/`). It is deliberately NOT under `.claude/`: it is a
-  proof-work skill, not a skill for developing this server. Expose it to Claude
-  Code globally with a symlink:
-  `ln -s "$PWD/skills/hol4-proving" ~/.claude/skills/hol4-proving`.
-- `hooks/` — Claude Code hooks that enforce those rules mechanically at the tool
-  call; see `hooks/README.md` for the table and the `settings.json` wiring.
+- `skills/hol4-proving/` — the shared HOL4 proof-interaction ruleset (`SKILL.md`)
+  and its technique notes (`notes/`). Claude Code can expose it globally with
+  `ln -s "$PWD/skills/hol4-proving" ~/.claude/skills/hol4-proving`; the Codex
+  plugin bundles the same canonical directory directly.
+- `hooks/h*.py` — the established Claude Code hooks and
+  `hooks/install_hooks.py` wiring. See `hooks/README.md`.
+- `hooks/hooks.json` and `integrations/codex/` — the additive Codex lifecycle
+  wiring and payload adapter. The adapter reuses the policy scripts while
+  isolating their state from Claude.
 
 Editing either? `skills/hol4-proving/notes/reference_hol4_docs.md` defines which
 layer owns which fact and the quality bar every entry must pass.
