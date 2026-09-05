@@ -252,6 +252,25 @@ fun unwrapAtom (TacticParse.Group (_, _, e)) = unwrapAtom e
   | unwrapAtom (TacticParse.RepairGroup (_, _, e, _)) = unwrapAtom e
   | unwrapAtom e = e
 
+(* Term-quotation openers: ASCII backtick, and the UTF-8 bytes of ‘ and “. *)
+val quoteOpeners = ["`", "\226\128\152", "\226\128\156"]
+
+fun startsWithQuote t = List.exists (fn q => String.isPrefix q t) quoteOpeners
+
+(* Does the atom's own span cover a complete tactic, or only an operand?
+   TacticParse's `group tac a b` records exactly that in Group's first field:
+     `Q` by tac      -> bare Subgoal, span = the quotation          (operand)
+     sg `Q`          -> Group(true, whole call, Subgoal _)          (tactic)
+     >>~- ([p], t)   -> Group(false, p, Rename p)                   (operand)
+     rename [p]      -> Group(true, whole call, Rename p)           (tactic)
+   An operand span must be realized as a tactic before goalFrag.expand (a
+   tactic -> _) receives it. Both Subgoal and Rename have topSpan = NONE, so
+   both forms are wrapped and the flag — not the span's first character — is
+   the discriminator. *)
+fun spanIsTactic (TacticParse.Group (b, _, _)) = b
+  | spanIsTactic (TacticParse.RepairGroup _) = true
+  | spanIsTactic _ = false
+
 (* Extract raw text from a fragment (no ef() wrapping).
    FAtom -> tactic text from proofBody substring.
    Subgoal atoms get "sg " prefix so `Q` becomes `sg `Q`` — a valid tactic.
@@ -265,18 +284,16 @@ fun frag_text proofBody (TacticParse.FAtom a) =
                          String.substring(proofBody, start, endPos - start)
                      | (NONE, NONE) => "")
       in case unwrapAtom a of
+           (* `Q` by tac spans only the quotation; realize it as the tactic
+              HOL4 equates that form with. `by`'s left operand is not always a
+              quotation (tac1 by tac2), and those spans are already tactics. *)
            TacticParse.Subgoal _ =>
-             (* Subgoal from `by`: if text is a term quotation `...`, prefix with sg
-                so it becomes a valid tactic. If already a tactic name, keep as-is. *)
-             if String.size raw > 0 andalso String.sub(raw, 0) = #"`"
-             then "sg " ^ raw else raw
+             if startsWithQuote raw then "sg " ^ raw else raw
+           (* An operand span carries only the pattern of `>>~- ([pat], tac)`,
+              applied as the SELECT tactic between open_select_lt and
+              next_select_lt; realize it the way TacticParse does. *)
          | TacticParse.Rename _ =>
-             (* Select pattern of `>>~- ([pat], tac)` (LSelectThen's first arm).
-                Between open_select_lt/next_select_lt it is applied as the
-                SELECT tactic, so it must be realized as RENAME_TAC, not handed
-                to goalFrag.expand as a bare term-quotation list (a type error:
-                expand : tactic -> ...). Mirrors TacticParse's Rename -> RENAME_TAC. *)
-             "Q.RENAME_TAC " ^ raw
+             if spanIsTactic a then raw else "Q.RENAME_TAC " ^ raw
          | _ => raw
       end
   | frag_text _ (TacticParse.FFOpen opn) = openFragName opn
@@ -563,9 +580,8 @@ fun merge_select_steps [] acc = rev acc
    behaviour, which is correct in single-goal contexts (top-level `P` by tac
    without an upstream multi-goal-producing tactic in the same THEN chain). *)
 fun isSubgoalText t =
-      String.size t >= 4 andalso
-      String.substring (t, 0, 3) = "sg " andalso
-      String.sub (t, 3) = #"`"
+      String.isPrefix "sg " t andalso
+      startsWithQuote (String.extract (t, 3, NONE))
 
 fun stripSgPrefix t = String.substring (t, 3, String.size t - 3)
 

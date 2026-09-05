@@ -16,7 +16,6 @@ six of them at the moment they apply; the rest you have to come and get.
 - `>~`/`>-`/`>>` same precedence, left-associative.
 - `*`/`DIV`/`MOD` same precedence, left-associative: `a * b MOD c` = `(a * b) MOD c`. Symptom of a mis-parenthesised quotation: a "trivially true" arithmetic `by simp[]` fails, or a qmatch raises. Fix: explicit parens matching the goal's actual term (verify via `aconv`, not the display).
 - Resume header labels are UNQUOTED: `Resume thm[Label]:` — writing `Resume thm["Label"]:` parse-errors at replay and cascades into misleading "No such label" extraction failures (the `suspend "Label"` tactic call itself DOES take a quoted string).
-- **Resume body cannot START with `‘Q’ by tac`** — the step-plan splits at `by`, treating `‘Q’` as a term step (fails). Lead with a regular tactic; `by` works fine chained after `\\`.
 - Qualify overloaded constructors in `>~` patterns: `Module$Constructor`.
 - Suspend/Resume/Finalise structural facts: body in `Resume thm[Name]: <tactics> QED`; dispatcher `suspend` labels must match Resume labels exactly. See [[feedback_suspend_resume]] for dispatch and inlining craft.
 
