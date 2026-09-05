@@ -12,7 +12,7 @@ from .hol_file_parser import (
     TheoremInfo, parse_theorems, LocalBlock, parse_local_blocks,
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan, step_text_start,
-    construct_start_line, _find_json_line,
+    construct_start_line, _find_json_line, suspension_base,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -2597,7 +2597,8 @@ class FileProofCursor:
                 f"[Loop: {count} edit→navigate cycles on {theorem} broke at the "
                 f"same step {nav.reached_idx}. Stop editing blind: sub-suspend "
                 f"the arm — replace it with `>- suspend \"X\"`, add "
-                f"`Resume {theorem}[X]: cheat QED` after the parent QED, then "
+                f"`Resume {suspension_base(theorem)}[X]: cheat QED` after the "
+                f"parent QED, then "
                 f"hol_state_at inside the Resume body to read the real goal]")
 
     def mark_interrupted(self) -> None:

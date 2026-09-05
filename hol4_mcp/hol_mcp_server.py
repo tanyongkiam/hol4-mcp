@@ -26,7 +26,7 @@ from .hol_session import HOLSession, HOLDIR, escape_sml_string
 from .hol_cursor import FileProofCursor, StateAtResult, _try_find_json_line
 from .hol_file_parser import (
     HOLParseError, step_line_numbers, format_steps, format_step_context,
-    step_text_start, elide_long_text,
+    step_text_start, elide_long_text, suspension_base,
 )
 from .quote_check import quote_diagnosis_lines
 
@@ -2172,7 +2172,8 @@ async def hol_state_at(
             lines.append(
                 f"PROOF BROKEN in opaque step {fail_idx} ({range_str}); the goal "
                 f"at the failure is not observable — sub-suspend the arm "
-                f"(`>- suspend \"X\"` + `Resume {active_theorem}[X]: cheat QED`) "
+                f"(`>- suspend \"X\"` + "
+                f"`Resume {suspension_base(active_theorem or 'thm')}[X]: cheat QED`) "
                 f"to navigate inside it"
             )
             lines.append(

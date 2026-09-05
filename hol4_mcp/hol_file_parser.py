@@ -548,6 +548,18 @@ class TheoremInfo:
         return self.proof_end_line - 2
 
 
+def suspension_base(name: str) -> str:
+    """Base theorem name to use in a `Resume <base>[<label>]:` header.
+
+    A Resume block's own name is the composite `thm[label]`, but the header
+    syntax takes exactly ONE label level, so suspension labels live in a flat
+    namespace per theorem: a sub-suspend created INSIDE `thm[a]` is resumed by
+    `Resume thm[b]:`, never `Resume thm[a][b]:` — that does not match the
+    Resume pattern, and yields a block the parser does not see at all.
+    """
+    return name.split('[', 1)[0]
+
+
 def _strip_comments(content: str) -> str:
     """Replace SML comments (* ... *) with spaces, preserving newlines.
 
