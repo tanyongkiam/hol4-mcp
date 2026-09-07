@@ -30,6 +30,7 @@ You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tacti
 | a per-goal tactic (`drule_all`, `first_x_assum`) fails for no clear reason right after `hol_state_at` — classically `Lib.assert: predicate not true` | [[feedback_replay_discipline]] §goalfrag — an all-goals driver was applied to a parked goalfrag; the goal terms are fine |
 | `hol_state_at` says "target INSIDE step k" | §Reading a `>-` / `THEN1` / `\\`-chain arm's goal |
 | `PROOF BROKEN` / `replayed=0/N` / a goal that looks wrong | [[feedback_replay_discipline]] §desync · [[feedback_hol4_mcp_proving]] §Recovery |
+| a replayed step dies with `poly: … Type error in function application` at a line of valid HOL | [[feedback_replay_discipline]] §Type error at a replayed step |
 | a navigation or check TIMEOUT | [[feedback_replay_discipline]] §TIMEOUT |
 | a probe took >2 min and it is NOT a cold start (server prints `SLOW NAVIGATION #n`) | this skill, *HOL4 — suspend/Resume/Finalise* — shrink the replayed unit BEFORE the next edit |
 | a green check that may rest on a cheated dependency | [[feedback_replay_discipline]] §auto-cheat |

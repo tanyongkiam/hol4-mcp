@@ -289,6 +289,12 @@ fun frag_text proofBody (TacticParse.FAtom a) =
               quotation (tac1 by tac2), and those spans are already tactics. *)
            TacticParse.Subgoal _ =>
              if startsWithQuote raw then "sg " ^ raw else raw
+           (* `Q` suffices_by tac elaborates to ThenLT (Subgoal Q, [LReverse])
+              under a Group whose span is likewise only the quotation, so it
+              reaches here as a ThenLT rather than a bare Subgoal. Reversing
+              after sg is what makes Q the surviving goal. *)
+         | TacticParse.ThenLT (TacticParse.Subgoal _, [TacticParse.LReverse]) =>
+             if startsWithQuote raw then "reverse (sg " ^ raw ^ ")" else raw
            (* An operand span carries only the pattern of `>>~- ([pat], tac)`,
               applied as the SELECT tactic between open_select_lt and
               next_select_lt; realize it the way TacticParse does. *)

@@ -61,6 +61,25 @@ async def execute_steps(session, steps, goal):
     return -1
 
 
+async def remaining_goals(session, steps, goal):
+    """Run a step plan on `goal`; return the surviving goals' conclusions.
+
+    None means a step raised. Goal count alone cannot tell `by` from
+    `suffices_by` — both leave one goal — so the conclusions are the evidence.
+    """
+    await session.send('drop_all();', timeout=5)
+    await session.send(f'gf `{goal}`;', timeout=10)
+    for step in steps:
+        r = await session.send(step.cmd, timeout=20)
+        if "Exception-" in r or "error:" in r or "poly:" in r or "Type error" in r:
+            return None
+    r = await session.send('goals_json();', timeout=10)
+    for line in r.strip().split('\n'):
+        if line.startswith('{"ok":'):
+            return [g["goal"] for g in json.loads(line)['ok']]
+    return None
+
+
 def texts(steps):
     return [s.text for s in steps]
 
@@ -179,3 +198,63 @@ class TestRenameRealization:
     async def test_select_then_still_executes(self, hol_session):
         steps = await call_step_plan(hol_session, SELECT_THEN)
         assert await execute_steps(hol_session, steps, "T /\\ T") == 0
+
+
+# ---------------------------------------------------------------------------
+# `Q` suffices_by tac — the operand span arrives as a ThenLT, not a Subgoal
+# ---------------------------------------------------------------------------
+#
+# TacticParse (src/parse/TacticParse.sml) elaborates the two `by` flavours
+# differently:
+#
+#     `Q` by tac           ->  ThenLT (Subgoal Q, [LThen1 tac])
+#     `Q` suffices_by tac  ->  ThenLT (group false Q (ThenLT (Subgoal Q,
+#                                                             [LReverse])),
+#                                      [LThen1 tac])
+#
+# Both spans cover only the quotation, but unwrapping the second reaches a
+# ThenLT rather than a bare Subgoal, so a `Subgoal`-only realization drops
+# through to the catch-all and emits the raw quotation. `goalFrag.expand`
+# takes a tactic, so the step dies as a Poly/ML "Type error in function
+# application" pointing at a line of perfectly good HOL.
+#
+# The reversal is not cosmetic: it is what makes Q the surviving goal, so
+# realizing the operand as plain `sg Q` would silently give `by` semantics.
+
+SUFFICES = "`q ∧ p` suffices_by metis_tac[]"
+SUFFICES_UNICODE = "‘q ∧ p’ suffices_by metis_tac[]"
+# Mid-chain the whole form merges into one step; standalone it decomposes.
+SUFFICES_CHAIN = "ALL_TAC \\\\ `q ∧ p` suffices_by metis_tac[]"
+
+
+class TestSufficesByRealization:
+    async def test_no_bare_quotation_step(self, hol_session):
+        steps = await call_step_plan(hol_session, SUFFICES)
+        assert not bare_quotations(steps), texts(steps)
+
+    async def test_unicode_form_has_no_bare_quotation(self, hol_session):
+        steps = await call_step_plan(hol_session, SUFFICES_UNICODE)
+        assert not bare_quotations(steps), texts(steps)
+
+    async def test_plan_executes(self, hol_session):
+        steps = await call_step_plan(hol_session, SUFFICES)
+        assert await remaining_goals(hol_session, steps, "p ∧ q") is not None
+
+    async def test_leaves_the_sufficient_goal_not_the_original(self, hol_session):
+        """The discriminating check: `by` semantics would leave `p ∧ q`."""
+        steps = await call_step_plan(hol_session, SUFFICES)
+        assert await remaining_goals(hol_session, steps, "p ∧ q") == ["q ∧ p"]
+
+    async def test_decomposed_form_agrees_with_merged_chain_form(self, hol_session):
+        """Whether the form merges into one step depends on its context; the
+        goal it leaves must not."""
+        chain = await call_step_plan(hol_session, SUFFICES_CHAIN)
+        expected = await remaining_goals(hol_session, chain, "p ∧ q")
+        assert expected == ["q ∧ p"], expected
+        standalone = await call_step_plan(hol_session, SUFFICES)
+        assert await remaining_goals(hol_session, standalone, "p ∧ q") == expected
+
+    async def test_by_control_is_unchanged(self, hol_session):
+        """`by` must keep its own realization — the two must not converge."""
+        steps = await call_step_plan(hol_session, "`T` by SIMP_TAC bool_ss []")
+        assert texts(steps) == ["`T` by SIMP_TAC bool_ss []"], texts(steps)

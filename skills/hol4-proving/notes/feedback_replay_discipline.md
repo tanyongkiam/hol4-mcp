@@ -45,6 +45,10 @@ A navigation/check that times out (or visibly hangs) is almost always a **loopin
 ## "desync" is essentially never the real cause
 A wrong-context proof and a true desync show the SAME headline (`replayed=0/N` + `PROOF BROKEN at <first step>`), so the headline tells you nothing — assume bad navigation (the GATE above) and PROVE it by replaying the committed body file-form (`hol_state_at` past QED, or `holmake`); it fails there too because the proof genuinely diverges. Don't reach for backward-nav/restart "resets". A genuine `hol_state_at` position-cache desync is only *theoretically* possible; if you ever truly confirm one on a provably-correct proof, REPORT it (minimal reproducer to `~/hol4-mcp/`) — never work around (RULE D).
 
+## ⛔ Type error at a replayed step
+A Poly/ML type error can be a REALIZATION fault, not a proof error.
+`goalFrag.expand` takes a tactic, so when the step plan realizes a construct's OPERAND span as itself the step is a bare term quotation and Poly/ML reports `Type error in function application` — pointing at a line of perfectly good HOL, and failing the whole theorem. READ THE STEP TEXT the failure prints: if it is not a runnable tactic, the proof is innocent and the realization is the bug. Reproduce with `goalfrag_step_plan_json` on that one construct, REPORT it (RULE D), and never rewrite the proof to dodge it.
+
 ## ⛔ Don't ACCUMULATE or RE-SEND proof state in `hol_send` — flush to the FILE, jump with `hol_state_at`
 Interactive `hol_send` is fine for navigating/probing the current goal (the GATE above) — but it is SCRATCH, not where you build or store a proof. Two anti-patterns (the top token-waste failure mode):
 - **Re-sending a chunk you already sent** (a tweaked variant), to "rebuild" the state. Each call re-prints a multi-KB goal; tokens compound brutally.
