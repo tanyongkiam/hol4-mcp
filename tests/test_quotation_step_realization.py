@@ -218,8 +218,8 @@ class TestRenameRealization:
 # takes a tactic, so the step dies as a Poly/ML "Type error in function
 # application" pointing at a line of perfectly good HOL.
 #
-# The reversal is not cosmetic: it is what makes Q the surviving goal, so
-# realizing the operand as plain `sg Q` would silently give `by` semantics.
+# Use Q_TAC SUFF_TAC, like BasicProvers.suffices_by. Reversed sg leaves the
+# same final goal, but gives the closer stripped assumptions, not Q ==> G.
 
 SUFFICES = "`q ∧ p` suffices_by metis_tac[]"
 SUFFICES_UNICODE = "‘q ∧ p’ suffices_by metis_tac[]"
@@ -228,6 +228,35 @@ SUFFICES_CHAIN = "ALL_TAC \\\\ `q ∧ p` suffices_by metis_tac[]"
 
 
 class TestSufficesByRealization:
+    @pytest.mark.parametrize("quotation", ["`q ∧ p`", "‘q ∧ p’"])
+    async def test_closer_receives_native_implication(self, hol_session, quotation):
+        steps = await call_step_plan(
+            hol_session, quotation + " suffices_by (strip_tac >> simp[])")
+        actual = await remaining_goals(hol_session, steps[:1], "p ∧ q")
+        assert actual == ["q ∧ p ⇒ p ∧ q", "q ∧ p"], (texts(steps), actual)
+        actual_json = await hol_session.send('goals_json();', timeout=10)
+        await hol_session.send('drop_all(); gf `p ∧ q`;', timeout=10)
+        native = await hol_session.send(
+            f'ef(goalFrag.expand (Q_TAC SUFF_TAC {quotation}));', timeout=10)
+        assert "Exception-" not in native and "error:" not in native, native
+        native_json = await hol_session.send('goals_json();', timeout=10)
+        assert actual_json == native_json
+
+    @pytest.mark.parametrize("prefix", ["", "ALL_TAC \\\\", "conj_tac \\\\"])
+    async def test_strip_closer_agrees_with_native(self, hol_session, prefix):
+        source = prefix + " ‘q ∧ p’ suffices_by (strip_tac >> simp[])"
+        goal = "p ∧ p" if prefix.startswith("conj_tac") else "p:bool"
+        steps = await call_step_plan(hol_session, source)
+        actual = await remaining_goals(hol_session, steps, goal)
+        await hol_session.send('drop_all();', timeout=10)
+        await hol_session.send(f'gf `{goal}`;', timeout=10)
+        native = await hol_session.send(f'ef(goalFrag.expand ({source}));', timeout=10)
+        assert "Exception-" not in native and "error:" not in native, native
+        expected = await hol_session.send('goals_json();', timeout=10)
+        expected = next(json.loads(l)['ok'] for l in expected.splitlines()
+                        if l.startswith('{"ok":'))
+        assert actual == [g['goal'] for g in expected], (texts(steps), actual)
+
     async def test_no_bare_quotation_step(self, hol_session):
         steps = await call_step_plan(hol_session, SUFFICES)
         assert not bare_quotations(steps), texts(steps)
