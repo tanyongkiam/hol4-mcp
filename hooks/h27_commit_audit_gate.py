@@ -195,7 +195,7 @@ def main():
         return 0
 
     review = review_id(_cwd, command, files, findings)
-    approved = approved_classes(payload, review)
+    approved = approved_classes(payload, review, {finding_class(f[3]) for f in findings})
     remaining = [f for f in findings if finding_class(f[3]) not in approved]
     if not remaining:
         emit_context(f"[H27: review {review} — approved {', '.join(sorted(approved))} "
@@ -224,9 +224,12 @@ def main():
           "confluent, so verify per theorem before collapsing anything.",
           file=sys.stderr)
     classes = sorted({finding_class(f[3]) for f in findings})
+    question = " and ".join("style exceptions" if c == "style" else
+                            "an incomplete-proof checkpoint" for c in classes)
     print(f"Review {review}: unapproved classes {', '.join(classes)}. "
-          "An exception requires explicit user approval naming this review and "
-          "the class (style exceptions or incomplete-proof checkpoint). "
+          f"Approve {question} for this exact review? "
+          "If this is the only pending audit review, reply yes or OK as your "
+          "next message. Otherwise name the review and exception class. "
           "Approval expires after 30 minutes and cannot cover changed proof "
           "contents/commands. Audit approval grants no permission to commit or push.",
           file=sys.stderr)

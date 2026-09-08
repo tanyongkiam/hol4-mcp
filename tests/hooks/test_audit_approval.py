@@ -116,3 +116,49 @@ def test_rolling_history_does_not_renew_expired_approval(monkeypatch):
     assert policy.apply_reviews(state, messages, key, 1) == {"style"}
     messages = messages[1:] + ["status?"]
     assert not policy.apply_reviews(state, messages, key, policy.WINDOW + 2)
+
+
+def test_short_reply_to_sole_review_at_rolling_boundary(monkeypatch):
+    policy = load_policy(monkeypatch)
+    for reply in ("yes", "OK", "Okay.", "Yes, please!", "approved"):
+        key, state = "123456789abc", {}
+        messages = [f"prompt {n}" for n in range(64)]
+        assert not policy.apply_reviews(state, messages, key, 0, {"style"})
+        messages = messages[1:] + [reply]
+        assert policy.apply_reviews(state, messages, key, 1, {"style"}) == {"style"}
+        assert not policy.apply_reviews(state, messages, key, policy.WINDOW + 2, {"style"})
+
+
+def test_short_reply_rejects_intervening_turns_or_ambiguous_reviews(monkeypatch):
+    policy = load_policy(monkeypatch)
+    key, other = "123456789abc", "abcdef123456"
+    for reply in ("no", "yes, fix the hook", "> yes", "I previously said OK"):
+        state, messages = {}, ["review"]
+        policy.apply_reviews(state, messages, key, 0, {"style"})
+        assert not policy.apply_reviews(state, messages + [reply], key, 1, {"style"})
+    state, messages = {}, ["review"]
+    policy.apply_reviews(state, messages, key, 0, {"style"})
+    assert not policy.apply_reviews(state, messages + ["status?", "yes"], key, 1, {"style"})
+    state = {}
+    policy.apply_reviews(state, messages, key, 0, {"style"})
+    policy.apply_reviews(state, messages, other, 1, {"style"})
+    assert not policy.apply_reviews(state, messages + ["yes"], key, 2, {"style"})
+
+
+def test_short_reply_only_approves_displayed_classes_and_cannot_replay(monkeypatch):
+    policy = load_policy(monkeypatch)
+    key, state, messages = "123456789abc", {}, ["review"]
+    policy.apply_reviews(state, messages, key, 0, {"style"})
+    messages += ["yes"]
+    assert policy.apply_reviews(state, messages, key, 1, {"style"}) == {"style"}
+    messages += [f"Revoke review {key}"]
+    assert not policy.apply_reviews(state, messages, key, 2, {"style"})
+    messages += ["status?"]
+    assert not policy.apply_reviews(state, messages, key, 3, {"style"})
+
+
+def test_short_reply_before_disclosure_cannot_become_consent(monkeypatch):
+    policy = load_policy(monkeypatch)
+    key, state = "123456789abc", {}
+    assert not policy.apply_reviews(state, ["yes"], key, 0, {"style"})
+    assert not policy.apply_reviews(state, ["yes"], key, 1, {"style"})

@@ -515,9 +515,16 @@ the audit gates. Exceptions use a content-scoped review, not a broad WIP token.
 ### Scoped review approval
 
 A blocked audit displays a review ID bound to the repository, exact command,
-proposed proof-file contents and findings. A user may approve **style
-exceptions**, an **incomplete-proof checkpoint**, or explicitly both, naming
-that ID. For example: `I approve the style exceptions for review <ID>.`
+proposed proof-file contents and findings. It asks approval for the displayed
+exception classes. When there is exactly one pending review, the next user
+message may simply be **yes** or **OK**; this approves only those displayed
+classes for that exact review. An intervening user message, expired review,
+changed scope or multiple pending reviews prevents this shorthand. Quoted
+acknowledgements and acknowledgements embedded in other requests do not count.
+
+A user may instead approve **style exceptions**, an **incomplete-proof
+checkpoint**, or explicitly both, naming the ID. For example:
+`I approve the style exceptions for review <ID>.`
 The equivalent incomplete-proof wording is
 `Approve the incomplete-proof checkpoint for review <ID>`; both classes may
 be joined with `and`. The approval must follow disclosure of the review.

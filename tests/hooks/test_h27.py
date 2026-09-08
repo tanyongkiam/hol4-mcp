@@ -238,6 +238,17 @@ def test_old_wip_phrase_cannot_bypass_content_resolution(run_hook, repo):
     assert code == 2 and "cannot determine" in err
 
 
+def test_short_reply_approves_the_disclosed_exception_class(run_hook, repo):
+    stage(repo, "  >- metis_tac []", "  >- cheat")
+    command = "git commit -m checkpoint"
+    code, err, _ = run(run_hook, repo, command)
+    assert code == 2 and "Approve an incomplete-proof checkpoint" in err
+    assert "reply yes or OK" in err
+    code, err, out = run_hook("h27_commit_audit_gate.py", "Bash", {"command": command},
+                             cwd=repo, user_msg="OK", history=[""])
+    assert code == 0 and "approved incomplete-proof" in out, (err, out)
+
+
 def test_deleted_finalise_is_blocked(run_hook, repo):
     p = repo / "fooScript.sml"
     p.write_text('Theorem t:\n T\nProof\n suspend "a"\nQED\n'

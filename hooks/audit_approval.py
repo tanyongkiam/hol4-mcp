@@ -18,6 +18,7 @@ APPROVE = re.compile(
     r"(style exceptions|incomplete[- ]proof checkpoint|style exceptions and incomplete[- ]proof checkpoint)"
     r"\s+(?:for\s+)?(?:review\s+)?([0-9a-f]{12})[.!]?", re.I)
 REVOKE = re.compile(r"revoke\s+(?:review\s+)?([0-9a-f]{12}|all audit approvals)[.!]?", re.I)
+AFFIRM = re.compile(r"(?:yes|ok|okay|approve|approved)(?:,?\s+please)?[.!]?", re.I)
 
 
 def finding_class(message):
@@ -52,7 +53,7 @@ def history_position(state, messages):
     return offset, continuous
 
 
-def apply_reviews(state, messages, review, now):
+def apply_reviews(state, messages, review, now, requested_classes=()):
     """Pure transition; approval must follow disclosure of this exact review."""
     offset, continuous = history_position(state, messages)
     pending = state.setdefault("pending", {})
@@ -76,7 +77,8 @@ def apply_reviews(state, messages, review, now):
         index += offset
         text = text.strip()
         approval, revocation = APPROVE.fullmatch(text), REVOKE.fullmatch(text)
-        if not approval and not revocation:
+        affirmation = AFFIRM.fullmatch(text)
+        if not approval and not revocation and not affirmation:
             continue
         event = hashlib.sha256(json.dumps([index, text]).encode()).hexdigest()
         if event in seen:
@@ -89,23 +91,40 @@ def apply_reviews(state, messages, review, now):
             else:
                 grants.pop(key, None)
             continue
-        kind, key = approval[1].lower(), approval[2].lower()
+        if affirmation:
+            # Only the next user reply to one disclosed audit question. Do
+            # not choose among reviews or infer approval from prose/status.
+            if len(pending) != 1:
+                continue
+            key, proposal = next(iter(pending.items()))
+            if index != proposal.get("reply_after_user_count"):
+                continue
+            classes = proposal.get("requested_classes", [])
+        else:
+            kind, key = approval[1].lower(), approval[2].lower()
+            classes = []
+            if "style exceptions" in kind:
+                classes.append("style")
+            if "checkpoint" in kind:
+                classes.append("incomplete-proof")
         proposal = pending.get(key)
         if proposal is None or index < proposal["after_user_count"]:
             continue
-        classes = []
-        if "style exceptions" in kind:
-            classes.append("style")
-        if "checkpoint" in kind:
-            classes.append("incomplete-proof")
         # Approving one class must not renew a different class's expiry.
         existing = grants.setdefault(key, {"classes": {}})["classes"]
         existing.update({kind: now for kind in classes})
     state["seen"] = sorted(seen)
-    return set(grants.get(review, {}).get("classes", []))
+    approved = set(grants.get(review, {}).get("classes", []))
+    remaining = set(requested_classes) - approved
+    if remaining:
+        # H27 is about to display this question. A repeated disclosure moves
+        # the reply boundary forward; it never reinterprets an earlier yes.
+        pending[review]["requested_classes"] = sorted(remaining)
+        pending[review]["reply_after_user_count"] = offset + len(messages)
+    return approved
 
 
-def approved_classes(payload, review):
+def approved_classes(payload, review, requested_classes=()):
     messages = user_messages(payload)
     if messages is None or not payload.get("session_id"):
         return set()  # unknown user/session provenance cannot grant exceptions
@@ -121,7 +140,7 @@ def approved_classes(payload, review):
                     state = json.load(stream)
             except (OSError, ValueError):
                 state = {}
-            result = apply_reviews(state, messages, review, time.time())
+            result = apply_reviews(state, messages, review, time.time(), requested_classes)
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(state, stream)
             return result
