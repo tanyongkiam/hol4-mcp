@@ -528,6 +528,10 @@ questions within that window but cannot cover changed proof contents, command,
 repository or findings. `Revoke review <ID>` or `Revoke all audit approvals`
 revokes it. A status tool never reads/writes this approval state. Unknown
 transcripts, session identity or unreadable state cannot waive the audit.
+Rolling transcript windows retain approval ordering through overlapping history
+hashes, not window-relative message indices. Lost history continuity or legacy
+pending state without a history boundary requires disclosure and approval again;
+it never turns an older message into new consent.
 Incomplete-proof approval covers Gates 2/3; style approval covers the remaining
 audit findings and cannot admit a proof. H14's Git gate remains separate: a
 later Git-permission message need not repeat an already valid audit approval.

@@ -210,6 +210,28 @@ def test_style_approval_does_not_permit_admission(run_hook, repo):
     assert code == 2 and "Gate 3" in err
 
 
+def test_scoped_approval_with_64_prompt_rolling_transcript(run_hook, repo):
+    stage(repo, "  >- metis_tac []", "  >- cheat")
+    command = "git commit -m checkpoint"
+    prompts = [f"prompt {n}" for n in range(64)]
+
+    def call():
+        return run_hook("h27_commit_audit_gate.py", "Bash", {"command": command},
+                        cwd=repo, user_msg=prompts[-1], history=prompts[:-1])
+
+    code, err, _ = call()
+    assert code == 2
+    review = re.search(r"Review ([0-9a-f]{12}):", err).group(1)
+    prompts = prompts[1:] + [
+        f"Approve the incomplete-proof checkpoint for review {review}"]
+    code, err, out = call()
+    assert code == 0 and "approved incomplete-proof" in out, (err, out)
+    prompts = prompts[1:] + [f"Revoke review {review}"]
+    assert call()[0] == 2
+    prompts = prompts[1:] + ["status?"]
+    assert call()[0] == 2
+
+
 def test_old_wip_phrase_cannot_bypass_content_resolution(run_hook, repo):
     code, err, _ = run_hook("h27_commit_audit_gate.py", "Bash",
         {"command": "bash -c 'git commit -m x'"}, cwd=repo, user_msg="git ok wip ok")

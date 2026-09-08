@@ -30,9 +30,34 @@ def review_id(root, command, files, findings):
     return hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()[:12]
 
 
+def history_position(state, messages):
+    """Track a monotone position across append-only or rolling transcripts.
+
+    Keep hashes, not prompt text. Without an overlapping history boundary we
+    cannot prove an approval followed disclosure, so pending reviews must be
+    disclosed again. Existing, unexpired grants retain their original scope.
+    """
+    current = [hashlib.sha256(text.encode()).hexdigest() for text in messages]
+    previous = state.get("history")
+    offset = state.get("history_offset", 0)
+    if previous is None:
+        continuous = not state.get("pending")  # legacy state has no boundary
+    else:
+        overlap = next((n for n in range(min(len(previous), len(current)), 0, -1)
+                        if previous[-n:] == current[:n]), 0)
+        continuous = bool(overlap) or not previous
+        offset += len(previous) - overlap
+    state["history"] = current
+    state["history_offset"] = offset
+    return offset, continuous
+
+
 def apply_reviews(state, messages, review, now):
     """Pure transition; approval must follow disclosure of this exact review."""
+    offset, continuous = history_position(state, messages)
     pending = state.setdefault("pending", {})
+    if not continuous:
+        pending.clear()
     grants = state.setdefault("grants", {})
     seen = set(state.get("seen", []))
     for key in list(pending):
@@ -46,8 +71,9 @@ def apply_reviews(state, messages, review, now):
         if not classes:
             grants.pop(key)
     if review not in pending:
-        pending[review] = {"created": now, "after_user_count": len(messages)}
+        pending[review] = {"created": now, "after_user_count": offset + len(messages)}
     for index, text in enumerate(messages):
+        index += offset
         text = text.strip()
         approval, revocation = APPROVE.fullmatch(text), REVOKE.fullmatch(text)
         if not approval and not revocation:
