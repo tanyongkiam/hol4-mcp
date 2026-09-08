@@ -80,6 +80,23 @@ def test_error_reason_real_exception():
     assert "error:" in r and ("Fail" in r or "Exception" in r)
 
 
+def test_error_reason_preserves_multiline_hol_exception():
+    output = ('OK..\nException-\n   HOL_ERR\n'
+              '     (at Tactical.Q_TAC:\n'
+              '        at Tactic.STRIP_TAC: not a conjunction or implication)\n'
+              '   raised\nval unrelated = "not part of the exception"\n')
+    reason = _error_reason(output)
+    assert "Tactic.STRIP_TAC" in reason
+    assert "not a conjunction or implication" in reason
+    assert "OK.." not in reason and "unrelated" not in reason
+    assert "\n" not in reason
+
+
+def test_error_reason_multiline_is_bounded():
+    output = "Exception-\n HOL_ERR\n" + "details " * 1000
+    assert len(_error_reason(output, limit=80)) <= len("error: ") + 80
+
+
 # --- budget ----------------------------------------------------------------
 
 def test_budget_raised():
@@ -99,7 +116,8 @@ def test_deps_excludes_target():
     lines = _auto_cheated_deps_lines(cur, target_name="thmA")
     rendered = "\n".join(lines)
     assert "thmA" not in rendered          # target excluded
-    assert "thmB" in rendered              # genuine dep still named
+    assert "thmB" in rendered              # admission history still named
+    assert "not a dependency list" in rendered
 
 
 def test_deps_empty_when_only_target_failed():

@@ -79,6 +79,23 @@ async def test_live_session_follows_ancestor_rebuild(tmp_path):
         await hol_stop(session)
 
 
+async def test_missing_ancestor_recovers_after_build(tmp_path):
+    root = make_theory_dir(tmp_path / "thy")
+    session = "lifecycle_missing"
+    try:
+        first = await hol_state_at(line=B_LINE_AFTER_REWRITE, col=6,
+                                   file=str(root / "ancBScript.sml"), session=session)
+        assert first.startswith("ERROR"), first
+        assert "ancATheory.uo" in first and "no target proof has run" in first, first
+        await build_a(root)
+        recovered = await hol_state_at(line=B_LINE_AFTER_REWRITE, col=6,
+                                       session=session)
+        assert goal_line(recovered) == "1 = 1", recovered
+        assert "[Session reloaded: ancestor ancATheory rebuilt" in recovered, recovered
+    finally:
+        await hol_stop(session)
+
+
 async def test_workdir_switch_restarts_transparently(tmp_path):
     d1 = make_theory_dir(tmp_path / "one")
     d2 = make_theory_dir(tmp_path / "two", value=2)

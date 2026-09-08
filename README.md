@@ -17,6 +17,15 @@ An [MCP](https://modelcontextprotocol.io/) server that gives LLM agents interact
 - Python ≥ 3.11
 - [uv](https://github.com/astral-sh/uv) (recommended) or pip
 
+### Interactive memory limit
+
+HOL sessions default to an 8192 MB Poly/ML maximum heap. For heavier theories,
+set `HOL4_MCP_MAXHEAP_MB=12288` in the server environment or pass
+`env={"HOL4_MCP_MAXHEAP_MB": "12288"}` to `hol_start`. Values must be integers
+of at least 256 MB. Startup reports the effective limit; changing the setting
+does not resize an already running session. Session restarts preserve its
+explicit environment. This option is independent of `holmake(heap_size=...)`.
+
 ## Installation
 
 ```bash
@@ -171,6 +180,38 @@ hol4-mcp serve --transport http --port 8000
 5. holmake(workdir=".")
    → Final build verification
 ```
+
+Recovery after a transient auto-cheated load is explicit:
+`hol_check_proof(theorem="my_theorem", fresh=True)` discards the session's old
+bindings, checkpoints and verdicts and replays the full prefix in a new HOL
+process. Use it once the file proof is ready; it does not waive oracle checks.
+Ordinary navigation and checks retain incremental replay and cached results.
+
+Dependency freshness checks stat existing artifacts directly and group absent
+load-path candidates by parent directory. Unchanged directories need one stat,
+not one per absent candidate; new/shadowing artifacts are checked without a
+timer delay. The opt-in `scripts/benchmark_dependency_freshness.py` measures
+warm read/hash/freshness overhead on real scripts without running their proofs.
+
+During long prefix work, `hol_sessions` reports the active dependency, preceding
+theorem or current-file SML/translation span, elapsed time and command budget.
+Status inspection does not replay HOL commands or reap busy sessions.
+
+Failure evidence is written only on failures: complete submitted SML and
+returned response, phase metadata when available, workdir, PID and heap limit.
+The reported JSON path (also shown by `hol_sessions`) is retained in a private
+temporary directory after session stop. These files can contain project source.
+Replies are decoded/framed and normally ANSI-normalized, not a byte-level pipe
+capture; interrupted requests retain the available partial response. Failed
+diagnostic writes never change the proof result. Admission history is reported
+separately from kernel oracle evidence; history alone is not a dependency list.
+
+For an opaque filesystem/discovery failure, an explicit
+`holmake(..., trace_discovery=True)` records Linux syscall/path evidence and
+execution-context metadata under `.hol/mcp-discovery-*`. It requires `strace`
+and tracing permission, adds overhead, and is off for regular builds. A tracer
+permission/setup failure is not reported as a proof-failure verdict. Missing
+directories are not silently ignored or created, and no retry is automatic.
 
 ## Architecture
 

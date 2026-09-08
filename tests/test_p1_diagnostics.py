@@ -62,7 +62,7 @@ async def test_auto_cheated_deps_named(tmp_path):
 
         # state_at at uses_dep's QED loads (and auto-cheats) fail_dep.
         r = await hol_state_at(session=session, line=15, col=1)
-        assert "[auto-cheated deps:" in r, f"deps line missing: {r}"
+        assert "[context admission history (not a dependency list):" in r, r
         assert "fail_dep" in r
         assert "error" in r  # the recorded reason
 
@@ -77,7 +77,7 @@ async def test_auto_cheated_deps_named(tmp_path):
         r = await hol_check_proof(theorem="uses_dep", session=session)
         assert "Status: OK" in r
         assert "⚠ depends on cheat" in r, f"oracle marker missing: {r}"
-        assert "[auto-cheated deps:" in r
+        assert "[context admission history (not a dependency list):" in r
         assert "fail_dep" in r
     finally:
         await hol_stop(session=session)
@@ -247,7 +247,7 @@ async def test_lost_suspension_ancestor_diagnosis(tmp_path):
         assert "Ancestor chain for suspension 'broken_dispatch'" in r, (
             f"diagnosis missing: {r}"
         )
-        assert "auto-cheated" in r
+        assert "context admission history" in r
         assert "first broken ancestor" in r
         assert "broken_dispatch" in r
 

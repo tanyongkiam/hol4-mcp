@@ -50,6 +50,7 @@ second one's ``drop_all()`` lands between the first one's ``gf`` and its
 """
 
 import asyncio
+import shutil
 from pathlib import Path
 
 import pytest
@@ -221,17 +222,20 @@ def stable(rendered: str) -> str:
 
 
 @pytest.fixture
-async def conc_session():
+async def conc_session(tmp_path):
     """A registered session parked inside ``conc_beta`` with a live cursor."""
     name = "repro_conc_navigation"
-    started = await hol_start(workdir=str(FIXTURES_DIR), name=name, force=True)
+    script = tmp_path / CONC_SCRIPT.name
+    shutil.copyfile(CONC_SCRIPT, script)
+    started = await hol_start(workdir=str(tmp_path), name=name, force=True)
     assert not started.startswith("ERROR"), f"test setup: {started}"
     try:
         init = await hol_state_at(
-            line=PARK_LINE, col=1, file=str(CONC_SCRIPT),
-            workdir=str(FIXTURES_DIR), session=name,
+            line=PARK_LINE, col=1, file=str(script),
+            workdir=str(tmp_path), session=name,
         )
         assert "Theorem: conc_beta" in init, f"test setup: cursor init failed: {init}"
+        assert srv._sessions[name].cursor._base_checkpoint_saved
         yield name
     finally:
         await hol_stop(session=name)

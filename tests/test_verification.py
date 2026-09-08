@@ -283,10 +283,7 @@ QED
 
 @pytest.mark.asyncio
 async def test_fatal_pre_theorem_load_error(hol_session_tmpdir: HOLSession, tmp_path: Path):
-    """Regression: fatal pre-theorem load errors must be reported (not silently advance loaded_to_line).
-
-    With lazy loading, init() succeeds but the error surfaces when entering a theorem.
-    """
+    """A required missing theory fails init, before any file prefix executes."""
     script = tmp_path / "testScript.sml"
     script.write_text("""\
 open definitelyMissingTheory;
@@ -305,12 +302,11 @@ QED
     cursor = FileProofCursor(script, hol_session_tmpdir)
     result = await cursor.init()
 
-    # init() succeeds with lazy loading — error surfaces on enter_theorem
-    assert "error" not in result
-
-    result = await cursor.enter_theorem("uses_pre_def")
     assert "error" in result
-    assert "Missing dependency:" in result["error"]
+    assert "Missing compiled dependency definitelyMissingTheory" in result["error"]
+    assert "definitelyMissingTheory.uo" in result["error"]
+    assert cursor._loaded_to_line == 0
+    assert cursor._needs_session_reinit
 
 
 @pytest.mark.asyncio

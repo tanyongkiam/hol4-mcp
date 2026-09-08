@@ -91,11 +91,12 @@ def _line_is_error_marker(s: str) -> bool:
     return False
 
 
-def _error_reason(output: str, limit: int = 120) -> str:
+def _error_reason(output: str, limit: int = 240) -> str:
     """Compact one-line reason from HOL error output (for _failed_proofs).
 
     Returns a TIMEOUT reason for budget timeouts, otherwise the first line
-    carrying a GENUINE error marker (see _line_is_error_marker). Never returns
+    carrying a GENUINE error marker (see _line_is_error_marker), with bounded
+    continuation text for Poly/ML's multiline exceptions. Never returns
     a goal-term line just because it contains the substring 'error'/'exception'
     — that misreported slow/aborted proofs as tactic failures (the
     `[auto-cheated deps: foo (error: | (SOME (Rerr ...)) => T)]` bug).
@@ -104,9 +105,17 @@ def _error_reason(output: str, limit: int = 120) -> str:
     if stripped.startswith("TIMEOUT"):
         first = next((l.strip() for l in stripped.splitlines() if l.strip()), "TIMEOUT")
         return first[:limit]
-    for line in output.splitlines():
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
         s = line.strip()
         if s and _line_is_error_marker(s):
+            if s.startswith(("Exception-", "Exception ", "HOL_ERR")):
+                parts = [s]
+                for continuation in lines[index + 1:index + 17]:
+                    if parts[-1].endswith("raised") or sum(map(len, parts)) >= limit:
+                        break
+                    parts.append(continuation.strip())
+                s = " ".join(part for part in parts if part)
             return f"error: {s[:limit]}"
     return "could not validate (no recognizable error marker; proof likely aborted/timed out)"
 
@@ -507,16 +516,22 @@ class FileProofCursor:
         # True when pre-theorem context changed (e.g., open/Theory/Ancestors).
         # Such changes require rebuilding HOL session context from scratch.
         self._needs_session_reinit: bool = False
+        self._context_rewind_pending = False
 
-        # Built artifact each dependency was loaded from, with its mtime at
-        # load time; a rebuilt ancestor is detected by re-stat and forces a
-        # session rebuild (a live session cannot reload a theory).
-        self._dep_artifacts: dict[str, tuple[Path, int]] = {}
+        # Include absent interfaces and earlier load-path candidates: a newly
+        # built or newly shadowing artifact invalidates the loaded context too.
+        self._dep_artifacts: dict[str, dict[Path, tuple[int, int, int] | None]] = {}
+        self._dep_parent_stamps: dict[Path, tuple | None] = {}
+        self._dep_dangling_links: dict[Path, str] = {}
+        self._dep_present_artifacts: list[tuple[str, Path, tuple]] = []
+        self._dep_absent_artifacts: dict[Path, list[tuple[str, Path]]] = {}
 
         # One-line notices about session-level events (reload after an
         # ancestor rebuild, restart into another workdir) for the next tool
         # output; the server takes and clears them (take_notices).
         self._session_notices: list[str] = []
+        # O(1) progress metadata; inspection never sends a command to HOL.
+        self._phase: dict = {}
 
         # Seconds spent (re)starting HOL and loading dependencies since the
         # last navigation reported them (`startup=` in the Timing line).
@@ -562,6 +577,16 @@ class FileProofCursor:
     def _dep_load_error(self, dep: str, result: str, elapsed: float,
                         budget: float) -> str:
         """Error text for a dependency that failed to load at init."""
+        if "Cannot find file" in result:
+            return (f"Missing compiled dependency {dep}: {result.strip()}\n"
+                    f"Build {dep}.uo in its owning directory (a .dat alone "
+                    f"does not provide the compiled interface), then retry "
+                    f"navigation; no target proof has run.")
+        if "Run out of store" in result:
+            heap_mb = getattr(self.session, "maxheap_mb", None)
+            return (f"Failed to load dependency {dep}: {result.strip()}\n"
+                    f"Interactive maxheap={heap_mb} MB "
+                    f"(HOL4_MCP_MAXHEAP_MB); no target proof has run.")
         if not result.lstrip().startswith("TIMEOUT"):
             return f"Failed to load dependency {dep}: {result}"
         holmakefile = Path(self.session.workdir) / "Holmakefile"
@@ -577,36 +602,101 @@ class FileProofCursor:
                 f"(budget {budget:g}s per dependency, env "
                 f"HOL4_MCP_DEP_LOAD_TIMEOUT). The Holmakefile {heap}.")
 
+    @staticmethod
+    def _artifact_stamp(path: Path) -> tuple[int, int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
     async def _record_dep_artifacts(self, deps: list[str]) -> None:
-        """Remember the built artifact (and its mtime) each dependency loaded
-        from: the session workdir first, then HOL's loadPath, each with its
-        `.hol/objs/` build directory."""
-        dirs = [Path(self.session.workdir)]
+        """Snapshot load candidates, including missing .ui/.uo/.dat files.
+
+        Stop at the first existing file for each suffix, but remember absent
+        candidates before it: their appearance could shadow the loaded file.
+        Relative loadPath entries are relative to HOL's cwd, not the server's.
+        """
+        workdir = Path(self.session.workdir).resolve()
+        dirs = [workdir]
         out = await self.session.send("!loadPath;", timeout=10)
-        dirs += [Path(p) for p in re.findall(r'"((?:[^"\\]|\\.)*)"', out)]
+        for p in re.findall(r'"((?:[^"\\]|\\.)*)"', out):
+            path = Path(p)
+            dirs.append(path if path.is_absolute() else workdir / path)
+        dirs = list(dict.fromkeys(dirs))
+        self._dep_parent_stamps = {}
+        self._dep_dangling_links = {}
+        self._dep_present_artifacts = []
+        self._dep_absent_artifacts = {}
         for dep in deps:
-            for d in dirs:
-                found = next((c for c in (d / ".hol" / "objs" / f"{dep}.uo",
-                                          d / f"{dep}.uo") if c.exists()), None)
-                if found is not None:
-                    self._dep_artifacts[dep] = (found, found.stat().st_mtime_ns)
-                    break
+            artifacts = self._dep_artifacts[dep] = {}
+            for suffix in ("uo", "ui", "dat"):
+                candidates = (c for d in dirs for c in
+                              (d / ".hol" / "objs" / f"{dep}.{suffix}",
+                               d / f"{dep}.{suffix}"))
+                for path in candidates:
+                    # Sample BEFORE the child: a concurrent creation must not
+                    # be hidden behind a newer directory snapshot.
+                    parent = path.parent
+                    if parent not in self._dep_parent_stamps:
+                        self._dep_parent_stamps[parent] = self._directory_stamp(parent)
+                    stamp = self._artifact_stamp(path)
+                    artifacts[path] = stamp
+                    if stamp is not None:
+                        self._dep_present_artifacts.append((dep, path, stamp))
+                        break
+                    self._dep_absent_artifacts.setdefault(parent, []).append((dep, path))
+                    if path.is_symlink():
+                        self._dep_dangling_links[path] = dep
+
+    @staticmethod
+    def _directory_stamp(path: Path) -> tuple | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev
 
     def _check_dep_artifacts(self) -> str | None:
-        """First dependency whose built artifact changed since it was loaded,
-        or None. An absent artifact (mid-rebuild) is judged again next call."""
-        for dep, (path, mtime_ns) in self._dep_artifacts.items():
-            try:
-                if path.stat().st_mtime_ns != mtime_ns:
-                    return dep
-            except OSError:
+        """First dependency changed, created or removed since initialization.
+
+        A disappearance invalidates the old context too; a mid-build retry must
+        report missing interfaces, not validate against an obsolete heap.
+        """
+        # Large load paths have many absent candidates. An unchanged parent
+        # cannot acquire a new directory entry; stat it once per call rather
+        # than every absent file. No TTL or relaxed freshness window. Existing
+        # files and dangling symlinks still need direct stats (the latter's
+        # target can appear without changing the link's own directory).
+        if not self._dep_artifacts:
+            return None
+        for dep, path, stamp in self._dep_present_artifacts:
+            if self._artifact_stamp(path) != stamp:
+                return dep
+        for path, dep in self._dep_dangling_links.items():
+            if self._artifact_stamp(path) is not None:
+                return dep
+        parents = {}
+        for parent, candidates in self._dep_absent_artifacts.items():
+            parents[parent] = self._directory_stamp(parent)
+            if parents[parent] == self._dep_parent_stamps[parent]:
                 continue
+            for dep, path in candidates:
+                if self._artifact_stamp(path) is not None:
+                    return dep
+                if path.is_symlink():
+                    self._dep_dangling_links[path] = dep
+                else:
+                    self._dep_dangling_links.pop(path, None)
+        # Retain the pre-child-check samples only after all checks pass.
+        self._dep_parent_stamps.update(parents)
         return None
 
     def _schedule_full_reinit(self) -> None:
         """Rebuild the session from scratch on the next call: drop every
         cache and checkpoint, the deps-only one included."""
         self._needs_session_reinit = True
+        self._context_rewind_pending = False
         self._loaded_to_line = 0
         self._loaded_content_hash = ""
         self._pos = SessionPosition()
@@ -676,6 +766,11 @@ class FileProofCursor:
             # Definition/Datatype/Theorem and the resulting "Unknown identifier"
             # is sticky across every later navigation.
             if first_changed <= self._loaded_to_line:
+                # Lowering this Python counter does not undo executed ML
+                # effects or remove later theorem bindings from the heap.
+                # Restore a valid predecessor before replaying the edit.
+                self._context_rewind_pending = True
+                self._active_theorem = None
                 boundary = construct_start_line(content, first_changed)
                 # `_loaded_to_line` is EXCLUSIVE — lines 1..n-1 are loaded and
                 # the resend starts AT n — so the boundary is the value itself.
@@ -1325,25 +1420,26 @@ class FileProofCursor:
             await self.session.start()
 
         # Load dependencies from holdeptool
-        # Skip "Cannot find file" errors (build-time deps like HolKernel, or holmake not run)
-        # but report other errors (actual load failures)
+        # Non-theory build-time modules may already live in the base heap.
+        # Required theory interfaces must not be silently skipped.
         try:
             deps = await get_script_dependencies(self.file)
+            await self._record_dep_artifacts(deps)
             budget = dep_load_timeout()
             for dep in deps:
                 t_dep = time.perf_counter()
-                result = await self.session.send(f'load "{dep}";', timeout=budget)
+                result = await self._send_phase(
+                    f'load "{dep}";', budget, "dependency load", dep)
                 if _is_hol_error(result):
-                    # "Cannot find file X.ui" means build-time dep or holmake not run - skip
-                    if "Cannot find file" in result:
+                    if "Cannot find file" in result and not dep.endswith("Theory"):
                         continue
+                    self._needs_session_reinit = True
                     return {
                         "theorems": [],
                         "cheats": [],
                         "error": self._dep_load_error(
                             dep, result, time.perf_counter() - t_dep, budget),
                     }
-            await self._record_dep_artifacts(deps)
         except (FileNotFoundError, RuntimeError):
             pass  # holdeptool not available or failed (parse error), skip dep loading
 
@@ -1528,11 +1624,31 @@ class FileProofCursor:
             return 0
         return line - 1
 
-    async def _send_and_check(self, content: str, timeout: float) -> str | None:
+    async def _send_phase(self, content: str, timeout: float, phase: str,
+                          item: str = "", start_line: int = 0,
+                          end_line: int = 0) -> str:
+        self._phase = {"phase": phase, "item": item, "file": str(self.file),
+                       "start_line": start_line, "end_line": end_line,
+                       "started": time.perf_counter(), "budget": timeout,
+                       "active": True}
+        previous_context = getattr(self.session, "request_context", {})
+        self.session.request_context = self._phase
+        try:
+            return await self.session.send(content, timeout=timeout)
+        except asyncio.CancelledError:
+            self._phase["interrupted"] = True
+            raise
+        finally:
+            self._phase["active"] = False
+            self.session.request_context = previous_context
+
+    async def _send_and_check(self, content: str, timeout: float,
+                              start_line: int = 0, end_line: int = 0) -> str | None:
         """Send content to HOL, return error string on fatal error, else None."""
         if not content.strip():
             return None
-        result = await self.session.send(content, timeout=timeout)
+        result = await self._send_phase(content, timeout, "top-level SML/translation",
+                                        start_line=start_line, end_line=end_line)
         if _is_fatal_hol_error(result):
             return f"Error executing file content: {_format_context_error(result)}"
         return None
@@ -1598,7 +1714,8 @@ class FileProofCursor:
                 actual_target = max(target_line, lb.end_line + 1)
             start_idx = self._line_to_idx(self._loaded_to_line)
             to_load = '\n'.join(content_lines[start_idx:actual_target - 1])
-            err = await self._send_and_check(to_load, timeout)
+            err = await self._send_and_check(to_load, timeout,
+                                              max(1, self._loaded_to_line), actual_target - 1)
             if err:
                 return err
             self._loaded_to_line = actual_target
@@ -1622,7 +1739,8 @@ class FileProofCursor:
                     # Normal theorem (no local block overlap)
                     if thm.start_line > current_line:
                         pre = '\n'.join(content_lines[self._line_to_idx(current_line):self._line_to_idx(thm.start_line)])
-                        err = await self._send_and_check(pre, timeout)
+                        err = await self._send_and_check(pre, timeout,
+                                                          max(1, current_line), thm.start_line - 1)
                         if err:
                             return err
 
@@ -1639,7 +1757,9 @@ class FileProofCursor:
                             # proof must be cheated and named, not abort the
                             # navigation and leave the target unreachable.
                             thm_timeout = min(timeout, PER_THEOREM_TIMEOUT) if timeout else PER_THEOREM_TIMEOUT
-                            result = await self.session.send(thm_content, timeout=thm_timeout)
+                            result = await self._send_phase(
+                                thm_content, thm_timeout, "preceding theorem",
+                                thm.name, thm.start_line, thm.proof_end_line - 1)
                             if result.startswith("TIMEOUT"):
                                 err = await self._cheat_failed_theorem(
                                     thm, f"timeout >{thm_timeout}s loading whole proof"
@@ -1673,7 +1793,9 @@ class FileProofCursor:
                     if block_end > current_line:
                         block_content = '\n'.join(content_lines[self._line_to_idx(current_line):self._line_to_idx(block_end)])
                         if block_content.strip():
-                            result = await self.session.send(block_content, timeout=timeout)
+                            result = await self._send_phase(
+                                block_content, timeout, "local SML block",
+                                start_line=max(1, current_line), end_line=block_end - 1)
                             if _is_fatal_hol_error(result):
                                 return f"Error executing file content: {_format_context_error(result)}"
                             if _is_hol_error(result):
@@ -1694,7 +1816,8 @@ class FileProofCursor:
                 if lb:
                     actual_target = max(target_line, lb.end_line + 1)
                 remaining = '\n'.join(content_lines[self._line_to_idx(current_line):self._line_to_idx(actual_target)])
-                err = await self._send_and_check(remaining, timeout)
+                err = await self._send_and_check(remaining, timeout,
+                                                  max(1, current_line), actual_target - 1)
                 if err:
                     return err
                 current_line = actual_target
@@ -1734,6 +1857,20 @@ class FileProofCursor:
         thm = self._get_theorem(name)
         if not thm:
             return {"error": f"Theorem '{name}' not found"}
+
+        if self._context_rewind_pending:
+            predecessor = self._find_predecessor_checkpoint(thm)
+            restored = (predecessor is not None and
+                        await self._load_context_checkpoint(predecessor.name))
+            if not restored:
+                restored = await self._restore_to_deps()
+            if not restored:
+                self._schedule_full_reinit()
+                error = await self._reinitialize_session_if_needed()
+                if error:
+                    return {"error": error}
+            self._context_rewind_pending = False
+            self._pos = SessionPosition()
 
         # Load context up to theorem start
         error = await self._load_context_to_line(thm.start_line)

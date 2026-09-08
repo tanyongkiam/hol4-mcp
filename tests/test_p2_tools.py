@@ -89,14 +89,19 @@ async def test_hol_goals_live_session(tmp_path):
         r = await hol_goals(session=session)
         assert "No live proof" in r, f"unexpected: {r}"
 
-        # Set a goal and step once
-        await hol_send(
+        # Direct goal creation is guarded; establish the same live frontier
+        # through file navigation, then test the session-only inspection API.
+        blocked = await hol_send(
             session=session, command="g `p /\\ q ==> q /\\ p`;"
         )
-        await hol_send(
-            session=session, command="proofManagerLib.e strip_tac;",
-            timeout=15,
-        )
+        assert "BLOCKED" in blocked
+        script = tmp_path / "liveGoalsScript.sml"
+        script.write_text(
+            "open HolKernel Parse boolLib bossLib;\n"
+            "Theorem live_goal:\n  p /\\ q ==> q /\\ p\nProof\n"
+            "  strip_tac >>\n  simp[]\nQED\n")
+        frontier = await hol_state_at(file=str(script), line=6, col=3, session=session)
+        assert "PROOF BROKEN" not in frontier and not frontier.startswith("ERROR"), frontier
 
         r = await hol_goals(session=session)
         assert "1 goal(s)" in r, f"unexpected: {r}"

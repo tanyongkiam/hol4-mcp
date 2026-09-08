@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .failure_evidence import FailureEvidence
+
 HOLDIR = Path(os.environ.get("HOLDIR", Path.home() / "HOL"))
 SCRIPT_DIR = Path(__file__).parent
 ETQ_PATH = SCRIPT_DIR / "sml_helpers" / "etq.sml"
@@ -40,6 +42,9 @@ def strip_ansi(text: str) -> str:
 # invented type variables and overload resolution. They ride the SUCCESS path,
 # so unless they are harvested here they reach the caller only by accident.
 _DIAGNOSTIC_RE = re.compile(r'^[ \t]*(WARNING:.*|<<HOL message:.*)$', re.M)
+_FAILURE_RE = re.compile(
+    r'^(?:Exception[- ]|Fail |TIMEOUT|poly: : error:|parse error at )|'
+    r'"error"\s*:\s*"[^"\s]', re.M)
 
 
 class HOLSession:
@@ -56,6 +61,9 @@ class HOLSession:
         # said about the caller's own tactics from prefix-loading chatter.
         self.diagnostics: list[tuple[str, str]] = []
         self._resync_seq = 0              # distinct sentinel per resync
+        self.maxheap_mb: int | None = None  # effective limit of the live process
+        self.failure_evidence = FailureEvidence()
+        self.request_context: dict = {}
 
     async def start(self) -> str:
         """Start HOL subprocess."""
@@ -67,8 +75,18 @@ class HOLSession:
         if self.env:
             proc_env.update(self.env)
 
+        # Keep the historical default; large projects may opt in explicitly.
+        # Validate before spawning so a typo cannot silently select a limit.
+        raw_heap = proc_env.get("HOL4_MCP_MAXHEAP_MB", "8192")
+        try:
+            heap_mb = int(raw_heap)
+        except (TypeError, ValueError):
+            raise ValueError("HOL4_MCP_MAXHEAP_MB must be an integer >= 256") from None
+        if heap_mb < 256:
+            raise ValueError("HOL4_MCP_MAXHEAP_MB must be an integer >= 256")
+
         self.process = await asyncio.create_subprocess_exec(
-            str(HOLDIR / "bin" / "hol"), "--maxheap", "8192", "--zero",
+            str(HOLDIR / "bin" / "hol"), "--maxheap", str(heap_mb), "--zero",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             # Merge stderr to stdout: HOL's interactive mode sends all output
@@ -80,6 +98,7 @@ class HOLSession:
             env=proc_env,
             start_new_session=True,  # New process group for clean kill
         )
+        self.maxheap_mb = heap_mb
 
         # Wait for initial prompt (null-terminated)
         await self._read_response(timeout=60)
@@ -99,7 +118,7 @@ class HOLSession:
         if init_file.exists():
             await self.send(init_file.read_text(), timeout=60)
 
-        return f"HOL started (PID {self.process.pid})"
+        return f"HOL started (PID {self.process.pid}, maxheap={heap_mb} MB)"
 
     async def _write_command(self, sml_code: str):
         """Write SML code to stdin with null terminator."""
@@ -177,21 +196,38 @@ class HOLSession:
                 return self._note_diagnostics(
                     sml_code, await self._read_response(timeout=timeout))
             except asyncio.TimeoutError:
+                partial = self._buffer.decode("utf-8", errors="replace")
                 self.interrupt()
                 try:
                     remaining = await self._read_response(timeout=5)
                 except asyncio.TimeoutError:
                     remaining = ""
                 msg = f"TIMEOUT after {timeout}s - sent interrupt."
+                self._record_failure(sml_code, partial + "\n" + remaining, "timeout")
                 return self._note_diagnostics(
-                    sml_code, f"{msg}\n{remaining}" if remaining else msg)
+                    sml_code, f"{msg}\n{remaining}" if remaining else msg,
+                    record_failure=False)
+            except (asyncio.CancelledError, RuntimeError) as exc:
+                self._record_failure(sml_code,
+                    self._buffer.decode("utf-8", errors="replace") + "\n" + str(exc),
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "process failure")
+                raise
 
-    def _note_diagnostics(self, command: str, output: str) -> str:
+    def _record_failure(self, command: str, response: str, kind: str) -> None:
+        self.failure_evidence.record(command, response, kind,
+            workdir=str(self.workdir), pid=self.process.pid if self.process else None,
+            maxheap_mb=self.maxheap_mb, context=dict(self.request_context),
+            timestamp=time.time())
+
+    def _note_diagnostics(self, command: str, output: str,
+                           record_failure: bool = True) -> str:
         """Record HOL diagnostics from one reply; returns the reply unchanged."""
         for m in _DIAGNOSTIC_RE.finditer(output):
             self.diagnostics.append((command, m.group(1).strip()))
         if len(self.diagnostics) > 500:
             del self.diagnostics[:-500]
+        if record_failure and _FAILURE_RE.search(output):
+            self._record_failure(command, output, "HOL error")
         return output
 
     async def _read_response(self, timeout: float) -> str:

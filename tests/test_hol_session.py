@@ -2,11 +2,44 @@
 
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from hol4_mcp.hol_session import HOLSession, escape_sml_string
 from hol4_mcp.hol_cursor import _is_hol_error
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+@pytest.mark.parametrize("inherited,explicit,expected", [
+    (None, None, 8192), ("10240", None, 10240),
+    ("10240", "12288", 12288), (None, "256", 256),
+])
+async def test_interactive_heap_configuration(monkeypatch, tmp_path,
+                                              inherited, explicit, expected):
+    monkeypatch.delenv("HOL4_MCP_MAXHEAP_MB", raising=False)
+    if inherited is not None:
+        monkeypatch.setenv("HOL4_MCP_MAXHEAP_MB", inherited)
+    env = {"HOL4_MCP_MAXHEAP_MB": explicit} if explicit is not None else None
+    session = HOLSession(str(tmp_path), env=env)
+    spawn = AsyncMock(return_value=SimpleNamespace(pid=123, returncode=None))
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr(session, "_read_response", AsyncMock(return_value=""))
+    monkeypatch.setattr(session, "send", AsyncMock(return_value=""))
+    result = await session.start()
+    args = spawn.call_args.args
+    assert args[args.index("--maxheap") + 1] == str(expected)
+    assert session.maxheap_mb == expected and f"maxheap={expected} MB" in result
+
+
+@pytest.mark.parametrize("value", ["", "0", "255", "-1", "12GiB", "8192.0"])
+async def test_bad_interactive_heap_does_not_spawn(monkeypatch, tmp_path, value):
+    spawn = AsyncMock()
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+    session = HOLSession(str(tmp_path), env={"HOL4_MCP_MAXHEAP_MB": value})
+    with pytest.raises(ValueError, match="HOL4_MCP_MAXHEAP_MB"):
+        await session.start()
+    spawn.assert_not_called()
 
 
 async def test_hol_session():

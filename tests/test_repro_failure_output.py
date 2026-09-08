@@ -142,16 +142,17 @@ async def test_absurd_timeout_is_refused(tmp_path):
         await hol_stop(session)
 
 
-async def test_cheat_dependence_marked_on_first_line(tmp_path):
+async def test_admission_history_marked_on_first_line_and_use_in_verdict(tmp_path):
     session = "fo_cheat"
     try:
         await init(tmp_path, "fdep", FAIL_DEP_SCRIPT, session)
         r = await hol_state_at(line=15, col=1, session=session)
-        assert "⚠ depends on cheat" in r.split("\n")[0], r
-        assert "[auto-cheated deps:" in r, r
+        assert "⚠ context has admission history" in r.split("\n")[0], r
+        assert "[context admission history (not a dependency list):" in r, r
 
         r2 = await hol_check_proof(theorem="uses_dep", session=session)
-        assert "⚠ depends on cheat" in r2.split("\n")[0], r2
+        assert "⚠ context has admission history" in r2.split("\n")[0], r2
+        assert "⚠ depends on cheat" in r2 and "kernel oracle evidence" in r2, r2
     finally:
         await hol_stop(session)
 

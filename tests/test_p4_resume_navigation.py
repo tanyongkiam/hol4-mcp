@@ -73,7 +73,7 @@ async def test_second_resume_reachable_past_broken_first(tmp_path):
         assert "No goals (proof complete)" in r, f"unexpected: {r}"
 
         # The broken first Resume is named, with the failure reason
-        assert "[auto-cheated deps:" in r
+        assert "[context admission history (not a dependency list):" in r
         assert "two_res[p_case]" in r
         assert "FAIL_TAC" in r
 
@@ -133,7 +133,7 @@ async def test_unknown_label_resume_recorded_as_skipped(tmp_path):
             f"skip not recorded: {dict(cursor._failed_proofs)}"
         )
         assert "SKIPPED" in cursor._failed_proofs["disp[typo_case]"]
-        assert "[auto-cheated deps:" in r
+        assert "[context admission history (not a dependency list):" in r
         assert "disp[typo_case]" in r
     finally:
         await hol_stop(session=session)

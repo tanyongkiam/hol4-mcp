@@ -29,6 +29,7 @@ from .hol_file_parser import (
     step_text_start, elide_long_text, suspension_base,
 )
 from .quote_check import quote_diagnosis_lines
+from .build_evidence import traced_build, build_failure_heading
 
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -134,26 +135,42 @@ async def _state_at_budgeted(
             goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
             file_hash="",
             error=_timeout_error_text(budget, prefix_s, target_s,
-                                      target_started=started is not None),
+                                      target_started=started is not None,
+                                      phase=(getattr(cursor, "_phase", None)
+                                             if getattr(cursor, "_phase", {}).get("interrupted")
+                                             else None)),
         )
 
 
 def _timeout_error_text(budget: float, prefix_s: float, target_s: float,
-                        target_started: bool) -> str:
+                        target_started: bool, phase: dict | None = None) -> str:
     """The TIMEOUT message, attributed: `prefix=` is dependency load plus the
     theorems before the target, `target=` the target's own tactics."""
     head = (
         f"TIMEOUT: state_at exceeded its overall {budget:.0f}s budget and was "
         f"aborted (HOL interrupted; session recovered). Spent: prefix={prefix_s:.1f}s "
-        f"(dependency load + earlier theorems), target={target_s:.1f}s (this "
+        f"(dependencies + current-file declarations + earlier theorems), target={target_s:.1f}s (this "
         f"theorem's own tactics). "
     )
     if not target_started:
+        detail = _phase_description(phase)
+        if phase and phase.get("phase") in {"top-level SML/translation", "local SML block"}:
+            return head + detail + (
+                " The target tactics have not run. Time was spent executing the "
+                "current file's declarations/translation; rebuilding ancestors or "
+                "splitting the target proof does not address this phase. Inspect "
+                "the named source span and reuse the warm session/checkpoints; "
+                "a justified larger timeout may be needed for a cold prefix.")
+        if phase and phase.get("phase") == "preceding theorem":
+            return head + detail + (
+                " The target tactics have not run. Inspect the named preceding "
+                "theorem and its replay budget, not the target proof.")
         return head + (
-            "The budget went to the PREFIX; your tactics never ran. This is not a "
-            "looping tactic: build the ancestors (holmake) so they load from .dat, "
-            "read `startup=` on a passing call to see the load cost, and only for a "
-            "genuinely huge prefix retry with a larger timeout= (seconds)."
+            detail + " The budget went to the PREFIX; target tactics have not run. "
+            "Inspect dependency loading versus current-file declarations before "
+            "retrying. Build ancestors only if their artifacts are missing/stale; "
+            "already-built heavy dependencies may need a preloaded HOLHEAP. "
+            "Use a larger timeout only for an identified expensive cold prefix."
         )
     heavy_prefix = ("" if prefix_s <= target_s else
                     " (the prefix took the larger share: if that repeats on a "
@@ -321,20 +338,26 @@ def _session_notice_lines(cursor) -> list[str]:
     reloaded, restart into another workdir), each on its own line."""
     take = getattr(cursor, "take_notices", None)
     notices = take() if take else []
+    notices.extend(_failure_evidence_lines(getattr(cursor, "session", None)))
     return [""] + notices if notices else []
 
 
+def _failure_evidence_lines(session) -> list[str]:
+    evidence = getattr(getattr(session, "failure_evidence", None), "latest", None)
+    if not evidence:
+        return []
+    # Clearly history: the current request may have succeeded after a failure.
+    if evidence.get("path"):
+        return [f"[Latest HOL failure evidence ({evidence['kind']}): {evidence['path']}]"]
+    return [f"[HOL failure evidence could not be saved: {evidence.get('log_error', 'unknown')}]"]
+
+
 def _auto_cheated_deps_lines(cursor, target_name: str | None = None) -> list[str]:
-    """Lines naming DEPENDENCIES auto-cheated during loading, with reasons.
+    """Context admission history, NOT an established dependency closure.
 
-    Auto-cheated deps silently weaken a per-theorem verification claim (the
-    proof is checked against the dep's STATEMENT, not its proof), so outputs
-    name each one and why it was cheated.
-
-    ``target_name`` (the theorem currently being navigated/checked) is excluded:
-    a target that was itself auto-cheated is NOT a dependency, and listing it
-    here next to a green verdict is self-contradictory. The target-self-cheat
-    case is surfaced separately by _target_self_cheated_lines.
+    Retains the legacy helper name. Backward navigation can leave history from
+    later theorems here; only kernel oracle evidence establishes use of an
+    admission. Target-self-taint is reported separately and still blocks OK.
     """
     failed = getattr(cursor, "_failed_proofs", None)
     if not failed:
@@ -343,7 +366,7 @@ def _auto_cheated_deps_lines(cursor, target_name: str | None = None) -> list[str
     if not deps:
         return []
     rendered = "; ".join(f"{name} ({reason})" for name, reason in deps.items())
-    return ["", f"[auto-cheated deps: {rendered}]"]
+    return ["", f"[context admission history (not a dependency list): {rendered}]"]
 
 
 def _prefix_skip_lines(cursor) -> list[str]:
@@ -371,10 +394,9 @@ def _target_self_cheated_reason(cursor, target_name: str | None) -> str | None:
     """If the navigation/check TARGET was itself auto-cheated during load,
     return its reason; else None.
 
-    When this fires, any 'No goals (proof complete)' / 'Status: OK' is a FALSE
-    GREEN — the target's own tactics never replayed (it was replaced by `cheat`,
-    because it timed out past the budget or genuinely errored). Callers must
-    refuse the green verdict and report this instead.
+    The context has contained an admitted binding for this target. Even if
+    its tactics subsequently close, that is not sufficient to certify it:
+    revalidate in a fresh context, without the old binding or cached verdicts.
     """
     if not target_name:
         return None
@@ -389,7 +411,7 @@ _slow_nav_counts: dict[tuple[str, str, str], int] = {}
 
 
 def _slow_nav_lines(session: str, file, theorem: str | None,
-                    elapsed_secs: float) -> list[str]:
+                    elapsed_secs: float, prefix_secs: float = 0) -> list[str]:
     """Warn when the SAME theorem is navigated slowly more than once.
 
     One slow replay is the unavoidable cold start. Every later one re-pays for a
@@ -398,6 +420,11 @@ def _slow_nav_lines(session: str, file, theorem: str | None,
     """
     if not theorem or elapsed_secs < _SLOW_NAV_SECS:
         return []
+    if prefix_secs >= _SLOW_NAV_SECS and elapsed_secs - prefix_secs < _SLOW_NAV_SECS:
+        return ["", f"[Slow prefix/setup: {prefix_secs:.1f}s; target replay "
+                f"{max(0, elapsed_secs - prefix_secs):.1f}s. Inspect current-file "
+                "translation/dependency loads and checkpoint reuse; this timing "
+                "does not justify splitting the target proof.]"]
     key = (session, str(file or ""), theorem)
     n = _slow_nav_counts.get(key, 0) + 1
     _slow_nav_counts[key] = n
@@ -417,6 +444,16 @@ def _slow_nav_lines(session: str, file, theorem: str | None,
         "failing arm.",
         "   Minutes-per-probe iteration is never justified by the proof being large.",
     ]
+
+
+def _phase_description(phase: dict | None) -> str:
+    if not phase:
+        return ""
+    span = (f" lines {phase['start_line']}-{phase['end_line']}"
+            if phase.get("start_line") else "")
+    return (f"Active item: {phase.get('phase', 'unknown')} "
+            f"{phase.get('item', '')}{span} "
+            f"(command budget {phase.get('budget', '?')}s).")
 
 
 def _target_self_cheated_lines(reason: str) -> list[str]:
@@ -444,8 +481,10 @@ def _target_self_cheated_lines(reason: str) -> list[str]:
         "⚠ NOT VALIDATED — the result above is NOT a verification of this "
         "theorem.",
         f"  This theorem was auto-cheated: {cause}.",
-        f"  The goals shown were computed against its STATEMENT, not its proof.",
+        "  Completed goals alone do not establish that the old admitted binding was unused.",
         f"  {remedy}",
+        "  If the file proof is ready, use hol_check_proof(theorem=..., fresh=True)",
+        "  to revalidate in a clean session without the old admitted binding.",
     ]
 
 
@@ -703,6 +742,11 @@ async def _prune_idle_sessions():
         entry = _sessions.get(name)
         if not entry:
             continue
+        # Status polling must not reap a long-running proof as "idle".
+        locks = (getattr(entry.session, "_lock", None),
+                 getattr(entry.cursor, "_nav_lock", None))
+        if any(lock is not None and lock.locked() for lock in locks):
+            continue
         # Re-check: session may have been touched during a prior await
         if time.time() - entry.last_used <= _SESSION_IDLE_TIMEOUT:
             continue
@@ -794,7 +838,10 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None,
     Args:
         workdir: Working directory (should contain Holmakefile for dependencies)
         name: Session identifier (e.g., "main")
-        env: Optional environment variables (e.g. {"VFMDIR": "/path/to/vfm"})
+        env: Optional environment variables (e.g. {"VFMDIR": "/path/to/vfm"}).
+             HOL4_MCP_MAXHEAP_MB sets the interactive Poly/ML heap limit in MB
+             (integer >= 256; default 8192). Applied at session startup only;
+             holmake's heap_size is independent.
         force: Allow a second concurrent session despite RULE J (default False)
 
     Returns: Session status
@@ -889,11 +936,16 @@ async def hol_sessions() -> str:
         # Cursor info
         if entry.cursor:
             cs = entry.cursor.status
-            cursor_str = f"{cs['active_theorem']}" if cs['active_theorem'] else "(none)"
+            cursor_str = cs.get('active_theorem') or "(none)"
         else:
             cursor_str = "(none)"
 
         lines.append(f"{name:<12} {workdir_str:<42} {age:<7} {idle_str:<7} {status:<8} {cursor_str}")
+        phase = getattr(entry.cursor, "_phase", None)
+        if phase and phase.get("active"):
+            elapsed = time.perf_counter() - phase["started"]
+            lines.append(f"  {_phase_description(phase)} Elapsed {elapsed:.1f}s.")
+        lines.extend(_failure_evidence_lines(entry.session))
 
     return "\n".join(lines)
 
@@ -1543,7 +1595,7 @@ _PROGRESS_INTERVAL = 10  # seconds
 
 
 @mcp.tool()
-async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 600, heap_size: int = 12288, jobs: int = None, detach: bool = False) -> str:
+async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 600, heap_size: int = 12288, jobs: int = None, detach: bool = False, trace_discovery: bool = False) -> str:
     """Run Holmake --qof in directory.
 
     Name the target (hook H32 blocks an untargeted, whole-directory build once;
@@ -1561,6 +1613,11 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 `job=<id>` and the log path; poll hol_build_status(job=...).
                 For builds longer than the synchronous budget — never a shell
                 `nohup Holmake` (hook H28), which nothing reports on.
+        trace_discovery: Opt-in Linux/strace diagnostic for opaque filesystem
+                or discovery failures (e.g. SysErr noent). Retains syscall/path
+                evidence and execution-context metadata under .hol. Adds
+                overhead; defaults to False. Does not ignore missing sources
+                or automatically retry any build.
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
              With detach: the job id and log path.
@@ -1578,14 +1635,17 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
     logs_dir = workdir_path / ".hol" / "logs"
 
-    # Delete all prior logs so only this run's logs exist afterward.
-    # Holmake only truncates a target's log when that target's job starts,
-    # so stale logs from prior runs would otherwise persist for any target
-    # not reached (e.g. due to timeout or dependency failure).
-    if logs_dir.exists():
-        for log_file in logs_dir.iterdir():
-            if log_file.is_file():
-                log_file.unlink()
+    # Preserve prior/peer build evidence. The native target locks coordinate
+    # writers, but deleting a directory's logs here bypasses those locks.
+    # For the optional failure excerpt below, consider only changed logs.
+    def log_stamp(path):
+        try:
+            st = path.stat()
+            return st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino
+        except FileNotFoundError:
+            return None
+
+    prior_logs = {p: log_stamp(p) for p in logs_dir.glob("*") if p.is_file()}
 
     # Resolve parallelism: explicit param > env var > 1
     if jobs is None:
@@ -1603,8 +1663,13 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     if env:
         proc_env.update(env)
 
+    try:
+        cmd, trace_note = traced_build(cmd, workdir_path, trace_discovery, proc_env)
+    except (OSError, ValueError) as exc:
+        return f"ERROR: preparing build diagnostics in {workdir_path}: {exc}"
+
     if detach:
-        return await _start_detached_build(cmd, workdir_path, proc_env, target)
+        return await _start_detached_build(cmd, workdir_path, proc_env, target, trace_note)
 
     proc = None
     try:
@@ -1653,7 +1718,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         wall = time.time() - start_time
 
         if timed_out:
-            return f"ERROR: Build timed out after {timeout}s."
+            return f"ERROR: Build timed out after {timeout}s.\n{trace_note}"
 
         output = b''.join(stdout_chunks).decode("utf-8", errors="replace")
 
@@ -1666,28 +1731,36 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                         entry.holmake_env = env
                 # Include env in output for caller to capture if needed
                 result += f"\nHOLMAKE_ENV: {json.dumps(env)}"
-            return f"{result}\n[{wall:.1f}s]"
+            return f"{result}\n[{wall:.1f}s]\n{trace_note}".rstrip()
 
-        # Build failed - append relevant logs (all logs are from this run)
-        result = f"Build failed (exit code {proc.returncode}).\n\n{output}"
+        # Shared-directory logs may also have changed in a peer build. Label
+        # this honestly; the command's own output above is authoritative.
+        result = build_failure_heading(proc.returncode, output, bool(trace_note)) + f"\n\n{output}"
 
         if logs_dir.exists():
             logs = sorted(
-                [f for f in logs_dir.iterdir() if f.is_file()],
+                [f for f in logs_dir.iterdir()
+                 if f.is_file() and log_stamp(f) != prior_logs.get(f)],
                 key=lambda f: -f.stat().st_mtime
             )
             if logs:
-                result += "\n\n=== Build Logs ===\n"
+                result += ("\n\n=== Build Logs ===\n"
+                           "Changed during this build; may include concurrent jobs.\n")
                 for log_file in logs[:3]:
                     content = log_file.read_text(errors="replace")
                     if len(content) > log_limit:
                         content = f"...(truncated, showing last {log_limit} bytes)...\n" + content[-log_limit:]
                     result += f"\n--- {log_file.name} ---\n{content}\n"
 
-        return f"{result}\n[{wall:.1f}s]"
+        if re.search(r"\b(?:noent|ENOENT|SysErr)\b", output) and not trace_note:
+            result += ("\nFilesystem/discovery failure: this is not a proof verdict. "
+                       f"Workdir={workdir_path}. For syscall/path evidence, use "
+                       "trace_discovery=True on a justified diagnostic run; do "
+                       "not infer the failing path from the last printed directory.")
+        return f"{result}\n[{wall:.1f}s]\n{trace_note}".rstrip()
 
     except Exception as e:
-        return f"ERROR: {e}"
+        return f"ERROR: build in {workdir_path}: {type(e).__name__}: {e}\n{trace_note}".rstrip()
     finally:
         await _kill_process_group(proc)
 
@@ -1700,13 +1773,14 @@ class _BuildJob:
     log: Path
     started: float
     finished: float | None = None
+    trace_note: str = ""
 
 
 _build_jobs: dict[str, _BuildJob] = {}
 
 
 async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: dict,
-                                target: str | None) -> str:
+                                target: str | None, trace_note: str = "") -> str:
     """Spawn Holmake with its output on a log file under `.hol/` and register
     it as a job for hol_build_status."""
     import uuid
@@ -1724,7 +1798,7 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     finally:
         log_fh.close()
     job = _BuildJob(proc=proc, workdir=workdir_path, target=target, log=log,
-                    started=time.time())
+                    started=time.time(), trace_note=trace_note)
     _build_jobs[job_id] = job
 
     async def _reap():
@@ -1732,7 +1806,7 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
         job.finished = time.time()
     asyncio.create_task(_reap())
     return (f"Build started in background: job={job_id} target={target or '(all)'} "
-            f"workdir={workdir_path}\nlog={log}\n"
+            f"workdir={workdir_path}\nlog={log}\n{trace_note}\n"
             f"Poll hol_build_status(job=\"{job_id}\"); it reports running/done "
             f"with the log tail, and cancel=True stops it.")
 
@@ -1771,9 +1845,10 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
         text = ""
     head = f"{state}: job={job} target={entry.target or '(all)'} workdir={entry.workdir} [{elapsed:.0f}s]"
     if state == "done":
-        verdict = "Build succeeded" if proc.returncode == 0 else f"Build failed (exit code {proc.returncode})"
+        verdict = ("Build succeeded" if proc.returncode == 0 else
+                   build_failure_heading(proc.returncode, text, bool(entry.trace_note)))
         head += f"\n{verdict}."
-    return f"{head}\nlog={entry.log}\n\n{text}".rstrip()
+    return f"{head}\nlog={entry.log}\n{entry.trace_note}\n\n{text}".rstrip()
 
 
 @mcp.tool()
@@ -1924,6 +1999,7 @@ async def _init_file_cursor(
 
     if result.get("error"):
         err_lines = [f"ERROR: {result['error']}"]
+        err_lines.extend(_failure_evidence_lines(s))
         err_lines.extend(
             _quote_diagnosis_if_parse_error(file_path, result['error'])
         )
@@ -2021,9 +2097,10 @@ async def hol_state_at(
     The failing step is marked with "<-- FAILED" in the steps section.
 
     Diagnostic lines to read, not ignore:
-      - "[auto-cheated deps: name (reason); ...]" — prefix theorems that
-        failed/timed out at load were replaced by cheat; the state shown
-        rests on their STATEMENTS only. Verify them before trusting an OK.
+      - "[context admission history (not a dependency list): ...]" — recorded
+        load failures/admissions, not an inferred dependency closure. Actual
+        oracle use is reported separately by hol_check_proof. Verify at-risk
+        prerequisites before claiming the file is complete.
       - "[inside opaque step k (lines A-B): state after sub-step j of n ...]"
         — the position is inside one opaque (parenthesized) step and the
         group receives exactly one goal there, so the step's flat sub-plan
@@ -2036,17 +2113,18 @@ async def hol_state_at(
       - "TIMEOUT: step k (lines A-B) ..." — the failing step's source span;
         split it with `>- suspend` or raise the per-tactic timeout.
       - "TIMEOUT: state_at exceeded ... prefix=Ps, target=Ts" — where the
-        overall budget went: prefix is dependency load plus earlier
-        theorems, target is this theorem's own tactics. target≈0 with
-        "your tactics never ran" is a heavy prefix (build the ancestors);
-        otherwise the tactic you just wrote is the suspect.
+        overall budget went. Read "Active item" to distinguish dependency
+        loading, current-file SML/translation and preceding theorem replay;
+        target is this theorem's own tactics. hol_sessions exposes progress
+        during a long prefix without sending a HOL command.
       - "PROOF BROKEN in opaque step k (lines A-B); ..." — the failure is
         inside one opaque step and its goal is not observable; the line
         carries the sub-suspend recipe. Goals are withheld unless
         show_partial=True, and then they are the step's ENTRY state.
-      - "Theorem: X ⚠ depends on cheat" (first line) — the state rests on
-        auto-cheated dependencies; "[auto-cheated deps: ...]" below names
-        them.
+      - "Theorem: X ⚠ context has admission history" — inspect the history
+        below; this does not assert that every recorded admission was used.
+      - "Latest HOL failure evidence" — retained request/response JSON path,
+        explicitly historical; the current request may have succeeded.
       - "[Loop: N edit→navigate cycles on X broke at the same step k ...]" —
         the same step has failed after N successive edits; stop editing
         blind and sub-suspend the arm as the line says.
@@ -2128,7 +2206,7 @@ async def hol_state_at(
     # rests on auto-cheated dependencies says so on this first line; the named
     # list follows in the caveats.
     if active_theorem:
-        marker = (" ⚠ depends on cheat"
+        marker = (" ⚠ context has admission history"
                   if _auto_cheated_deps_lines(cursor, active_theorem) else "")
         lines.append(f"Theorem: {active_theorem}{marker}")
 
@@ -2375,7 +2453,9 @@ async def hol_state_at(
 
     if result.timings:
         lines.extend(_slow_nav_lines(session, cursor.file, active_theorem,
-                                     result.timings.get('total', 0)))
+                                     result.timings.get('total', 0),
+                                     max(0, result.timings.get('total', 0) -
+                                         result.timings.get('replay', 0))))
 
     _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)
@@ -2388,6 +2468,7 @@ async def hol_check_proof(
     workdir: str = None,
     trace: bool = True,
     session: str = "default",
+    fresh: bool = False,
 ) -> str:
     """Confirm a theorem's proof completes. END-OF-THEOREM ONLY.
 
@@ -2407,6 +2488,10 @@ async def hol_check_proof(
         workdir: Working directory for HOL (used with file)
         trace: If True, include full per-step timing trace
         session: Session name (default: "default")
+        fresh: Explicit recovery only: restart HOL and replay the full prefix,
+            discarding all cached bindings, checkpoints and verdicts. Use after
+            a transient admitted load once the file proof is ready. Defaults
+            to False, preserving incremental replay and cached checks.
 
     Returns: Whether proof completes, failure location, brief goal summary.
              With trace=True, also includes per-step timing and goal counts.
@@ -2414,10 +2499,10 @@ async def hol_check_proof(
     Status values: OK / FAILED / INCOMPLETE / CHEAT / NO TACTICS, plus
     CANNOT CHECK for a Resume whose suspension goal is unavailable (comes
     with an ancestor-chain diagnosis naming the first broken ancestor).
-    "Status: OK ... ⚠ depends on cheat" is followed by
-    "[auto-cheated deps: name (reason); ...]" naming WHICH prefix theorems
-    were auto-cheated at load and why — the OK rests on their statements
-    only. A timeout failure adds "TIMEOUT: step k spans lines A-B" naming
+    "Status: OK ... ⚠ depends on cheat" is accompanied by kernel oracle
+    evidence. "context admission history" separately names load failures;
+    it is NOT a dependency closure and may include later theorems visited
+    earlier in the session. A timeout adds "TIMEOUT: step k spans lines A-B" naming
     the span to split with `>- suspend`.
     """
     cursor = await _get_cursor(session)
@@ -2442,10 +2527,23 @@ async def hol_check_proof(
     except FileNotFoundError:
         return f"ERROR: File not found: {cursor.file}"
 
+    if fresh:
+        # Validate the request before discarding a useful session. Merely
+        # deleting _failed_proofs would leave the old admitted ML binding live.
+        if not cursor._get_theorem(theorem):
+            return f"ERROR: Theorem '{theorem}' not found"
+        cursor._schedule_full_reinit()
+        cursor._skip_prefix = False
+        cursor._skipped_thms.clear()
+        cursor._session_notices.append(
+            "[Fresh verification: HOL restarted; full prefix replayed without "
+            "old bindings, checkpoints or cached verdicts]")
+
     # Enter theorem and get step plan
     enter_result = await cursor.enter_theorem(theorem)
     if "error" in enter_result:
         err_lines = [f"ERROR: {enter_result['error']}"]
+        err_lines.extend(_failure_evidence_lines(cursor.session))
         err_lines.extend(
             _quote_diagnosis_if_parse_error(cursor.file, enter_result['error'])
         )
@@ -2455,13 +2553,14 @@ async def hol_check_proof(
     if not thm:
         return f"ERROR: Theorem '{theorem}' not found"
 
-    dep_marker = (" ⚠ depends on cheat"
+    dep_marker = (" ⚠ context has admission history"
                   if _auto_cheated_deps_lines(cursor, theorem) else "")
     lines = [
         f"Theorem: {theorem}{dep_marker}",
         f"Lines: {thm.start_line}-{thm.proof_end_line - 1}",
     ]
     lines.extend(_session_notice_lines(cursor))
+    lines.extend(_auto_cheated_deps_lines(cursor, theorem))
     lines.append("")
 
     if thm.has_cheat:
@@ -2524,6 +2623,7 @@ async def hol_check_proof(
 
     if final.error:
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")
+        lines.extend(_failure_evidence_lines(cursor.session))
         # HOL echoes the whole failing ML expression, so for a big opaque arm
         # this line alone can be hundreds of lines of the body being replayed.
         lines.append(f"Error: {elide_long_text(final.error)}")
@@ -2557,11 +2657,10 @@ async def hol_check_proof(
             # "0 goals" rests on its statement, not its replayed proof.
             lines.append(f"Status: NOT VALIDATED ({total_ms}ms)")
             lines.extend(_target_self_cheated_lines(self_cheat))
-            lines.extend(_auto_cheated_deps_lines(cursor, theorem))
             return "\n".join(lines)
         if oracles:
             lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps) ⚠ depends on cheat")
-            lines.extend(_auto_cheated_deps_lines(cursor, theorem))
+            lines.append(f"[kernel oracle evidence: {', '.join(map(str, oracles))}]")
         else:
             lines.append(f"Status: OK ({total_ms}ms, {total_steps} steps)")
         if not trace and not oracles:
