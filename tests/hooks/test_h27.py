@@ -238,6 +238,53 @@ def test_gate_follows_cd_and_git_C_to_the_script_repository(run_hook, repo, tmp_
         assert code == 2 and "separate tool calls" in err, (command, err)
 
 
+def test_gate_covers_repository_from_script_free_subdirectory(run_hook, repo):
+    stage(repo, "  >- metis_tac []", "  >- cheat")
+    subdir = repo / "docs"
+    subdir.mkdir()
+    index = (repo / ".git/index").read_bytes()
+    for cwd in (repo, subdir):
+        code, err, _ = run(run_hook, cwd, "git commit -m checkpoint")
+        assert code == 2 and "Gate 3" in err, (cwd, err)
+    assert (repo / ".git/index").read_bytes() == index
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_gate_resolves_all_git_C_options(run_hook, repo, tmp_path, relative):
+    stage(repo, "  >- metis_tac []", "  >- cheat")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    git(plain, "init", "-q")
+    destination = "../repo" if relative else str(repo)
+    command = f"git -C '{plain}' -C '{destination}' commit -m checkpoint"
+    code, err, _ = run(run_hook, tmp_path, command)
+    assert code == 2 and "Gate 3" in err, err
+    # Unsupported compound forms must still be refused in the final repository.
+    code, err, _ = run(run_hook, tmp_path, command + " && git push")
+    assert code == 2 and "separate tool calls" in err, err
+    # Resolving to a non-HOL repository must not retain the first one's scope.
+    command = f"git -C '{repo}' -C '{plain}' commit -m note && git push"
+    assert run(run_hook, tmp_path, command)[0] == 0
+
+
+def test_gate_uses_commit_repository_not_preceding_git_command(run_hook, repo, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    git(plain, "init", "-q")
+    command = f"git -C '{plain}' status && git -C '{repo}' commit -m checkpoint"
+    code, err, _ = run(run_hook, tmp_path, command)
+    assert code == 2 and "separate tool calls" in err, err
+
+
+def test_repository_scan_includes_scripts_in_other_subdirectories(repo):
+    nested = repo / "proofs"
+    nested.mkdir()
+    git(repo, "mv", "fooScript.sml", "proofs/fooScript.sml")
+    docs = repo / "docs"
+    docs.mkdir()
+    assert _snapshot_module.tracks_scripts(str(docs))
+
+
 def test_deleted_finalise_is_blocked(run_hook, repo):
     p = repo / "fooScript.sml"
     p.write_text('Theorem t:\n T\nProof\n suspend "a"\nQED\n'
