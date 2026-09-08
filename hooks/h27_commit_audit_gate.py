@@ -9,10 +9,10 @@ AND `holmake`, so no other signal catches them either. This moves the gate to a
 mechanical moment: when proof code leaves your hands.
 
 DIFF-SCOPED. Only what this commit introduces is judged:
-  - a theorem is swept for composition defects only if the commit touches it;
+  - unchanged inherited composition findings are matched against HEAD;
   - banned tactics, `cheat` and `[local]` helpers count only on ADDED lines.
-Pre-existing debris in untouched theorems is tolerated until that theorem is
-restructured, exactly as Gate 5 says.
+The proposed bytes come from the index, or the selected tracked worktree files
+for -a/--only/--include. This hook never changes the real index.
 
 Checks (skill audit gates 1, 2, 3, 5, 6 + the composition sweep):
   Gate 1  a Resume block added -- name the (a)/(b) justification or inline it
@@ -22,35 +22,28 @@ Checks (skill audit gates 1, 2, 3, 5, 6 + the composition sweep):
   Gate 6  a `[local]` helper added that is used once
   sweep   proof_sweep.py over each touched theorem
 
-Override: put `wip ok` in the message alongside `git ok`. Deliberate WIP commits
-are legitimate; silently unenforceable gates are not.
+Exceptions require approval of the displayed content-scoped review and finding
+class. Audit exceptions and permission to execute Git are separate.
 
-Fails OPEN on anything unexpected (not a repo, git error, unreadable file) --
-never block real work because of a gate bug.
+An ambiguous prospective commit is reported as unavailable, not silently
+audited against the wrong content. Stage separately and commit the index.
 """
 
 HOOK_EVENT = "PreToolUse"
 HOOK_MATCHER = "Bash"   # None = all calls for this event
 
+import difflib
 import json
 import os
 import re
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import proof_sweep  # noqa: E402
-from hook_payload import latest_user_message  # noqa: E402
-
-# Same option-consuming shape as H14: `git -C dir commit`, `git --no-pager commit`.
-_OPT = (r"(?:(?:-C|-c|--git-dir|--work-tree|--namespace|--exec-path)"
-        r"(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*)\s+")
-COMMIT_RE = re.compile(r"\bgit\s+(?:" + _OPT + r")*commit\b")
-WORKDIR_RE = re.compile(r"\bgit\s+(?:-C|--git-dir=?)\s*(\S+)")
-# A leading `cd <dir> && ... git commit` retargets the repo just as `git -C` does;
-# without this the gate audits the session's cwd and judges the wrong repository.
-CD_RE = re.compile(r"(?:^|[;&|]|&&)\s*cd\s+(?!-)(\S+)")
-OVERRIDE_RE = re.compile(r"\bwip\s+ok\b", re.IGNORECASE)
+from hook_payload import emit_context, visible_command  # noqa: E402
+from h14_git_destructive_consent import find_match  # noqa: E402
+from git_commit_snapshot import snapshot, AuditUnavailable  # noqa: E402
+from audit_approval import review_id, approved_classes, finding_class  # noqa: E402
 
 BANNED = [(re.compile(r"\bTRY\b"), "TRY"), (re.compile(r"\bORELSE\b"), "ORELSE"),
           (re.compile(r"\bFIRST\b"), "FIRST"), (re.compile(r"\bTHENL\b"), "THENL"),
@@ -76,41 +69,16 @@ ADVISORY_ONLY = ("`>-` is the only dispatcher",)
 # skill's audit, where a human is doing the judging.
 
 
-def git(args, cwd):
-    try:
-        p = subprocess.run(["git"] + args, cwd=cwd, capture_output=True,
-                           text=True, timeout=10)
-        return p.stdout if p.returncode == 0 else None
-    except Exception:
-        return None
-
-
-def diff_base(command):
-    """What this commit newly introduces: the index against HEAD. An `--amend`
-    folds the index into HEAD, whose content already passed this gate when it
-    was committed, so it is judged the same way."""
-    if re.search(r"(?:^|\s)-[a-zA-Z]*a|--all\b", command):
-        return ["HEAD"]            # -a stages tracked edits at commit time
-    return ["--cached"]
-
-
-def added_lines(path, base, cwd):
-    """{new-file line number: text} for lines this commit adds."""
-    out = git(["diff", "-U0"] + base + ["--", path], cwd)
-    if out is None:
-        return None
-    added, ln = {}, 0
-    for line in out.split("\n"):
-        m = re.match(r"@@ -\S+ \+(\d+)(?:,\d+)? @@", line)
-        if m:
-            ln = int(m.group(1))
-            continue
-        if line.startswith("+") and not line.startswith("+++"):
-            added[ln] = line[1:]
-            ln += 1
-        elif not line.startswith("-"):
-            ln += 1
-    return added
+def changed_lines(before, after):
+    """Added lines and an exact unchanged-line mapping into HEAD."""
+    old, new = before.splitlines(), after.splitlines()
+    added, unchanged = {}, {}
+    for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if tag == "equal":
+            unchanged.update({j + 1: a + j - c + 1 for j in range(c, d)})
+        elif tag in ("insert", "replace"):
+            added.update({j + 1: new[j] for j in range(c, d)})
+    return added, unchanged
 
 
 def blocks(text):
@@ -137,16 +105,11 @@ def block_of(blks, ln):
     return None
 
 
-def audit(path, base, cwd):
-    added = added_lines(path, base, cwd)
-    if not added:
-        return []
-    try:
-        text = open(os.path.join(cwd, path), encoding="utf-8", errors="replace").read()
-    except OSError:
-        return []
+def audit(before, text):
+    added, unchanged = changed_lines(before, text)
     # Strip comments for token checks; keep line structure so numbers stay real.
-    bare = {n: COMMENT.sub("", t) for n, t in added.items()}
+    clean_lines = proof_sweep.clean(text).splitlines()
+    bare = {n: clean_lines[n - 1] for n in added}
     found, blks = [], blocks(text)
     ladders = {}
     for line in text.split("\n"):
@@ -172,20 +135,30 @@ def audit(path, base, cwd):
                              f"induction, so this reads as a deferred tail. Inline it, or "
                              f"say why it is a keeper"))
 
-    # Gate 2: a theorem with a Resume in the file and no Finalise after it.
-    for name in {m.group(1) for t in bare.values()
-                 for m in [re.match(r"^Resume\s+([A-Za-z0-9_']+)", t.strip())] if m}:
-        if not re.search(r"^Finalise\s+" + re.escape(name) + r"\s*;", text, re.M):
-            found.append((0, f"Gate 2: `Resume {name}` present with no `Finalise "
-                             f"{name};` — the theorem stays cheated"))
+    # Gate 2 also catches deleting/moving a previously valid Finalise, even
+    # when this diff adds no lines. An inherited defect is not a new one.
+    def unfinished(source):
+        ends = {name: last for name, kind, _, _, last in blocks(source) if kind == "Resume"}
+        for n, line in enumerate(proof_sweep.clean(source).splitlines(), 1):
+            m = re.match(r"^Finalise\s+([A-Za-z0-9_']+)\s*;", line)
+            if m and n > ends.get(m[1], n):
+                ends.pop(m[1], None)
+        return set(ends)
 
-    # Composition sweep, only over theorems whose PROOF TEXT this commit touches.
-    for name, kind, first, body, last in blks:
-        if kind == "Definition" or not any(body <= n < last for n in added):
+    for name in unfinished(text) - unfinished(before):
+        found.append((0, f"Gate 2: `Resume {name}` present with no `Finalise "
+                         f"{name};` after its last body — the theorem stays cheated"))
+
+    # Compare semantic findings at unchanged source lines, not just their
+    # counts. Also catch new adjacency created solely by deleting a line.
+    inherited = set(proof_sweep.sweep(before))
+    for ln, msg in proof_sweep.sweep(text):
+        if not any(kind != "Definition" and body <= ln < last
+                   for _, kind, _, body, last in blks):
             continue
-        for ln, msg in proof_sweep.sweep(text, first, last):
-            if not msg.startswith(ADVISORY_ONLY):
-                found.append((ln, msg))
+        if ((unchanged.get(ln), msg) not in inherited
+                and not msg.startswith(ADVISORY_ONLY)):
+            found.append((ln, msg))
     return found
 
 
@@ -197,36 +170,39 @@ def main():
     if payload.get("tool_name", "") != "Bash":
         return 0
     command = payload.get("tool_input", {}).get("command", "")
-    if not COMMIT_RE.search(command):
+    if not re.search(r"\bgit\b", command) or not re.search(r"\bcommit\b", command):
         return 0
 
-    latest = latest_user_message(payload)
-    if latest and OVERRIDE_RE.search(latest):
+    try:
+        visible = visible_command(command)
+        if ("$(" in visible or "`" in visible) and find_match(command) == "git commit":
+            raise AuditUnavailable("command substitutions can change the index; use a literal commit call")
+        proposed = snapshot(command, payload.get("cwd") or os.getcwd())
+        if proposed is None and find_match(command) == "git commit":
+            raise AuditUnavailable("shell-wrapped commit cannot be audited; use a plain commit call")
+    except (AuditUnavailable, ValueError) as error:
+        print(f"hol4-hook H27: cannot determine the proposed commit: {error}", file=sys.stderr)
+        return 2
+    if proposed is None:
         return 0
-
-    m = WORKDIR_RE.search(command) or CD_RE.search(command)
-    cwd = m.group(1) if m else payload.get("cwd") or os.getcwd()
-    if git(["rev-parse", "--git-dir"], cwd) is None:
-        return 0                                   # not a repo: fail open
-
-    base = diff_base(command)
-    names = git(["diff", "--name-only"] + base, cwd)
-    if names is None:
-        return 0
-    scripts = [f for f in names.split("\n") if f.endswith("Script.sml")]
-    if not scripts:
-        return 0
+    _cwd, files = proposed
 
     findings = []                                  # [(file, theorem, line, msg)]
-    for f in scripts:
-        try:
-            blks = blocks(open(os.path.join(cwd, f), encoding="utf-8",
-                               errors="replace").read())
-            findings += [(f, block_of(blks, ln), ln, msg) for ln, msg in audit(f, base, cwd)]
-        except Exception:
-            continue                               # one bad file must not block
+    for f, (before, after) in files.items():
+        blks = blocks(after)
+        findings += [(f, block_of(blks, ln), ln, msg) for ln, msg in audit(before, after)]
     if not findings:
         return 0
+
+    review = review_id(_cwd, command, files, findings)
+    approved = approved_classes(payload, review)
+    remaining = [f for f in findings if finding_class(f[3]) not in approved]
+    if not remaining:
+        emit_context(f"[H27: review {review} — approved {', '.join(sorted(approved))} "
+                     "exceptions for these exact proof contents/command; "
+                     "this does not grant Git permission or establish proof completeness.]")
+        return 0
+    findings = remaining
 
     print(f"hol4-hook H27: refused the commit — the audit gates flag "
           f"{len(findings)} thing(s) in the proof code it would record.",
@@ -243,11 +219,16 @@ def main():
         print(f"    {'line ' + str(ln) + ': ' if ln else ''}{msg}", file=sys.stderr)
         shown += 1
     print("", file=sys.stderr)
-    print("Only theorems this commit TOUCHES were judged. Each sweep item is a "
+    print("Only newly introduced findings in the proposed commit were judged. Each sweep item is a "
           "PROMPT TO CHECK, not a proven defect — simplification is not "
           "confluent, so verify per theorem before collapsing anything.",
           file=sys.stderr)
-    print("If this is a deliberate work-in-progress commit, say `wip ok`.",
+    classes = sorted({finding_class(f[3]) for f in findings})
+    print(f"Review {review}: unapproved classes {', '.join(classes)}. "
+          "An exception requires explicit user approval naming this review and "
+          "the class (style exceptions or incomplete-proof checkpoint). "
+          "Approval expires after 30 minutes and cannot cover changed proof "
+          "contents/commands. Audit approval grants no permission to commit or push.",
           file=sys.stderr)
     return 2
 

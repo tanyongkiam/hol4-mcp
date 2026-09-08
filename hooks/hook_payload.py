@@ -26,8 +26,8 @@ Two things every hook needs and none should reimplement:
   soft-hook protocol: a situation is blocked ONCE per session window with
   the full message; an identical retry passes with a prominent override
   note and a log entry; a consent phrase in ANY user turn of the session
-  pre-grants. The hard hooks (H14, H27) do not use these — they read the
-  latest user message only.
+  pre-grants. H14 retains its latest-message Git gate; H27 uses separate
+  content/finding-scoped audit approvals, never this soft retry protocol.
 """
 import json
 import os

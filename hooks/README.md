@@ -37,7 +37,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H4  | 📝     | PreToolUse            | `Edit\|Write\|MultiEdit` | Warn on `Resume` body starting with `‘Q’ by tac` (step-plan splits at `by`) |
 | H5  | ⏭     | PreToolUse            | `mcp__hol4__hol_check_proof` | ~~Block re-call after FAILED with no intervening `hol_state_at` (RULE C)~~ — skipped (H6 covers the failure-time nudge; the block-step needs per-session state that wasn't worth the machinery) |
 | H6  | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|hol_state_at\|hol_goals` | On `FAILED` / `TIMEOUT` / `PROOF BROKEN`: the symptom-table hint for the failing tactic on every failure; the RULE C reminder only from the SECOND consecutive failure on the same theorem (per-session state; a pass or another theorem resets). Silent first failure with no matching row. Advisory only |
-| H7  | ✅     | PostToolUse           | `mcp__hol4__holmake`    | RULE A reminder only on the edit-then-rebuild signature: a rebuild of the same (workdir, target) within 30 min after a `*Script.sml` edit (per-session state). First build and edit-free retries are silent. Advisory only |
+| H7  | ✅     | PostToolUse           | `mcp__hol4__holmake`    | RULE A reminder on repeated builds of the same target within 30 min after an authored proof-block change. Assertion-only, translation-prefix-only, unrelated-file and timestamp-only changes are silent. Advisory only |
 | H8  | ✅     | PostToolUse           | `mcp__hol4__hol_state_at` | Inject cost-discipline reminder on any single `hol_state_at` call whose `replay` time ≥ 30s (stateless; cache hits and error paths skipped) |
 | H9  | ⏭     | PreToolUse            | `mcp__hol4__hol_restart` | ~~Default-block; CLAUDE.md says "effectively never"~~ — skipped (escape-hatch design too messy for the rare legitimate case; CLAUDE.md text is sufficient deterrent) |
 | H10 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Inject Finalise reminder when a Resume block introduces a new theorem to a `Script.sml` without a matching `Finalise <thm>;` (diff-aware on theorem names; sub-Resumes on existing theorems silent) |
@@ -56,7 +56,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H24 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Advise (never block) on newly-defined tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) in `*Script.sml` — lifting a tactic needs a strong stated justification; defaults are lift a LEMMA or leave the duplication. Diff-aware on binding names; `*Lib.sml`/`*Syntax.sml` out of scope by the path test |
 | H25 | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|mcp__hol4__hol_state_at\|mcp__hol4__holmake` | Sweep finished proof text for composition defects (adjacent normalisers, `impl_tac` sandwich, `>-` not marking a sibling, near-identical sibling arms, nested splitter ladders, n-ary tactic forms, self-feeding lambdas). Fires per theorem on `hol_check_proof` → `Status: OK`; counts-only backstop on `holmake` for git-modified scripts. Advisory; checks live in `proof_sweep.py` |
 | H26 | ✅     | —                     | —                      | **Implemented inside H6**, not as its own hook: it fires on the same event with the same payload, so a separate hook would mean two messages on one failure. See "The symptom table" under H6 |
-| H27 | ✅     | PreToolUse            | `Bash`                  | HARD. Run the audit gates against a `git commit` touching `*Script.sml` and block on what it finds — diff-scoped (index vs HEAD, `--amend` included), so only theorems whose PROOF TEXT the commit touches are swept. Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem, minus the lone-`>-` prompt (H25's advisory); findings grouped per theorem. Override with `wip ok` |
+| H27 | ✅     | PreToolUse            | `Bash`                  | HARD. Audit the prospective committed script content against HEAD, respecting staging and supported commit path/flag selection without mutating the index. Block new findings, not inherited unchanged style debt; detect missing Finalise including deletion. Unsupported command forms receive an explicit diagnostic. WIP approval remains separate from Git permission |
 | H28 | ✅     | PreToolUse            | `Bash`                  | SOFT. Block shell invocations of `Holmake` / raw `poly`\|`hol` once, redirecting to `mcp__hol4__holmake` / `hol_start` (`detach=True` for long builds); an identical retry passes with an override note. Command-position match only, after quoted strings and heredoc bodies are blanked (`hook_payload.visible_command`), so prose, log paths, grep patterns, `hol=...` assignments and `--help`/`-v` queries pass. Pre-grant: `shell holmake ok` |
 | H29 | ✅     | PreToolUse            | `mcp__hol4__hol_stop\|mcp__hol4__hol_restart` | SOFT. Block a REPEAT `hol_stop`/`hol_restart` within 30 min while the cached working file (H25's `hol4_file`) is still in the same directory once — the ritual-stop signature; stop/restart is never part of the edit-check loop (`hol_state_at` auto-detects edits, reloads after an ancestor rebuild and moves the session across workdirs itself; every stop costs a cold prefix reload). First stop, any stop once the working file is in another directory, and a stop within 10 min of a budget TIMEOUT (recorded by H6) pass; an identical retry passes with an override note. Pre-grant: `restart ok` |
 | H30 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|hol_goals\|hol_check_proof\|hol_send\|hol_start` | Block HOL navigation of a file whose ANCESTOR theories are stale — script newer than its built artifacts, artifacts missing (mid-rebuild), or built before their own ancestors' artifacts. Forecloses "edited upstream, kept working downstream": sessions and fresh loads read the built `.dat`, so downstream checks silently run against the pre-edit upstream with no native symptom. Make-style check over the `Ancestors`/`open` closure (comment-stripped, duplicate names resolved nearest-first, mtime-memoized under `~/.claude/hook-state/h30/`); self-clears on rebuild; target file itself exempt; also keeps H25's `hol4_file` cache current for `hol_goals`/`hol_start`. SOFT: a given (file, stale set) is blocked once with rebuild commands from each ancestor's own directory; an identical retry passes with an override note; a newly stale theory blocks again. Pre-grant: `stale ok` |
@@ -275,11 +275,11 @@ neither tactic would help and the nudge would be misleading.
 **Matcher**: `mcp__hol4__holmake`
 **Effect**: never blocks. Injects a RULE A reminder via `additionalContext`
 only when the call fits the edit-then-rebuild loop: the same (workdir, target)
-was built within the last 30 minutes AND a `*Script.sml` in the workdir was
-modified after that build. The first build of a target and an edit-free retry
-(a timeout, a dependency unstick) are silent.
+was built within the last 30 minutes AND the named target's authored proof
+blocks changed. The first build, unchanged proofs, assertion-only scripts,
+top-level translation edits and changes to unrelated scripts are silent.
 
-State: `~/.claude/hook-state/<session_id>/h7_builds.json`, one timestamp per
+State: `~/.claude/hook-state/<session_id>/h7_builds.json`, a timestamp and proof fingerprints per
 (workdir, target). The reminder names the interval and says what to do with
 the edit instead (hol_state_at, hol_check_proof; rebuild once at the end).
 
@@ -350,12 +350,12 @@ populates this with the path to the session transcript JSONL). It scans the
 **latest user message** for `\bgit\s+ok\b` (case-insensitive). Present →
 permit. Absent → block.
 
-`git ok` is a one-shot grant tied to that specific message — it does not
-persist across subsequent user messages. If you say `git ok` and I push;
-your next message without `git ok` does NOT consent to another push. This is
-the HARD shape, shared only with H27's `wip ok`; the soft hooks (H28–H32)
-pre-grant from any earlier message and pass on a deliberate retry instead
-(see *Soft hooks*).
+H14 checks `git ok` in the latest message; it does not persist across later
+user messages. It is a necessary gate token, not blanket authority: the
+requested operation's scope still governs (commit permission is not push
+permission). H27's content-scoped audit exception can survive a later status
+message, but never grants Git authority. Soft-hook retries are separate (see
+*Soft hooks*).
 
 ### Fail-open conditions
 
@@ -510,7 +510,27 @@ Acceptable — the token has no legitimate use in committed proof work.
 **Event**: `PreToolUse`
 **Matcher**: `Bash`
 **Effect**: blocks (exit 2) a `git commit` that would record proof code failing
-the audit gates. Override: `wip ok` in the latest user message.
+the audit gates. Exceptions use a content-scoped review, not a broad WIP token.
+
+### Scoped review approval
+
+A blocked audit displays a review ID bound to the repository, exact command,
+proposed proof-file contents and findings. A user may approve **style
+exceptions**, an **incomplete-proof checkpoint**, or explicitly both, naming
+that ID. For example: `I approve the style exceptions for review <ID>.`
+The equivalent incomplete-proof wording is
+`Approve the incomplete-proof checkpoint for review <ID>`; both classes may
+be joined with `and`. The approval must follow disclosure of the review.
+Quoted/negated text and old `wip ok` tokens grant nothing.
+
+Each approved class expires independently after 30 minutes. It survives status
+questions within that window but cannot cover changed proof contents, command,
+repository or findings. `Revoke review <ID>` or `Revoke all audit approvals`
+revokes it. A status tool never reads/writes this approval state. Unknown
+transcripts, session identity or unreadable state cannot waive the audit.
+Incomplete-proof approval covers Gates 2/3; style approval covers the remaining
+audit findings and cannot admit a proof. H14's Git gate remains separate: a
+later Git-permission message need not repeat an already valid audit approval.
 
 ### Why
 
@@ -523,14 +543,19 @@ hands.
 
 ### Diff-scoped
 
-Only what the commit introduces is judged: the index against HEAD (`-a` widens
-that to tracked working-tree edits). An `--amend` is judged the same way — the
-content already in HEAD passed this gate when it was committed. A theorem is
-swept only if the commit touches its PROOF TEXT (the lines after `Proof` or a
-`Resume` header): retyping a statement is not a proof edit. `cheat`, banned
-tactics and `Resume` count only on ADDED lines. Pre-existing debris in
-untouched theorems is tolerated until that theorem is restructured — exactly
-what Gate 5 says. Findings are printed grouped per theorem.
+Only what the commit introduces is judged against HEAD. Ordinary commits use
+index blobs; `-a` includes tracked worktree edits; `--only` and implicit path
+commits use only selected worktree paths; `--include` overlays selected paths
+on the index. `--amend` is compared with the current HEAD. Unchanged inherited
+sweep findings are matched by source-line mapping and finding text, including
+inside edited theorems. Newly introduced findings still block. `cheat`, banned
+tactics and `Resume` count on ADDED code lines; deletion or misplacement of a
+required `Finalise` is also detected. Findings are grouped per theorem.
+
+The audit is read-only: it never modifies the index or runs Git content
+filters. Compound staging/commit calls, interactive selection, filters and
+other unsupported forms require separate staging and a plain index commit.
+Quoted paths and commit-message option text are parsed as arguments, not flags.
 
 ### What it checks, and what it deliberately does not
 
@@ -560,8 +585,9 @@ removed or narrowed, not tolerated.
 
 ### Limitations
 
-- Fails open on anything unexpected — not a repo, a git error, an unreadable
-  file. A gate bug must never block real work.
+- If the prospective commit cannot be determined, reports the specific
+  limitation rather than auditing a different snapshot. Stage separately and
+  use a plain index commit in that case.
 - Runs alongside H14, which gates the same commits on `git ok`. Two hooks on one
   call is intentional here: they answer different questions (may you commit at
   all, and is this code fit to commit).
@@ -615,9 +641,9 @@ agent must not miss. They share one protocol (`hook_payload.soft_block`):
 5. The next `git commit` (H14) reports the session's overrides, so the
    decisions surface where the work is recorded.
 
-The hard hooks are unchanged: H14 (`git ok`) and H27 (`wip ok`) read the
-latest user message only and never pass on a retry; H1, H17, H20 and H23
-block a wrong tactic form outright, with no override.
+H14 retains its latest-message Git gate. H27 requires the scoped review
+approval described above; neither passes merely because the agent retries.
+H1, H17, H20 and H23 block a wrong tactic form outright, with no override.
 
 ## Installing the full suite
 

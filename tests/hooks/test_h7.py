@@ -23,7 +23,7 @@ def build(run_hook, workdir, target="fooTheory"):
 def workdir(tmp_path):
     d = tmp_path / "thy"
     d.mkdir()
-    (d / "fooScript.sml").write_text("Theory foo\n")
+    (d / "fooScript.sml").write_text("Theory foo\nTheorem t:\n T\nProof\n simp[]\nQED\n")
     return d
 
 
@@ -42,13 +42,41 @@ def test_rebuild_without_edit_is_silent(run_hook, workdir):
 
 def test_rebuild_after_script_edit_gets_reminder(run_hook, workdir):
     build(run_hook, workdir)
-    future = time.time() + 5
-    os.utime(workdir / "fooScript.sml", (future, future))
+    script = workdir / "fooScript.sml"
+    script.write_text(script.read_text().replace("simp[]", "rw[]"))
     code, _, out = build(run_hook, workdir)
     assert code == 0
     ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
     assert "H7" in ctx and "RULE A" in ctx
     assert "edit" in ctx.lower() and "rebuil" in ctx.lower()
+
+
+def test_assertion_only_rebuild_is_silent(run_hook, workdir):
+    script = workdir / "fooScript.sml"
+    script.write_text('Theory foo\nval _ = assert (K true) ();\n')
+    build(run_hook, workdir)
+    script.write_text(script.read_text() + 'val _ = assert (K true) 1;\n')
+    assert build(run_hook, workdir)[2] == ""
+
+
+def test_translation_prefix_edit_is_not_a_proof_edit(run_hook, workdir):
+    build(run_hook, workdir)
+    script = workdir / "fooScript.sml"
+    script.write_text('val _ = translate foo_def;\n' + script.read_text())
+    assert build(run_hook, workdir)[2] == ""
+
+
+def test_edit_to_other_script_does_not_blame_target(run_hook, workdir):
+    build(run_hook, workdir)
+    (workdir / "barScript.sml").write_text("Theorem t:\n T\nProof\n rw[]\nQED\n")
+    assert build(run_hook, workdir)[2] == ""
+
+
+def test_touch_without_content_edit_is_silent(run_hook, workdir):
+    build(run_hook, workdir)
+    future = time.time() + 5
+    os.utime(workdir / "fooScript.sml", (future, future))
+    assert build(run_hook, workdir)[2] == ""
 
 
 def test_other_target_is_a_first_build(run_hook, workdir):

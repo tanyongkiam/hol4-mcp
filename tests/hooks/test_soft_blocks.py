@@ -153,6 +153,21 @@ def test_h30_pregrant_in_earlier_message(run_hook, stale_repo):
     assert "pre-granted" in ctx(out).lower(), out
 
 
+@pytest.mark.parametrize("tool", ["holmake", "hol_build_status", "hol_cancel_build",
+                                 "hol_stop", "hol_sessions"])
+def test_h30_non_navigation_does_not_consume_override(run_hook, stale_repo, tool):
+    # A denied navigation still caches the target, as in the real incident.
+    assert nav(run_hook, stale_repo)[0] == 2
+    state = run_hook.home / ".claude" / "hook-state" / SESSION / "soft_blocks.json"
+    before = state.read_bytes()
+    code, err, out = run_hook("h30_stale_ancestors.py", f"mcp__hol4__{tool}",
+                              {"workdir": str(stale_repo)}, session_id=SESSION)
+    assert code == 0 and not err and not out
+    assert state.read_bytes() == before
+    # The actual navigation still follows the ordinary logged-override path.
+    assert "OVERRIDDEN" in ctx(nav(run_hook, stale_repo)[2])
+
+
 # --- H31 ---------------------------------------------------------------------
 
 def test_h31_blocks_once_then_retry_passes(run_hook):

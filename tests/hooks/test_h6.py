@@ -52,6 +52,16 @@ def test_success_is_silent(run_hook):
     assert ctx == ""
 
 
+def test_current_file_prefix_failure_does_not_trigger_proof_restructuring(run_hook):
+    output = ("Theorem: foo\nTIMEOUT: state_at exceeded its overall 300s budget. "
+              "Active item: top-level SML/translation lines 2-900. "
+              "The target tactics have not run.")
+    for _ in range(3):
+        assert check(run_hook, output) == ""
+    # An actual target failure after setup still starts at its first failure.
+    assert "RULE C" not in check(run_hook, failed("foo"))
+
+
 
 INSIDE = ("Theorem: foo\nLine 9 col 3, Proof position\n\n=== Goal (1 of 2) ===\n  P x\n\n"
           "NOTE: target line 10 is INSIDE step 2 (lumped/parenthesized chain, lines 9-11); "

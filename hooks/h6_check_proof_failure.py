@@ -175,9 +175,10 @@ BUDGET_VERDICT_TARGET = ("The budget ran out in YOUR tactics: a looping rewrite 
                          "(`simp[<recursive_def>]` without `Once`, a GSYM oscillation) "
                          "or a blown-up prover -- sub-suspend the arm and read the goal; "
                          "do not widen timeout=.")
-BUDGET_VERDICT_PREFIX = ("Your tactics never ran: the prefix is the cost. Build the "
-                         "ancestors (holmake) so they load from .dat and read `startup=` "
-                         "on a passing call.")
+BUDGET_VERDICT_PREFIX = ("Your tactics never ran: inspect the reported active phase. "
+                         "Build ancestors only when missing/stale; current-file "
+                         "translation needs prefix/checkpoint diagnosis, not a "
+                         "rewrite of the target proof.")
 
 LABEL_HINT = """\
 `No such label`: a Resume whose suspension was never registered. Check, in
@@ -318,6 +319,12 @@ def main():
     if BUDGET_ROW.search(text) or "TIMEOUT after" in text:
         # H29 lets a stop/restart through shortly after a budget TIMEOUT.
         save_state(os.path.join(os.path.dirname(path), "last_timeout"), time.time())
+    if "target tactics have not run" in text.lower():
+        # The shared server already names the phase and gives its remedy.
+        # Do not count prefix failures as repeated failed target-proof edits.
+        if state.get("theorem") == theorem:
+            save_state(path, {})
+        return 0
     if not any(rx.search(text) for rx in FAILURE_PATTERNS):
         if state.get("theorem") == theorem:
             save_state(path, {})

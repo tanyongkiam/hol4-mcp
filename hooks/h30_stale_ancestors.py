@@ -329,7 +329,9 @@ def main():
     except Exception:
         return 0
     tool = payload.get("tool_name", "")
-    if not tool.startswith("mcp__hol4__"):
+    # Enforce our own declared scope even when a client dispatcher is broad.
+    # In particular, recovery builds and polling must not consume an override.
+    if not re.fullmatch(HOOK_MATCHER, tool):
         return 0
     try:
         target = target_file(payload)

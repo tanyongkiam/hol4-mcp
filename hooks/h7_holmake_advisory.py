@@ -5,10 +5,9 @@ fits the edit-then-rebuild loop.
 
 Advisory only, never blocks. Keyed on repeats per session (state under
 ~/.claude/hook-state/<session_id>/h7_builds.json): the first build of a
-(workdir, target) is silent, and so is a rebuild with no *Script.sml in the
-workdir modified since the previous build (a retry). A rebuild within 30
-minutes AFTER a script edit is the signature of using holmake to check an
-edit -- that one gets the reminder, worded for that loop.
+(workdir, target) is silent, and so is a rebuild with unchanged authored proof
+text. A rebuild within 30 minutes AFTER a target proof edit gets the reminder.
+Executable assertions, top-level translations and unrelated scripts do not.
 
 Rule source: hol4-proving skill '⛔ RULE A' / 'HOL4 - iteration loop'.
 """
@@ -17,17 +16,21 @@ HOOK_EVENT = "PostToolUse"
 HOOK_MATCHER = "mcp__hol4__holmake"   # None = all calls for this event
 
 import glob
+import hashlib
 import json
 import os
+import re
 import sys
 import time
+
+from proof_sweep import clean, _theorem_windows
 
 STATE = os.path.expanduser("~/.claude/hook-state")
 WINDOW_S = 30 * 60
 
 REMINDER_TEMPLATE = """\
 hol4-hook H7: Holmake ran again on {target}, {mins} min after the previous
-build, with a *Script.sml edited in between -- the edit-then-rebuild loop.
+build, with proof text edited in between -- the edit-then-rebuild loop.
 
 Per hol4-proving skill RULE A: holmake is the FILE-BUILD GATE, not the way to
 check an edit. Read the edit with hol_state_at (it auto-detects the change)
@@ -67,14 +70,24 @@ def save_state(path, state):
         pass
 
 
-def newest_script_mtime(workdir):
-    newest = 0.0
-    for p in glob.glob(os.path.join(workdir, "*Script.sml")):
+def proof_fingerprints(workdir, target):
+    """Only the named target's authored proof blocks, not executable assertions
+    or top-level translation. Unknown/directory targets cover local scripts."""
+    match = re.fullmatch(r"(.+)Theory(?:\.(?:dat|uo|ui|sml|sig))?", target or "")
+    paths = ([os.path.join(workdir, match[1] + "Script.sml")] if match else
+             glob.glob(os.path.join(workdir, "*Script.sml")))
+    result = {}
+    for p in paths:
         try:
-            newest = max(newest, os.path.getmtime(p))
+            with open(p, encoding="utf-8") as source:
+                lines = clean(source.read()).splitlines()
         except OSError:
-            pass
-    return newest
+            continue
+        bodies = ["\n".join(lines[lo:hi]) for lo, hi in _theorem_windows(lines)
+                  if any(re.match(r"^(Proof|Resume)\b", line) for line in lines[lo:hi])]
+        if bodies:
+            result[p] = hashlib.sha256("\n".join(bodies).encode()).hexdigest()
+    return result
 
 
 def main():
@@ -91,14 +104,16 @@ def main():
     state = load_state(path)
     prev = state.get(key)
     now = time.time()
-    state[key] = {"ts": now}
+    proofs = proof_fingerprints(workdir, ti.get("target"))
+    state[key] = {"ts": now, "proofs": proofs}
     save_state(path, state)
     if not prev:
         return 0
     age = now - float(prev.get("ts", 0))
     if not (0 <= age < WINDOW_S):
         return 0
-    if newest_script_mtime(workdir) <= float(prev.get("ts", 0)):
+    if "proofs" not in prev or not any(prev["proofs"].get(p) != h
+                                        for p, h in proofs.items()):
         return 0
     print(json.dumps({
         "hookSpecificOutput": {
