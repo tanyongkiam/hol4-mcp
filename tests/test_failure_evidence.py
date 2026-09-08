@@ -79,3 +79,24 @@ async def test_live_hol_failure_evidence(tmp_path):
         assert record["response"] == output
         assert "evidence integration" in output
         assert "42" in await session.send("40 + 2;", timeout=5)
+
+
+def test_evidence_is_capped_and_discarded_at_exit(monkeypatch):
+    from hol4_mcp import failure_evidence as module
+
+    monkeypatch.setattr(module, "_directories", [])
+    monkeypatch.delenv("HOL4_MCP_KEEP_EVIDENCE", raising=False)
+    evidence = module.FailureEvidence()
+    for n in range(module.KEEP + 5):
+        evidence.record(f"cmd {n}", "Exception- raised", "HOL error")
+    names = sorted(p.name for p in evidence.directory.iterdir())
+    assert len(names) == module.KEEP
+    assert f"failure-{module.KEEP + 5}.json" in names and "failure-1.json" not in names
+    assert evidence.latest["path"].endswith(f"failure-{module.KEEP + 5}.json")
+    directory = evidence.directory
+    monkeypatch.setenv("HOL4_MCP_KEEP_EVIDENCE", "1")
+    module._discard_all()
+    assert directory.exists()
+    monkeypatch.delenv("HOL4_MCP_KEEP_EVIDENCE")
+    module._discard_all()
+    assert not directory.exists()

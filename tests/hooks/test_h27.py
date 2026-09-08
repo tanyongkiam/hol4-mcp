@@ -3,7 +3,6 @@ an `--amend` that changes a statement line is not a proof edit, a lone `>-`
 is H25's advisory and not a blocker, while a body edit adding `cheat` is."""
 import subprocess
 import importlib.util
-import re
 from pathlib import Path
 
 import pytest
@@ -176,77 +175,67 @@ def test_literal_commit_prose_is_not_a_commit_or_substitution(run_hook, repo):
     assert run(run_hook, repo, "git log --grep='git commit'")[0] == 0
 
 
-def test_scoped_wip_approval_survives_status_but_not_new_contents(run_hook, repo):
+def test_wip_ok_in_latest_message_overrides(run_hook, repo):
     stage(repo, "  >- metis_tac []", "  >- cheat")
     command = "git commit -m checkpoint"
     code, err, _ = run(run_hook, repo, command)
-    assert code == 2
-    review = re.search(r"Review ([0-9a-f]{12}):", err).group(1)
-    approval = f"Approve the incomplete-proof checkpoint for review {review}"
-
-    def call(message, history=(), tool="Bash"):
-        return run_hook("h27_commit_audit_gate.py", tool, {"command": command},
-                        cwd=repo, user_msg=message, history=history)
-
-    code, err, out = call(approval, [""])
-    assert code == 0 and "does not grant Git permission" in out, (err, out)
-    state = run_hook.home / ".claude/hook-state/test-session/audit_approvals.json"
-    before = state.read_bytes()
-    assert call("status?", ["", approval], "mcp__hol4__hol_build_status")[0] == 0
-    assert state.read_bytes() == before
-    assert call("status?", ["", approval])[0] == 0
-    stage(repo, "  >- cheat", "  >- (cheat)")
-    code, err, _ = call("keep going", ["", approval, "status?"])
-    assert code == 2 and f"Review {review}:" not in err
-
-
-def test_style_approval_does_not_permit_admission(run_hook, repo):
-    stage(repo, "  >- metis_tac []", "  >- cheat")
-    command = "git commit -m checkpoint"
-    _, err, _ = run(run_hook, repo, command)
-    review = re.search(r"Review ([0-9a-f]{12}):", err).group(1)
+    assert code == 2 and "say `wip ok`" in err
     code, err, _ = run_hook("h27_commit_audit_gate.py", "Bash", {"command": command},
-        cwd=repo, user_msg=f"Approve style exceptions for review {review}", history=[""])
-    assert code == 2 and "Gate 3" in err
-
-
-def test_scoped_approval_with_64_prompt_rolling_transcript(run_hook, repo):
-    stage(repo, "  >- metis_tac []", "  >- cheat")
-    command = "git commit -m checkpoint"
-    prompts = [f"prompt {n}" for n in range(64)]
-
-    def call():
-        return run_hook("h27_commit_audit_gate.py", "Bash", {"command": command},
-                        cwd=repo, user_msg=prompts[-1], history=prompts[:-1])
-
-    code, err, _ = call()
-    assert code == 2
-    review = re.search(r"Review ([0-9a-f]{12}):", err).group(1)
-    prompts = prompts[1:] + [
-        f"Approve the incomplete-proof checkpoint for review {review}"]
-    code, err, out = call()
-    assert code == 0 and "approved incomplete-proof" in out, (err, out)
-    prompts = prompts[1:] + [f"Revoke review {review}"]
-    assert call()[0] == 2
-    prompts = prompts[1:] + ["status?"]
-    assert call()[0] == 2
-
-
-def test_old_wip_phrase_cannot_bypass_content_resolution(run_hook, repo):
+                            cwd=repo, user_msg="git ok wip ok")
+    assert code == 0, err
+    # The override waives the whole audit, unmodelled command shapes included.
     code, err, _ = run_hook("h27_commit_audit_gate.py", "Bash",
-        {"command": "bash -c 'git commit -m x'"}, cwd=repo, user_msg="git ok wip ok")
-    assert code == 2 and "cannot determine" in err
+                            {"command": "bash -c 'git commit -m x'"},
+                            cwd=repo, user_msg="git ok wip ok")
+    assert code == 0, err
 
 
-def test_short_reply_approves_the_disclosed_exception_class(run_hook, repo):
+HEREDOC_MESSAGE = '''git commit -m "$(cat <<'EOF'
+fix: retouch
+
+Body paragraph.
+EOF
+)"'''
+
+
+def test_heredoc_message_is_audited_not_refused(run_hook, repo):
     stage(repo, "  >- metis_tac []", "  >- cheat")
-    command = "git commit -m checkpoint"
-    code, err, _ = run(run_hook, repo, command)
-    assert code == 2 and "Approve an incomplete-proof checkpoint" in err
-    assert "reply yes or OK" in err
-    code, err, out = run_hook("h27_commit_audit_gate.py", "Bash", {"command": command},
-                             cwd=repo, user_msg="OK", history=[""])
-    assert code == 0 and "approved incomplete-proof" in out, (err, out)
+    code, err, _ = run(run_hook, repo, HEREDOC_MESSAGE)
+    assert code == 2 and "Gate 3" in err, err
+    stage(repo, "  >- cheat", "  >- metis_tac []")
+    code, err, _ = run(run_hook, repo, HEREDOC_MESSAGE)
+    assert code == 0, err
+    # An unquoted heredoc is fine too, unless its body carries a substitution.
+    assert run(run_hook, repo, HEREDOC_MESSAGE.replace("<<'EOF'", "<<EOF"))[0] == 0
+    nested = HEREDOC_MESSAGE.replace("Body paragraph.", "$(git add fooScript.sml)")
+    code, err, _ = run(run_hook, repo, nested.replace("<<'EOF'", "<<EOF"))
+    assert code == 2 and "cannot determine the proposed commit" in err
+
+
+def test_repository_without_scripts_is_not_gated(run_hook, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    git(plain, "init", "-q")
+    (plain / "README").write_text("x\n")
+    git(plain, "add", "README")
+    for command in ("git add README && git commit -m x", "bash -c 'git commit -m x'",
+                    "git -c user.name=me commit -S -m x", "git commit -m x && git push"):
+        code, err, _ = run_hook("h27_commit_audit_gate.py", "Bash",
+                                {"command": command}, cwd=plain)
+        assert code == 0, (command, err)
+    # Outside any repository the audit is vacuous as well.
+    code, err, _ = run_hook("h27_commit_audit_gate.py", "Bash",
+                            {"command": "git commit -m x"}, cwd=tmp_path)
+    assert code == 0, err
+
+
+def test_gate_follows_cd_and_git_C_to_the_script_repository(run_hook, repo, tmp_path):
+    stage(repo, "  >- metis_tac []", "  >- cheat")
+    for command in (f"git -C '{repo}' commit -m x && git push",
+                    f"cd '{repo}' && git commit -m x && git push"):
+        code, err, _ = run_hook("h27_commit_audit_gate.py", "Bash",
+                                {"command": command}, cwd=tmp_path)
+        assert code == 2 and "separate tool calls" in err, (command, err)
 
 
 def test_deleted_finalise_is_blocked(run_hook, repo):

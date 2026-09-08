@@ -22,14 +22,13 @@ def git(args, cwd, *, optional=False):
     return proc.stdout
 
 
-def commit_args(command, cwd):
-    """Return (Git cwd, commit argv), or None for a non-commit command."""
+def _parts(command):
+    """The simple commands of a shell command line, split at control operators."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
-    tokens = list(lexer)
     parts, part = [], []
-    for token in tokens:
+    for token in lexer:
         if token in (";", "&&", "||", "|", "&", "\n"):
             if part:
                 parts.append(part)
@@ -38,6 +37,41 @@ def commit_args(command, cwd):
             part.append(token)
     if part:
         parts.append(part)
+    return parts
+
+
+def repo_hint(command, cwd):
+    """Best-effort directory the commit addresses: a `cd`, a `git -C`, else
+    `cwd`. Never raises; it only decides whether the audit applies at all."""
+    try:
+        parts = _parts(command)
+    except ValueError:
+        return cwd
+    for words in parts:
+        if words[0] == "cd" and len(words) == 2:
+            cwd = str(Path(cwd, words[1]).resolve())
+        elif words[0] == "git":
+            i = 1
+            while i < len(words) and words[i].startswith("-"):
+                if words[i] == "-C" and i + 1 < len(words):
+                    return str(Path(cwd, words[i + 1]).resolve())
+                i += 1
+    return cwd
+
+
+def tracks_scripts(cwd):
+    """True if the repository at `cwd` tracks any `*Script.sml`."""
+    try:
+        proc = subprocess.run(["git", "ls-files", "-z", "--", "*Script.sml"],
+                              cwd=cwd, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and bool(proc.stdout.strip(b"\0"))
+
+
+def commit_args(command, cwd):
+    """Return (Git cwd, commit argv), or None for a non-commit command."""
+    parts = _parts(command)
     found = []
     preceding = False
     for words in parts:
@@ -160,7 +194,8 @@ def snapshot(command, cwd):
     for path in sorted(candidates):
         if not path.endswith("Script.sml"):
             continue
-        before = git(["cat-file", "blob", head[path]], root).decode() if path in head else ""
+        before = (git(["cat-file", "blob", head[path]], root).decode("utf-8", errors="replace")
+                  if path in head else "")
         if path in overlay:
             # Git clean filters and encodings may produce different bytes.
             # Do not run contributor-controlled filters during a read-only audit.
@@ -168,11 +203,12 @@ def snapshot(command, cwd):
             if any(not line.endswith((": unspecified", ": unset")) for line in attrs.splitlines()):
                 raise AuditUnavailable(f"{path} has Git content filters; stage it and commit the index")
             try:
-                after = Path(root, path).read_text()
+                after = Path(root, path).read_text(encoding="utf-8", errors="replace")
             except FileNotFoundError:
                 after = ""
         else:
-            after = git(["cat-file", "blob", prospective[path]], root).decode() if path in prospective else ""
+            after = (git(["cat-file", "blob", prospective[path]], root).decode("utf-8", errors="replace")
+                     if path in prospective else "")
         if before != after:
             files[path] = (before, after)
     return root, files

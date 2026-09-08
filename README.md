@@ -199,8 +199,10 @@ Status inspection does not replay HOL commands or reap busy sessions.
 
 Failure evidence is written only on failures: complete submitted SML and
 returned response, phase metadata when available, workdir, PID and heap limit.
-The reported JSON path (also shown by `hol_sessions`) is retained in a private
-temporary directory after session stop. These files can contain project source.
+The reported JSON path (also shown by `hol_sessions`) lives in a private
+temporary directory holding the newest 20 per session; the directory is removed
+when the server exits unless `HOL4_MCP_KEEP_EVIDENCE` is set. These files can
+contain project source.
 Replies are decoded/framed and normally ANSI-normalized, not a byte-level pipe
 capture; interrupted requests retain the available partial response. Failed
 diagnostic writes never change the proof result. Admission history is reported

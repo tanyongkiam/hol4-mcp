@@ -22,11 +22,14 @@ Checks (skill audit gates 1, 2, 3, 5, 6 + the composition sweep):
   Gate 6  a `[local]` helper added that is used once
   sweep   proof_sweep.py over each touched theorem
 
-Exceptions require approval of the displayed content-scoped review and finding
-class. Audit exceptions and permission to execute Git are separate.
+Override: put `wip ok` in the message alongside `git ok`. Deliberate WIP commits
+are legitimate; silently unenforceable gates are not.
 
-An ambiguous prospective commit is reported as unavailable, not silently
-audited against the wrong content. Stage separately and commit the index.
+Outside a repository that tracks `*Script.sml` the audit is vacuous and nothing
+is refused. Inside one, an ambiguous prospective commit (a compound command, a
+substitution, a shell wrapper, an unknown option) is refused with the reason,
+never audited against the wrong content: stage separately and commit the index.
+A message piped from a heredoc whose body the shell would not execute is fine.
 """
 
 HOOK_EVENT = "PreToolUse"
@@ -40,10 +43,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import proof_sweep  # noqa: E402
-from hook_payload import emit_context, visible_command  # noqa: E402
+from hook_payload import latest_user_message, visible_command  # noqa: E402
 from h14_git_destructive_consent import find_match  # noqa: E402
-from git_commit_snapshot import snapshot, AuditUnavailable  # noqa: E402
-from audit_approval import review_id, approved_classes, finding_class  # noqa: E402
+from git_commit_snapshot import (  # noqa: E402
+    snapshot, repo_hint, tracks_scripts, AuditUnavailable,
+)
+
+OVERRIDE_RE = re.compile(r"\bwip\s+ok\b", re.IGNORECASE)
+# A commit message piped from a heredoc: `hook_payload.visible_command` has
+# blanked the body, so only empty lines may remain between the tag line and
+# its terminator -- anything else is text the shell would execute.
+HEREDOC_MESSAGE_RE = re.compile(
+    r"\$\(\s*cat\s+<<-?\s*['\"]?(\w+)['\"]?[ \t]*\n(?:[ \t]*\n)*[ \t]*\1[ \t]*\n\s*\)")
 
 BANNED = [(re.compile(r"\bTRY\b"), "TRY"), (re.compile(r"\bORELSE\b"), "ORELSE"),
           (re.compile(r"\bFIRST\b"), "FIRST"), (re.compile(r"\bTHENL\b"), "THENL"),
@@ -173,11 +184,19 @@ def main():
     if not re.search(r"\bgit\b", command) or not re.search(r"\bcommit\b", command):
         return 0
 
+    latest = latest_user_message(payload)
+    if latest and OVERRIDE_RE.search(latest):
+        return 0
+
+    cwd = payload.get("cwd") or os.getcwd()
+    if not tracks_scripts(repo_hint(command, cwd)):
+        return 0                                   # nothing to audit: pass every form
+
     try:
-        visible = visible_command(command)
+        visible = HEREDOC_MESSAGE_RE.sub("", visible_command(command))
         if ("$(" in visible or "`" in visible) and find_match(command) == "git commit":
             raise AuditUnavailable("command substitutions can change the index; use a literal commit call")
-        proposed = snapshot(command, payload.get("cwd") or os.getcwd())
+        proposed = snapshot(command, cwd)
         if proposed is None and find_match(command) == "git commit":
             raise AuditUnavailable("shell-wrapped commit cannot be audited; use a plain commit call")
     except (AuditUnavailable, ValueError) as error:
@@ -185,7 +204,7 @@ def main():
         return 2
     if proposed is None:
         return 0
-    _cwd, files = proposed
+    _root, files = proposed
 
     findings = []                                  # [(file, theorem, line, msg)]
     for f, (before, after) in files.items():
@@ -193,16 +212,6 @@ def main():
         findings += [(f, block_of(blks, ln), ln, msg) for ln, msg in audit(before, after)]
     if not findings:
         return 0
-
-    review = review_id(_cwd, command, files, findings)
-    approved = approved_classes(payload, review, {finding_class(f[3]) for f in findings})
-    remaining = [f for f in findings if finding_class(f[3]) not in approved]
-    if not remaining:
-        emit_context(f"[H27: review {review} — approved {', '.join(sorted(approved))} "
-                     "exceptions for these exact proof contents/command; "
-                     "this does not grant Git permission or establish proof completeness.]")
-        return 0
-    findings = remaining
 
     print(f"hol4-hook H27: refused the commit — the audit gates flag "
           f"{len(findings)} thing(s) in the proof code it would record.",
@@ -223,16 +232,8 @@ def main():
           "PROMPT TO CHECK, not a proven defect — simplification is not "
           "confluent, so verify per theorem before collapsing anything.",
           file=sys.stderr)
-    classes = sorted({finding_class(f[3]) for f in findings})
-    question = " and ".join("style exceptions" if c == "style" else
-                            "an incomplete-proof checkpoint" for c in classes)
-    print(f"Review {review}: unapproved classes {', '.join(classes)}. "
-          f"Approve {question} for this exact review? "
-          "If this is the only pending audit review, reply yes or OK as your "
-          "next message. Otherwise name the review and exception class. "
-          "Approval expires after 30 minutes and cannot cover changed proof "
-          "contents/commands. Audit approval grants no permission to commit or push.",
-          file=sys.stderr)
+    print("If this is a deliberate work-in-progress commit, say `wip ok` "
+          "(alongside `git ok`).", file=sys.stderr)
     return 2
 
 
