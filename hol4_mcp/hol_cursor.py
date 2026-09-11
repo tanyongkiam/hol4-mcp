@@ -534,8 +534,14 @@ class FileProofCursor:
         self._phase: dict = {}
 
         # Seconds spent (re)starting HOL and loading dependencies since the
-        # last navigation reported them (`startup=` in the Timing line).
+        # last navigation reported them (`startup=` in the Timing line), and
+        # what incurred them, so a slow prefix can be attributed to its cause
+        # rather than read as an inherent cost of the file.
         self._startup_seconds: float = 0.0
+        self._startup_cause: str | None = None
+        # Why the pending full reinit was scheduled (None: not pending, or
+        # scheduled without a stated reason).
+        self._reinit_reason: str | None = None
 
         # perf_counter at which the current navigation began replaying the
         # TARGET theorem's own tactics (None until the prefix is in place), so
@@ -692,10 +698,14 @@ class FileProofCursor:
         self._dep_parent_stamps.update(parents)
         return None
 
-    def _schedule_full_reinit(self) -> None:
+    def _schedule_full_reinit(self, reason: str | None = None) -> None:
         """Rebuild the session from scratch on the next call: drop every
-        cache and checkpoint, the deps-only one included."""
+        cache and checkpoint, the deps-only one included.
+
+        ``reason`` is reported with the startup time the reinit costs.
+        """
         self._needs_session_reinit = True
+        self._reinit_reason = reason
         self._context_rewind_pending = False
         self._loaded_to_line = 0
         self._loaded_content_hash = ""
@@ -734,7 +744,8 @@ class FileProofCursor:
         rebuilt = self._check_dep_artifacts()
         if rebuilt is not None:
             self._dep_artifacts = {}
-            self._schedule_full_reinit()
+            self._schedule_full_reinit(
+                f"session reload: ancestor {rebuilt} rebuilt since it was loaded")
             self._session_notices.append(
                 f"[Session reloaded: ancestor {rebuilt} rebuilt since it was "
                 f"loaded; dependencies and prefix replayed from the new artifacts]")
@@ -742,9 +753,13 @@ class FileProofCursor:
         if content_hash == self._content_hash:
             return False
 
-        # Find first changed line before updating
+        # Find first changed line before updating. A fresh cursor's first parse
+        # is not an edit: nothing is loaded or cached, and init builds the
+        # session that the "edit at line 1, before the first theorem" reading
+        # would otherwise schedule a second time.
         old_content = self._content
-        first_changed = self._first_changed_line(old_content, content)
+        first_changed = (self._first_changed_line(old_content, content)
+                         if old_content else None)
 
         self._content = content
         self._content_hash = content_hash
@@ -754,10 +769,17 @@ class FileProofCursor:
 
         # Invalidate checkpoints and traces for theorems at or after the change
         if first_changed is not None:
-            # Whether the edit lands in a suspend/Resume chain that is currently
-            # BROKEN (a body auto-cheated / a child orphaned). Read this BEFORE
-            # _invalidate_from_line clears the _failed_proofs verdicts it keys on.
-            chain_broken = self._affected_chain_is_broken(first_changed)
+            # An edit landing in a suspend/Resume chain that is currently BROKEN
+            # (a body auto-cheated, its children orphaned) is invalidated like
+            # any other edit: the prefix is truncated to the edited block and,
+            # if that block had run, the next enter_theorem rewinds to a context
+            # checkpoint — a Poly/ML heap image taken before it ran — which
+            # restores markerLib's suspension stores along with everything
+            # else, so the fixed block re-registers its labels on the partial
+            # path. What a broken chain does owe the caller is an account of
+            # the cost its red member adds to every reload; built BEFORE
+            # _invalidate_from_line drops the _failed_proofs verdicts it names.
+            chain_notice = self._broken_chain_notice(first_changed)
 
             self._invalidate_from_line(first_changed)
             # Also reset loaded context tracking - can't trust context after change point.
@@ -782,32 +804,20 @@ class FileProofCursor:
                 self._loaded_to_line = boundary if boundary > 1 else 0
                 self._loaded_content_hash = ""  # Empty string = needs recompute
 
-            # Fixing a broken suspend/Resume chain: the session-global suspension
-            # store is append/consume-only and cannot be partially rolled back, so
-            # a fixed dispatcher's sub-`suspend`s only re-register their children in
-            # a CLEAN session. Force a session reinit (restart + replay from deps)
-            # so the whole chain re-runs and orphaned children ("No such label")
-            # come back — exactly what previously required a manual hol_stop + cold
-            # reload. Gated on chain_broken so ordinary edits to a HEALTHY
-            # suspend/Resume proof keep their fast partial replay.
-            if chain_broken:
-                self._needs_session_reinit = True
-                self._loaded_to_line = 0
-                self._loaded_content_hash = ""
-                self._pos = SessionPosition()
-                self._active_theorem = None
-                self._invalidate_all_checkpoints()
-                self._proof_traces.clear()
-                self._tc_goals.clear()
-                self._resume_goals.clear()
-                self._failed_proofs.clear()
-                self._theorem_oracles.clear()
+            if chain_notice:
+                self._session_notices.append(chain_notice)
 
             # If change is before first theorem, pre-theorem context may have changed
             # (e.g., open/Theory/Ancestors). Rebuild HOL session on next query.
             first_thm_line = self._theorems[0].start_line if self._theorems else None
             if first_thm_line and first_changed < first_thm_line:
-                self._schedule_full_reinit()
+                reason = (f"session reinit: the edit at line {first_changed} "
+                          f"precedes the first theorem (line {first_thm_line}), "
+                          f"so the header/open context may have changed")
+                self._schedule_full_reinit(reason)
+                self._session_notices.append(
+                    f"[{reason.capitalize()}; HOL restarts, dependencies reload "
+                    f"and the prefix replays from line 1]")
 
         # Clear active theorem if it was renamed/deleted
         if self._active_theorem:
@@ -873,6 +883,10 @@ class FileProofCursor:
         if not self._needs_session_reinit:
             return None
         t_start = time.perf_counter()
+        reason, self._reinit_reason = self._reinit_reason, None
+        self._startup_cause = reason or (
+            "session reinit: HOL restart, dependency reload and prefix "
+            "replay from line 1")
 
         # Restart HOL process for a clean top-level environment
         if self.session.is_running:
@@ -893,6 +907,7 @@ class FileProofCursor:
         self._startup_seconds += time.perf_counter() - t_start
         if init_result.get("error"):
             self._needs_session_reinit = True
+            self._reinit_reason = reason
             return init_result["error"]
 
         return None
@@ -1345,10 +1360,10 @@ class FileProofCursor:
         and at least one member reaches to/past it.
 
         A chain lying entirely AFTER the change is NOT affected — none of its
-        text changed and it has not run, so its suspension store is not stale
-        and it owes no reinit. Scoping by straddling (rather than "every
-        theorem after the change") is what keeps an unrelated broken chain
-        later in the file from forcing a full session reinit on every edit.
+        text changed and it has not run, so nothing of its registered state
+        is stale. Scoping by straddling (rather than "every theorem after
+        the change") is what keeps an unrelated broken chain later in the
+        file from being blamed for an edit elsewhere.
 
         The root of a ``Resume thm[label]`` is the Theorem named ``thm`` (its
         ``suspension_name``); a ``Theorem``/``Triviality`` whose body contains
@@ -1381,17 +1396,100 @@ class FileProofCursor:
         that currently has a failed/auto-cheated/orphaned body recorded in
         ``_failed_proofs``.
 
-        Such a chain's suspension store is stale (a label was consumed by an
-        auto-cheat, or a sub-`suspend` never ran), so it cannot be partially
-        replayed — it must be re-run from a clean session. A healthy chain
-        (nothing in ``_failed_proofs``) is left to the normal fast partial path,
-        and so is a broken chain that the change does not touch.
+        Such a chain replays like any other after an edit (the rewind to a
+        context checkpoint restores the suspension stores with the heap);
+        what distinguishes it is that the red member re-runs and re-fails on
+        every load, which ``_broken_chain_notice`` reports. A broken chain the
+        change does not touch is not the edit's concern.
         """
         return any(
             member.name in self._failed_proofs
             for root in self._affected_chain_roots(start_line)
             for member in self._chain_members(root.name)
         )
+
+    _CHAIN_REMEDY = (
+        "Keep loaded bodies green: end an unfinished arm in `cheat` or "
+        "`>- suspend \"Label\"` and iterate inside its Resume body.")
+
+    @staticmethod
+    def _suspended_labels(thm: TheoremInfo) -> list[str]:
+        """Labels a body registers when it runs (``suspend "X"`` occurrences)."""
+        return re.findall(r'suspend\s*"([^"]+)"', thm.proof_body or "")
+
+    def _broken_chain_notice(self, start_line: int) -> str | None:
+        """Account of the broken suspend/Resume chain(s) a change at
+        ``start_line`` lands in, or None when every affected chain is healthy.
+
+        A member in ``_failed_proofs`` either failed at load and was
+        auto-cheated (so the labels its body suspends were never registered
+        and their Resume blocks are orphaned — "No such label"), or is such an
+        orphan itself. Each reload past a failed body re-runs it, up to
+        PER_THEOREM_TIMEOUT, and auto-cheats it again unless the edit fixed it;
+        the notice attributes that recurring cost to the red member.
+        """
+        if not self._affected_chain_is_broken(start_line):
+            return None
+        out: list[str] = []
+        for root in self._affected_chain_roots(start_line):
+            members = self._chain_members(root.name)
+            failed = [m for m in members if m.name in self._failed_proofs]
+            if not failed:
+                continue
+            red = [m for m in failed
+                   if not self._failed_proofs[m.name].startswith("label not found")]
+            labels = {lab for m in red for lab in self._suspended_labels(m)}
+            orphans = [m.name for m in members
+                       if m not in red
+                       and (m.label_name in labels or m.name in self._failed_proofs)]
+            if red:
+                red_str = "; ".join(
+                    f"{m.name} (line {m.start_line}) failed at load — "
+                    f"{self._failed_proofs[m.name]}" for m in red)
+                orphan_str = (
+                    f" Its `suspend` labels were never registered, so "
+                    f"{', '.join(orphans)} cannot be resumed (\"No such label\")."
+                    if orphans else "")
+                out.append(
+                    f"[Broken suspend/Resume chain `{root.name}`: {red_str}."
+                    f"{orphan_str} The reload after this edit re-runs that body "
+                    f"(up to {PER_THEOREM_TIMEOUT}s) and auto-cheats it again "
+                    f"unless the edit fixed it; only the prefix from the edited "
+                    f"block on is replayed. {self._CHAIN_REMEDY}]")
+            else:
+                out.append(
+                    f"[Broken suspend/Resume chain `{root.name}`: "
+                    f"{', '.join(orphans)} could not be resumed (label not found "
+                    f"at load) although no member failed — no loaded body of "
+                    f"this chain suspends that label; check the label name.]")
+        return "\n".join(out) if out else None
+
+    def _record_failed_proof(self, thm: TheoremInfo, reason: str) -> None:
+        """Record an auto-cheat verdict. For a suspend/Resume chain member —
+        a Resume block, or a Theorem that suspends — also queue a notice that
+        names the Resume blocks its labels would have served and what the red
+        body costs every load from now on."""
+        self._failed_proofs[thm.name] = reason
+        if thm.kind == "Resume":
+            root = thm.suspension_name
+        elif thm.kind in ("Theorem", "Triviality") and re.search(
+                r'\bsuspend\b', thm.proof_body or ""):
+            root = thm.name
+        else:
+            return
+        labels = set(self._suspended_labels(thm))
+        orphans = [t.name for t in self._theorems
+                   if t.kind == "Resume" and t.suspension_name == root
+                   and t.label_name in labels]
+        orphan_str = (
+            f" Its `suspend` labels were never registered, so "
+            f"{', '.join(orphans)} cannot be resumed (\"No such label\")."
+            if orphans else "")
+        self._session_notices.append(
+            f"[Auto-cheated {thm.kind} {thm.name} (line {thm.start_line}) "
+            f"after its body failed at load: {reason}.{orphan_str} Every load "
+            f"past it re-runs this body (up to {PER_THEOREM_TIMEOUT}s) and "
+            f"auto-cheats it again until it loads green. {self._CHAIN_REMEDY}]")
 
     async def init(self) -> dict:
         """Initialize cursor - parse file and load deps.
@@ -1542,7 +1640,7 @@ class FileProofCursor:
                     f"Resume '{thm.name}' failed (line {thm.start_line}) "
                     f"and could not be cheated: {result}"
                 )
-            self._failed_proofs[thm.name] = reason
+            self._record_failed_proof(thm, reason)
             return None
 
         attrs = f"[{','.join(thm.attributes)}]" if thm.attributes else ""
@@ -1555,14 +1653,14 @@ class FileProofCursor:
         # (residual output from the original failed proof can pollute the result,
         # so checking for errors is unreliable — check for success instead)
         if f"val {thm.name}" in result:
-            self._failed_proofs[thm.name] = reason
+            self._record_failed_proof(thm, reason)
             return None
         if _is_hol_error(result):
             return (
                 f"Proof of '{thm.name}' failed (line {thm.start_line}) "
                 f"and could not be cheated: {result[-500:]}"
             )
-        self._failed_proofs[thm.name] = reason
+        self._record_failed_proof(thm, reason)
         return None
 
     async def _cheat_skip_theorem(self, thm: TheoremInfo) -> bool:
@@ -1865,7 +1963,12 @@ class FileProofCursor:
             if not restored:
                 restored = await self._restore_to_deps()
             if not restored:
-                self._schedule_full_reinit()
+                reason = ("session reinit: no context or deps checkpoint "
+                          "could be restored to rewind past the edit")
+                self._schedule_full_reinit(reason)
+                self._session_notices.append(
+                    f"[{reason.capitalize()}; HOL restarts, dependencies "
+                    f"reload and the prefix replays from line 1]")
                 error = await self._reinitialize_session_if_needed()
                 if error:
                     return {"error": error}
@@ -2673,6 +2776,7 @@ class FileProofCursor:
         # call the user is waiting on: start the clock that much earlier.
         pre_startup = self._startup_seconds
         self._startup_seconds = 0.0
+        pre_cause, self._startup_cause = self._startup_cause, None
         self._target_replay_started = None
         t0 = time.perf_counter() - pre_startup
 
@@ -2687,6 +2791,9 @@ class FileProofCursor:
         changed = await self._prepare_session(line, col, timings)
         timings['startup'] = pre_startup + self._startup_seconds
         self._startup_seconds = 0.0
+        cause, self._startup_cause = self._startup_cause or pre_cause, None
+        if cause:
+            timings['startup_cause'] = cause
         if isinstance(changed, StateAtResult):
             return changed
         timings['file_changed'] = 1 if changed else 0

@@ -411,18 +411,29 @@ _slow_nav_counts: dict[tuple[str, str, str], int] = {}
 
 
 def _slow_nav_lines(session: str, file, theorem: str | None,
-                    elapsed_secs: float, prefix_secs: float = 0) -> list[str]:
+                    elapsed_secs: float, prefix_secs: float = 0,
+                    cause: str | None = None) -> list[str]:
     """Warn when the SAME theorem is navigated slowly more than once.
 
     One slow replay is the unavoidable cold start. Every later one re-pays for a
     replayed unit that should have been shrunk instead, so the COUNT — not the
     duration — is the signal.
+
+    ``cause`` names what the prefix/setup time was spent on when the cursor
+    knows (a cold init, a scheduled session reinit and why); a slow prefix
+    with a known cause is attributed to it rather than left to be guessed at.
     """
     if not theorem or elapsed_secs < _SLOW_NAV_SECS:
         return []
     if prefix_secs >= _SLOW_NAV_SECS and elapsed_secs - prefix_secs < _SLOW_NAV_SECS:
+        target = max(0, elapsed_secs - prefix_secs)
+        if cause:
+            return ["", f"[Slow prefix/setup: {prefix_secs:.1f}s — {cause}; "
+                    f"target replay {target:.1f}s. The prefix cost belongs to "
+                    "that setup, not to this theorem's tactics; this timing "
+                    "does not justify splitting the target proof.]"]
         return ["", f"[Slow prefix/setup: {prefix_secs:.1f}s; target replay "
-                f"{max(0, elapsed_secs - prefix_secs):.1f}s. Inspect current-file "
+                f"{target:.1f}s. Inspect current-file "
                 "translation/dependency loads and checkpoint reuse; this timing "
                 "does not justify splitting the target proof.]"]
     key = (session, str(file or ""), theorem)
@@ -1993,6 +2004,7 @@ async def _init_file_cursor(
 
     init_time = time.perf_counter() - t0
     cursor._startup_seconds = time.perf_counter() - t_begin
+    cursor._startup_cause = "cold init: HOL start and dependency load"
     cursor._session_notices.extend(notices)
 
     _sessions[session].cursor = cursor
@@ -2145,11 +2157,26 @@ async def hol_state_at(
       - "[Session restarted: workdir A → B ...]" — file= lives in another
         workdir; the session moved there. A's loaded context and open
         suspensions are gone.
+      - "[Session reinit: <why>; HOL restarts, dependencies reload ...]" —
+        a full rebuild was owed (an edit before the first theorem; no
+        checkpoint left to rewind to). Ordinary edits, including edits
+        inside a suspend/Resume chain, replay from the edited block only.
+      - "[Auto-cheated Resume R[L] (line N) after its body failed at load:
+        ...]" — a chain member went red while loading the prefix. It names
+        the Resume blocks its `suspend` labels would have served (now "No
+        such label") and warns that every later load re-runs and re-fails
+        that body. Make it green first: end the unfinished arm in `cheat`
+        or `>- suspend "Label"`, then iterate inside the Resume body.
+      - "[Broken suspend/Resume chain `R`: R[L] (line N) failed at load —
+        ...]" — this edit landed in a chain with such a red member; the
+        reload re-runs that body and auto-cheats it again unless the edit
+        fixed it. The cost is the red arm's, not the file's.
       - "[Timing: total=..., replay=..., startup=...]" — startup is HOL
         start plus dependency loads (cold init or reload); replay is this
         theorem's tactics only. A slow call with startup≈total is a heavy
         dependency load (see HOL4_MCP_DEP_LOAD_TIMEOUT / HOLHEAP), not a
-        slow proof.
+        slow proof. "[Slow prefix/setup: Ps — <cause>; ...]" names what
+        the prefix time was spent on when the session knows.
 
     Returns: Proof position, goals at that position, errors if any
     """
@@ -2455,7 +2482,8 @@ async def hol_state_at(
         lines.extend(_slow_nav_lines(session, cursor.file, active_theorem,
                                      result.timings.get('total', 0),
                                      max(0, result.timings.get('total', 0) -
-                                         result.timings.get('replay', 0))))
+                                         result.timings.get('replay', 0)),
+                                     cause=result.timings.get('startup_cause')))
 
     _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)
@@ -2532,7 +2560,7 @@ async def hol_check_proof(
         # deleting _failed_proofs would leave the old admitted ML binding live.
         if not cursor._get_theorem(theorem):
             return f"ERROR: Theorem '{theorem}' not found"
-        cursor._schedule_full_reinit()
+        cursor._schedule_full_reinit("fresh verification requested")
         cursor._skip_prefix = False
         cursor._skipped_thms.clear()
         cursor._session_notices.append(

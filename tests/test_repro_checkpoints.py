@@ -405,34 +405,14 @@ BROKEN_CHAIN_SCRIPT = (
 )
 
 BROKEN_BODY_IDX = 17     # 0-based index of chain[c2]'s body (line 18)
-
-# Any wording that names the pending work counts as disclosure.
-_COST_TOKENS = ("reinit", "restart", "replay", "reload", "cold",
-                "invalidat", "discard", "from deps", "dependencies")
+C2_START_LINE = 17       # "Resume chain[c2]:"
 
 
-def _disclosure(status: dict) -> list[str]:
-    """Entries of ``status`` that name the pending reload cost. The file path is
-    excluded — a directory name must not count as a report."""
-    found = []
-    for key, value in status.items():
-        if key in ("file", "file_hash"):
-            continue
-        text = f"{key} {value}".lower()
-        if any(tok in text for tok in _COST_TOKENS):
-            found.append(f"{key}={value!r}")
-    return found
-
-
-def test_broken_chain_edit_discloses_pending_cold_replay(tmp_path: Path):
-    """The forced session reinit is deliberate; its COST must be visible.
-
-    Not tested here: that the reinit happens (it must — the suspension store is
-    append/consume-only). Tested: after the edit, the caller-facing status
-    reports, in some form, that the session will be restarted and the prefix
-    re-replayed from dependencies. In the field that path cost 490s and nothing
-    warned; ``status`` afterwards is indistinguishable from a cursor that has
-    simply not loaded anything yet.
+def test_broken_chain_edit_keeps_prefix_and_names_the_red_arm(tmp_path: Path):
+    """An edit inside a broken chain is an ordinary partial edit: no session
+    restart is armed and the prefix before the edited block is kept. The cost
+    it does carry — the red arm re-runs on every load until it is green — is
+    disclosed by name rather than paid silently.
     """
     script = tmp_path / "reprockptchainScript.sml"
     script.write_text(BROKEN_CHAIN_SCRIPT)
@@ -455,13 +435,21 @@ def test_broken_chain_edit_discloses_pending_cold_replay(tmp_path: Path):
     lines[BROKEN_BODY_IDX] = "  metis_tac []"
     script.write_text("\n".join(lines))
     assert cursor._reparse_if_changed(), "setup: edit not detected"
-    assert cursor._needs_session_reinit, \
-        "setup: the broken-chain edit did not arm the session reinit"
+    assert not cursor._needs_session_reinit, (
+        "a one-line edit inside a broken chain armed a full session restart "
+        "plus a replay of the whole prefix from dependencies"
+    )
 
     status = cursor.status
-    assert _disclosure(status), (
-        "a one-line edit armed a full session restart plus a replay of the "
-        "whole prefix from dependencies, and status discloses none of it: "
-        f"loaded_to_line={status['loaded_to_line']}, stale={status['stale']}, "
-        f"checkpoints left={sorted(cursor._checkpoints)}"
+    assert "pending_work" not in status, status["pending_work"]
+    assert status["loaded_to_line"] == C2_START_LINE, (
+        f"prefix should be kept up to the edited block, got "
+        f"loaded_to_line={status['loaded_to_line']}"
+    )
+    assert {"chain", "chain[c1]"} <= set(cursor._checkpoints), (
+        f"checkpoints before the edit discarded: {sorted(cursor._checkpoints)}"
+    )
+    notices = "\n".join(cursor.take_notices())
+    assert "chain[c2]" in notices and "RES_TAC failed" in notices, (
+        f"the red arm's cost is not disclosed: {notices!r}"
     )

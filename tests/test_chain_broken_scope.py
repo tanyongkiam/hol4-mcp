@@ -1,16 +1,15 @@
-"""Scope regression for the broken-chain session-reinit gate.
+"""Scope regression for the broken-chain gate.
 
-``_reparse_if_changed`` forces a FULL session reinit (restart + replay of the
-whole file prefix) when an edit lands in a suspend/Resume chain that is
-currently broken. That is correct for the chain being edited — its suspension
-store is stale, so children must re-register from a clean session.
+``_affected_chain_is_broken`` decides whether an edit lands in a suspend/Resume
+chain that currently has an auto-cheated or orphaned member. What hangs off it
+is the "[Broken suspend/Resume chain ...]" notice ``_reparse_if_changed``
+queues (see test_broken_chain_partial_reload.py for the reload behaviour).
 
 The bug: both ``_suspension_chain_root_line`` and ``_affected_chain_is_broken``
 scanned every theorem with ``proof_end_line >= start_line`` — the edited
-theorem AND EVERYTHING AFTER IT. So a broken chain LATER in the file made every
-edit to an EARLIER chain trigger the reinit, even though that later chain was
-untouched by the edit and had not run. On a large script the reinit is a
-multi-minute prefix reload, paid on every keystroke-sized edit.
+theorem AND EVERYTHING AFTER IT. So a broken chain LATER in the file was
+blamed for every edit to an EARLIER chain, even though that later chain was
+untouched by the edit and had not run.
 
 These helpers are pure over the parsed file state, so no HOL session is needed.
 """
@@ -77,33 +76,32 @@ def test_later_broken_chain_does_not_taint_edit_in_earlier_chain(tmp_path: Path)
 
     assert not cursor._affected_chain_is_broken(EARLY_BODY_LINE), (
         "edit in the `early` chain was judged broken because an unrelated LATER "
-        "chain (`late`) has a failed body — this forces a full session reinit "
-        "and a multi-minute prefix reload on every edit"
+        "chain (`late`) has a failed body"
     )
 
 
-def test_broken_chain_containing_the_edit_still_triggers_reinit(tmp_path: Path):
-    """The feature itself must survive: editing a chain that IS broken still
-    reports broken, so its children re-register from a clean session."""
+def test_broken_chain_containing_the_edit_still_reports_broken(tmp_path: Path):
+    """The gate itself must survive: editing a chain that IS broken still
+    reports broken, so the red member gets named."""
     cursor = _cursor(tmp_path)
     cursor._failed_proofs = {"early[e2]": "auto-cheated"}
 
     assert cursor._affected_chain_is_broken(EARLY_BODY_LINE), (
-        "editing a chain with a failed body must still force the reinit"
+        "editing a chain with a failed body must still report broken"
     )
 
 
-def test_edit_in_later_broken_chain_still_triggers_reinit(tmp_path: Path):
+def test_edit_in_later_broken_chain_still_reports_broken(tmp_path: Path):
     """Editing the broken chain itself, from inside it, still reports broken."""
     cursor = _cursor(tmp_path)
     cursor._failed_proofs = {"late[L1]": "auto-cheated"}
 
     assert cursor._affected_chain_is_broken(LATE_BODY_LINE), (
-        "editing the broken `late` chain must still force the reinit"
+        "editing the broken `late` chain must still report broken"
     )
 
 
-def test_healthy_chains_never_trigger_reinit(tmp_path: Path):
+def test_healthy_chains_never_report_broken(tmp_path: Path):
     cursor = _cursor(tmp_path)
     cursor._failed_proofs = {}
 
