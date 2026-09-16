@@ -1975,7 +1975,8 @@ async def _init_file_cursor(
         # Check if file content changed - session has stale definitions
         elif entry and entry.cursor:
             old_cursor = entry.cursor
-            if Path(old_cursor.file).resolve() == file_path:
+            old_file = Path(old_cursor.file).resolve()
+            if old_file == file_path:
                 # Same file - check if content changed
                 old_hash = old_cursor._content_hash
                 new_content = file_path.read_text()
@@ -1984,6 +1985,20 @@ async def _init_file_cursor(
                     # File changed - restart session to clear stale definitions
                     await hol_stop(session)
                     s = None
+            else:
+                # Another script in the same workdir. Its new_theory would
+                # make HOL export the current, partially replayed theory
+                # segment into the workdir (Theory.new_theory exports a
+                # non-empty current segment before creating the next one),
+                # and Holmake would then take that truncated export for an
+                # up-to-date build. A fresh process has no segment to export.
+                notices.append(
+                    f"[Session restarted: file {old_file.name} → {file_path.name}; "
+                    f"the previous file's loaded context and open suspensions "
+                    f"were dropped]"
+                )
+                await hol_stop(session)
+                s = None
 
     if not s or not s.is_running:
         # Preserve per-session HOL env (e.g., VFMDIR) across auto-restarts.
@@ -2154,9 +2169,11 @@ async def hol_state_at(
       - "[Session reloaded: ancestor X rebuilt ...]" — a dependency's built
         artifact changed since the session loaded it; the session was rebuilt
         and the prefix replayed from the new artifacts. Nothing to do.
-      - "[Session restarted: workdir A → B ...]" — file= lives in another
-        workdir; the session moved there. A's loaded context and open
-        suspensions are gone.
+      - "[Session restarted: workdir A → B ...]" / "[Session restarted:
+        file A → B ...]" — file= names another script; HOL restarted for it
+        (a reused process would export the previous, partially replayed
+        theory when the new script's new_theory runs). A's loaded context
+        and open suspensions are gone.
       - "[Session reinit: <why>; HOL restarts, dependencies reload ...]" —
         a full rebuild was owed (an edit before the first theorem; no
         checkpoint left to rewind to). Ordinary edits, including edits
