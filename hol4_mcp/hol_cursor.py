@@ -1006,6 +1006,33 @@ class FileProofCursor:
         self._loaded_content_hash = ""
         return True
 
+    async def _rewind_or_reinit(self, thm: TheoremInfo | None, reason: str) -> str | None:
+        """Bring the heap back to a state holding no file content from ``thm``
+        onwards (from line 1 when ``thm`` is None), or restart HOL.
+
+        Tries the nearest predecessor context checkpoint, then the deps-only
+        one. When neither loads, the heap still holds everything that ran,
+        and every per-theorem checkpoint saved in it is part of its
+        SaveState parent chain: Poly/ML refuses to save over a parent
+        ("File being saved is used as a parent of this file"), so replaying
+        in that heap silently loses every checkpoint it tries to re-save.
+        HOL restarts instead.
+
+        Returns None on success, or an error string from the restart.
+        """
+        if thm is not None:
+            predecessor = self._find_predecessor_checkpoint(thm)
+            if (predecessor is not None
+                    and await self._load_context_checkpoint(predecessor.name)):
+                return None
+        if await self._restore_to_deps():
+            return None
+        self._schedule_full_reinit(reason)
+        self._session_notices.append(
+            f"[{reason.capitalize()}; HOL restarts, dependencies reload and "
+            f"the prefix replays from line 1]")
+        return await self._reinitialize_session_if_needed()
+
     def _theorem_prefix_hash(self, theorem_name: str) -> str:
         """Hash of the file content a theorem's checkpoint was built from.
 
@@ -1077,6 +1104,7 @@ class FileProofCursor:
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=30
         )
         if _is_hol_error(result):
+            self._note_checkpoint_save_failure(ckpt_path, result)
             return False
 
         # Merge with existing entry (may already have context_path). The hash
@@ -1095,6 +1123,15 @@ class FileProofCursor:
                 content_hash=self._theorem_prefix_hash(theorem_name),
             )
         return True
+
+    def _note_checkpoint_save_failure(self, ckpt_path: Path, result: str) -> None:
+        """Report a checkpoint that failed to save; without it, backward
+        navigation to that point falls back to a long replay."""
+        error = next((ln.strip() for ln in result.splitlines() if ln.strip()), "")
+        notice = (f"[Checkpoint not saved: {ckpt_path.name}: {error[:200]}; "
+                  f"backward navigation past it replays instead]")
+        if notice not in self._session_notices:
+            self._session_notices.append(notice)
 
     async def _save_context_checkpoint(self, theorem_name: str) -> None:
         """Save context checkpoint: theory state after theorem content is loaded.
@@ -1120,6 +1157,7 @@ class FileProofCursor:
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
         )
         if _is_hol_error(result):
+            self._note_checkpoint_save_failure(ckpt_path, result)
             return
 
         # Update checkpoint dict (merge with any existing end_of_proof entry).
@@ -1957,21 +1995,11 @@ class FileProofCursor:
             return {"error": f"Theorem '{name}' not found"}
 
         if self._context_rewind_pending:
-            predecessor = self._find_predecessor_checkpoint(thm)
-            restored = (predecessor is not None and
-                        await self._load_context_checkpoint(predecessor.name))
-            if not restored:
-                restored = await self._restore_to_deps()
-            if not restored:
-                reason = ("session reinit: no context or deps checkpoint "
-                          "could be restored to rewind past the edit")
-                self._schedule_full_reinit(reason)
-                self._session_notices.append(
-                    f"[{reason.capitalize()}; HOL restarts, dependencies "
-                    f"reload and the prefix replays from line 1]")
-                error = await self._reinitialize_session_if_needed()
-                if error:
-                    return {"error": error}
+            error = await self._rewind_or_reinit(
+                thm, "session reinit: no context or deps checkpoint "
+                     "could be restored to rewind past the edit")
+            if error:
+                return {"error": error}
             self._context_rewind_pending = False
             self._pos = SessionPosition()
 
@@ -2275,6 +2303,16 @@ class FileProofCursor:
         if self._is_checkpoint_valid(thm.name) and thm.proof_body:
             if await self._load_checkpoint_and_backup(thm.name, tactic_idx):
                 return True, tactic_idx, None, True
+            # A failed load leaves the heap unchanged, possibly holding
+            # content past this theorem: rewind before replaying it.
+            error = await self._rewind_or_reinit(
+                thm, "session reinit: a proof checkpoint failed to load and "
+                     "no context or deps checkpoint could be restored")
+            if error:
+                return False, 0, error, False
+            enter_result = await self.enter_theorem(thm.name)
+            if "error" in enter_result:
+                return False, 0, enter_result["error"], False
 
         # Full replay from scratch
         setup_err = await self._setup_proof_goal(thm.name)
@@ -2365,10 +2403,14 @@ class FileProofCursor:
         # the nearest predecessor checkpoint, as execute_proof_traced does.
         if (self._deps_checkpoint_saved
                 and self._loaded_to_line > thm_at_pos.proof_end_line):
-            predecessor = self._find_predecessor_checkpoint(thm_at_pos)
-            if predecessor is None or not await self._load_context_checkpoint(
-                    predecessor.name):
-                await self._restore_to_deps()
+            error = await self._rewind_or_reinit(
+                thm_at_pos, "session reinit: no context or deps checkpoint "
+                            "could be restored for backward navigation")
+            if error:
+                return StateAtResult(
+                    goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
+                    file_hash=self._content_hash, error=error
+                )
 
         # Re-enter when the target changed, and ALSO when the loaded prefix no
         # longer reaches this theorem's start: an edit BEFORE the theorem
@@ -2965,14 +3007,15 @@ class FileProofCursor:
         #    without later theorems. Fallback to deps-only restore if none exists.
         if self._deps_checkpoint_saved:
             if self._loaded_to_line == 0:
-                await self._restore_to_deps()
+                if await self._rewind_or_reinit(
+                        None, "session reinit: the deps checkpoint could not "
+                              "be restored for a clean trace"):
+                    return []
             elif self._loaded_to_line > thm.start_line:
-                predecessor = self._find_predecessor_checkpoint(thm)
-                if predecessor is not None:
-                    if not await self._load_context_checkpoint(predecessor.name):
-                        await self._restore_to_deps()
-                else:
-                    await self._restore_to_deps()
+                if await self._rewind_or_reinit(
+                        thm, "session reinit: no context or deps checkpoint "
+                             "could be restored for a clean trace"):
+                    return []
 
         # Load context up to theorem
         enter_result = await self.enter_theorem(theorem_name)
@@ -3077,7 +3120,10 @@ class FileProofCursor:
 
         # Restore to clean deps-only state
         if self._deps_checkpoint_saved:
-            await self._restore_to_deps()
+            if await self._rewind_or_reinit(
+                    None, "session reinit: the deps checkpoint could not be "
+                          "restored for whole-file verification"):
+                return {}
         else:
             # No checkpoint - must reload deps manually for clean state
             # This is slower but ensures correctness
