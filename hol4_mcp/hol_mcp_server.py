@@ -8,6 +8,7 @@ Sessions are in-memory only. They survive within a single MCP server lifetime
 import asyncio
 import atexit
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -15,9 +16,14 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Optional
+from weakref import WeakValueDictionary
+
+import anyio
 
 from . import _mcp_cancel_patch  # noqa: F401 — patches mcp SDK on import
 from fastmcp import FastMCP
@@ -48,6 +54,87 @@ STATE_AT_TIMEOUT = float(os.environ.get("HOL_STATE_AT_TIMEOUT", "300.0"))
 # Largest per-call timeout= accepted, in seconds. Anything above it is a unit
 # mistake (milliseconds passed as seconds), not a budget.
 MAX_STATE_AT_TIMEOUT = 3600.0
+
+
+class _SessionOperation:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.owner = None
+
+
+# A strong reference lives with every holder/waiter. Idle names disappear,
+# avoiding retained sessions and locks bound to a defunct event loop.
+_session_operations = WeakValueDictionary()
+_startup_operation = object()
+
+
+@asynccontextmanager
+async def _session_operation(key):
+    operation = _session_operations.get(key)
+    if operation is None:
+        operation = _SessionOperation()
+        _session_operations[key] = operation
+    task = asyncio.current_task()
+    if operation.owner is task:
+        # Auto-init and restart call other server helpers in the same task.
+        yield
+        return
+    async with operation.lock:
+        operation.owner = task
+        try:
+            yield
+        except asyncio.CancelledError:
+            # Only the holder recovers. Cancelling a waiter must not interrupt
+            # the operation it was waiting for. Shield MCP cancel scopes so
+            # pipe recovery finishes before another request takes the lock.
+            with anyio.CancelScope(shield=True):
+                await _recover_cancelled_operation(key)
+            raise
+        finally:
+            operation.owner = None
+
+
+async def _recover_cancelled_operation(key):
+    entry = _sessions.get(key)
+    if entry is None:
+        return
+    try:
+        entry.session.interrupt()
+        recovered = await entry.session.resync()
+    except Exception:
+        recovered = False
+    if not recovered:
+        # A pipe that could not be aligned must not serve another request.
+        try:
+            await entry.session.stop()
+        except Exception:
+            pass
+    if entry.cursor:
+        entry.cursor.mark_interrupted()
+        if not recovered:
+            entry.cursor._schedule_full_reinit("cancelled request pipe recovery failed")
+
+
+def _serialized_session(parameter="session"):
+    """Serialize a complete request, including init/restart and presentation.
+
+    Session names survive cursor/process replacement. Interrupt and stop are
+    deliberately outside this guard so they can abort a running operation.
+    None selects the shared startup guard for the single-session policy.
+    """
+    def decorate(function):
+        signature = inspect.signature(function)
+
+        @wraps(function)
+        async def serialized(*args, **kwargs):
+            key = _startup_operation
+            if parameter is not None:
+                arguments = signature.bind(*args, **kwargs).arguments
+                key = arguments.get(parameter, signature.parameters[parameter].default)
+            async with _session_operation(key):
+                return await function(*args, **kwargs)
+        return serialized
+    return decorate
 
 
 def _timeout_arg_error(timeout: float | None) -> str | None:
@@ -761,6 +848,9 @@ async def _prune_idle_sessions():
                  getattr(entry.cursor, "_nav_lock", None))
         if any(lock is not None and lock.locked() for lock in locks):
             continue
+        operation = _session_operations.get(name)
+        if operation is not None and operation.lock.locked():
+            continue
         # Re-check: session may have been touched during a prior await
         if time.time() - entry.last_used <= _SESSION_IDLE_TIMEOUT:
             continue
@@ -776,6 +866,7 @@ _gc_call_counter = 0
 _gc_last_time = 0.0
 
 
+@_serialized_session("session_name")
 async def _do_gc(session_name: str):
     """Actually run PolyML.fullGC(). Runs as background task."""
     entry = _sessions.get(session_name)
@@ -838,6 +929,8 @@ def _session_age(name: str) -> str:
 
 
 @mcp.tool()
+@_serialized_session("name")
+@_serialized_session(None)
 async def hol_start(workdir: str, name: str = "default", env: dict = None,
                     force: bool = False) -> str:
     """Start a HOL4 REPL session.
@@ -1147,6 +1240,7 @@ def _check_proof_state_command(command: str) -> str | None:
 
 
 @mcp.tool()
+@_serialized_session()
 async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX_OUTPUT, session: str = "default") -> str:
     """Send raw SML command to HOL session.
 
@@ -1240,6 +1334,7 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
 
 
 @mcp.tool()
+@_serialized_session()
 async def hol_search(
     query: str = None,
     pattern: str = None,
@@ -1305,6 +1400,7 @@ async def hol_search(
 
 
 @mcp.tool()
+@_serialized_session()
 async def hol_goals(
     n: int = None,
     asm: int = None,
@@ -1501,6 +1597,7 @@ async def hol_stop(session: str = "default") -> str:
 
 
 @mcp.tool()
+@_serialized_session()
 async def hol_restart(session: str = "default") -> str:
     """Restart HOL session (stop + start, preserves workdir).
 
@@ -1530,6 +1627,7 @@ async def hol_restart(session: str = "default") -> str:
 
 
 @mcp.tool()
+@_serialized_session()
 async def hol_setenv(env: dict, session: str = "default") -> str:
     """Set environment variables for a HOL session and auto-restart to apply.
 
@@ -1932,6 +2030,7 @@ async def hol_logs(workdir: str) -> str:
 # =============================================================================
 
 
+@_serialized_session()
 async def _init_file_cursor(
     file: str,
     session: str = "default",
@@ -2054,6 +2153,7 @@ async def _init_file_cursor(
 
 
 @mcp.tool()
+@_serialized_session()
 async def hol_state_at(
     line: int,
     col: int = 1,
@@ -2510,6 +2610,7 @@ async def hol_state_at(
 
 
 @mcp.tool()
+@_serialized_session()
 async def hol_check_proof(
     theorem: str,
     file: str = None,

@@ -54,6 +54,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import anyio
 
 from hol4_mcp import hol_mcp_server as srv
 from hol4_mcp.hol_cursor import StateAtResult
@@ -292,3 +293,139 @@ async def test_concurrent_state_at_calls_report_their_own_positions(conc_session
         f"made serially:\n--- concurrent ---\n{stable(concurrent_alpha)}\n"
         f"--- serial ---\n{stable(baseline_alpha)}"
     )
+
+
+@pytest.mark.parametrize("operation", ["check", "send", "goals", "switch", "cancel_waiter", "gc", "start", "restart", "setenv"])
+async def test_other_operations_wait_for_navigation(conc_session, monkeypatch, tmp_path, operation):
+    """A peer cannot inspect, reset or replace a session partway through navigation."""
+    expected = await hol_state_at(line=ALPHA_LINE, session=conc_session)
+    await hol_state_at(line=PARK_LINE, session=conc_session)
+    cursor = srv._sessions[conc_session].cursor
+    paused = asyncio.Event()
+    release = asyncio.Event()
+    peer_entered = asyncio.Event()
+    original_state_at = cursor.state_at
+    original_send = cursor.session.send
+    original_init = srv._init_file_cursor
+
+    async def paused_navigation(*args, **kwargs):
+        paused.set()
+        await release.wait()
+        return await original_state_at(*args, **kwargs)
+
+    async def observed_send(*args, **kwargs):
+        if paused.is_set() and not release.is_set():
+            peer_entered.set()
+        return await original_send(*args, **kwargs)
+
+    async def observed_init(*args, **kwargs):
+        if paused.is_set() and not release.is_set():
+            peer_entered.set()
+        return await original_init(*args, **kwargs)
+
+    monkeypatch.setattr(cursor, "state_at", paused_navigation)
+    monkeypatch.setattr(cursor.session, "send", observed_send)
+    monkeypatch.setattr(srv, "_init_file_cursor", observed_init)
+    monkeypatch.setattr(srv, "_schedule_gc", lambda _: None)
+    primary = asyncio.create_task(hol_state_at(line=ALPHA_LINE, session=conc_session))
+    peer = None
+    try:
+        await asyncio.wait_for(paused.wait(), 5)
+        if operation == "check":
+            call = srv.hol_check_proof(theorem="conc_beta", session=conc_session)
+        elif operation in ("send", "cancel_waiter"):
+            call = srv.hol_send(command="drop_all();", session=conc_session)
+        elif operation == "goals":
+            call = srv.hol_goals(session=conc_session)
+        elif operation == "gc":
+            call = srv._do_gc(conc_session)
+        elif operation == "start":
+            call = hol_start(str(tmp_path), name=conc_session)
+        elif operation == "restart":
+            call = srv.hol_restart(session=conc_session)
+        elif operation == "setenv":
+            call = srv.hol_setenv({}, session=conc_session)
+        else:
+            other = tmp_path / "otherScript.sml"
+            shutil.copyfile(CONC_SCRIPT, other)
+            call = hol_state_at(file=str(other), line=BETA_LINE, session=conc_session)
+        peer = asyncio.create_task(call)
+        # If the peer is serialized, it cannot issue a HOL command or replace
+        # the cursor while the navigation has yielded between commands.
+        try:
+            await asyncio.wait_for(peer_entered.wait(), .1)
+        except TimeoutError:
+            pass
+        assert not peer_entered.is_set(), f"{operation} entered the active navigation"
+        if operation == "cancel_waiter":
+            peer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await peer
+    finally:
+        release.set()
+        results = await asyncio.gather(primary, *([peer] if peer else []), return_exceptions=True)
+    assert stable(results[0]) == stable(expected)
+    if operation == "cancel_waiter":
+        assert isinstance(results[1], asyncio.CancelledError)
+        return
+    assert not isinstance(results[1], BaseException), results[1]
+    if operation == "check":
+        assert "Status: OK" in results[1], results[1]
+    elif operation == "goals":
+        assert ALPHA_GOAL_TEXT in results[1], results[1]
+    elif operation == "switch":
+        assert "Theorem: conc_beta" in results[1], results[1]
+
+
+async def test_concurrent_start_enforces_single_session(tmp_path):
+    names = ("race_start_a", "race_start_b")
+    try:
+        results = await asyncio.gather(*(hol_start(str(tmp_path), name=name) for name in names))
+        assert sum("started" in result for result in results) == 1, results
+        assert sum("refusing to start" in result for result in results) == 1, results
+        assert sum(name in srv._sessions for name in names) == 1
+    finally:
+        for name in names:
+            await hol_stop(session=name)
+
+
+@pytest.mark.parametrize("cancellation", ["task", "scope"])
+async def test_cancelled_tool_recovers_before_next_command(conc_session, monkeypatch, cancellation):
+    session = srv._sessions[conc_session].session
+    started = asyncio.Event()
+    original_write = session._write_command
+
+    async def observe_write(command):
+        await original_write(command)
+        if command == SLOW_TO_UNWIND:
+            started.set()
+
+    monkeypatch.setattr(session, "_write_command", observe_write)
+    scopes = []
+
+    async def call():
+        if cancellation == "scope":
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                await srv.hol_send(SLOW_TO_UNWIND, session=conc_session, timeout=300)
+        else:
+            await srv.hol_send(SLOW_TO_UNWIND, session=conc_session, timeout=300)
+
+    task = asyncio.create_task(call())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        if cancellation == "scope":
+            scopes[0].cancel()
+            await task
+        else:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        result = await srv.hol_send("1 + 1;", session=conc_session, timeout=1)
+        assert "val it = 2" in result, result
+        result = await hol_state_at(line=ALPHA_LINE, session=conc_session)
+        assert "Theorem: conc_alpha" in result and "ERROR" not in result, result
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
