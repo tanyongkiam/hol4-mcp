@@ -1753,6 +1753,20 @@ async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace
         return f"ERROR: dependency reservation in {workdir}: {exc}. No build was started."
 
 
+def _read_log_tail(path: Path, limit: int) -> tuple[str, bool]:
+    """Read at most limit bytes; nonpositive limits explicitly request all."""
+    with path.open("rb", buffering=0) as stream:
+        if limit > 0:
+            size = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, size - limit))
+            data = stream.read(limit)
+            truncated = size > limit
+        else:
+            data = stream.read()
+            truncated = False
+    return data.decode("utf-8", errors="replace"), truncated
+
+
 @mcp.tool()
 async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 600, heap_size: int = 12288, jobs: int = None, detach: bool = False, trace_discovery: bool = False) -> str:
     """Run Holmake --qof in directory.
@@ -1764,10 +1778,12 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         workdir: Directory containing Holmakefile
         target: Specific target to build (e.g. "fooTheory")
         env: Optional environment variables (e.g. {"MY_VAR": "/some/path"})
-        log_limit: Max bytes per log file to include on failure (default 1024)
+        log_limit: Max bytes per log file to include on failure (default 1024,
+                   0 for unlimited)
         timeout: Max seconds to wait (default 600, max 1800). Ignored with detach.
         heap_size: Max heap size in MB for Poly/ML builds (default 12288)
-        jobs: Max parallel jobs (-j flag). Default from HOL4_MCP_HOLMAKE_JOBS env var, or 1.
+        jobs: Max parallel jobs (-j flag). Overrides HOL4_MCP_HOLMAKE_JOBS in
+              env, then the inherited environment; default 1.
         detach: After dependency discovery, start the build in the background with
                 `job=<id>` and the log path; poll hol_build_status(job=...).
                 For builds longer than the synchronous budget — never a shell
@@ -1820,21 +1836,22 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
     prior_logs = {p: log_stamp(p) for p in logs_dir.glob("*") if p.is_file()}
 
-    # Resolve parallelism: explicit param > env var > 1
-    if jobs is None:
-        jobs = int(os.environ.get("HOL4_MCP_HOLMAKE_JOBS", "1"))
-    jobs = max(1, jobs)
+    # Resolve against the environment actually passed to the child.
+    proc_env = os.environ.copy()
+    if env:
+        proc_env.update(env)
+    setting = "HOL4_MCP_HOLMAKE_JOBS" if jobs is None else "jobs"
+    value = proc_env.get(setting, "1") if jobs is None else jobs
+    try:
+        jobs = max(1, int(value))
+    except (TypeError, ValueError):
+        return f"ERROR: {setting} must be an integer, got {value!r}. No build was started."
 
     cmd = [str(holmake_bin), "--no_preexecs", "--qof", f"--heap-size={heap_size}"]
     if jobs > 1:
         cmd.extend(["-j", str(jobs)])
     if target:
         cmd.append(target)
-
-    # Build environment
-    proc_env = os.environ.copy()
-    if env:
-        proc_env.update(env)
 
     try:
         cmd, trace_note = traced_build(cmd, workdir_path, trace_discovery, proc_env)
@@ -1930,9 +1947,9 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 result += ("\n\n=== Build Logs ===\n"
                            "Changed during this build; may include concurrent jobs.\n")
                 for log_file in logs[:3]:
-                    content = log_file.read_text(errors="replace")
-                    if len(content) > log_limit:
-                        content = f"...(truncated, showing last {log_limit} bytes)...\n" + content[-log_limit:]
+                    content, truncated = _read_log_tail(log_file, log_limit)
+                    if truncated:
+                        content = f"...(truncated, showing last {log_limit} bytes)...\n" + content
                     result += f"\n--- {log_file.name} ---\n{content}\n"
 
         if re.search(r"\b(?:noent|ENOENT|SysErr)\b", output) and not trace_note:
@@ -2013,7 +2030,7 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
     Args:
         job: Job id from the detached holmake call
         cancel: Kill the build's process group (default False)
-        tail: Bytes of log to include (default 2000)
+        tail: Bytes of log to include (default 2000, 0 to omit the log)
 
     Returns: `running`/`done`/`cancelled` with elapsed time, exit code and the
              log tail; a done job's line says `Build succeeded` or `Build failed`.
@@ -2036,8 +2053,7 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
     end = entry.finished or time.time()
     elapsed = end - entry.started
     try:
-        data = entry.log.read_bytes()
-        text = data[-tail:].decode("utf-8", errors="replace") if tail > 0 else ""
+        text = _read_log_tail(entry.log, tail)[0] if tail > 0 else ""
     except OSError:
         text = ""
     head = f"{state}: job={job} target={entry.target or '(all)'} workdir={entry.workdir} [{elapsed:.0f}s]"
@@ -2078,9 +2094,9 @@ async def hol_log(workdir: str, theory: str, limit: int = 1024) -> str:
                 return f"Log not found: {theory}\nAvailable: {', '.join(sorted(available))}"
             return f"Log not found: {theory}\nNo logs in {logs_dir}"
 
-    content = log_file.read_text(errors="replace")
-    if limit > 0 and len(content) > limit:
-        return f"...(truncated, showing last {limit} bytes)...\n{content[-limit:]}"
+    content, truncated = _read_log_tail(log_file, limit)
+    if truncated:
+        return f"...(truncated, showing last {limit} bytes)...\n{content}"
     return content
 
 

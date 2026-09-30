@@ -10,18 +10,23 @@ ASCII '.
 
 from pathlib import Path
 
+from .hol_file_parser import _strip_comments, _strip_strings
+
 OPEN_Q = '‘'
 CLOSE_Q = '’'
 
 
 def find_unmatched_quotes(text: str) -> list[tuple[int, int, str]]:
-    """Return (line, col, 'open'|'close') for each unmatched smart quote.
+    """Return (line, col, 'open'|'close') for unmatched code smart quotes.
+
+    SML comments and strings are ordinary text, not quotation delimiters.
 
     Lines are 1-indexed, columns 0-indexed (matching the historical
     check_quotes.py output, which printed col as 0-indexed).
     """
     quotes = []  # (line_1indexed, col_0indexed, kind)
-    for li, line in enumerate(text.split('\n')):
+    code = _strip_strings(_strip_comments(text))
+    for li, line in enumerate(code.split('\n')):
         for col, ch in enumerate(line):
             if ch == OPEN_Q:
                 quotes.append((li + 1, col, 'open'))
