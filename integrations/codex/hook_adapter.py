@@ -29,6 +29,9 @@ from runtime import data_root, plugin_root, synthetic_transcript
 
 PATCH_HEADER_RE = re.compile(r"^\*\*\* (Update|Add|Delete) File: (.+)$", re.MULTILINE)
 MOVE_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
+PATH_HEADER_RE = re.compile(
+    r"^(\*\*\* (?:(?:Update|Add|Delete) File|Move to): )(.+)$", re.MULTILINE
+)
 
 
 @dataclass(frozen=True)
@@ -73,92 +76,105 @@ def _read(path: Path) -> str:
         return ""
 
 
-def _materialize(cwd: Path, mirror: Path, records: list[PatchRecord]) -> None:
-    for record in records:
-        if record.operation == "Add":
-            continue
-        source = cwd / record.source
-        if not source.is_file():
-            continue
-        destination = mirror / record.source
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(source.read_bytes())
-
-
-def _find_sequence(lines: list[str], wanted: list[str], start: int) -> int:
+def _find_sequence(lines: list[str], wanted: list[str], start: int,
+                   eof: bool = False) -> int:
     if not wanted:
-        return start
-    for begin in range(start, len(lines) - len(wanted) + 1):
-        if lines[begin:begin + len(wanted)] == wanted:
-            return begin
-    for begin in range(0, start):
-        if lines[begin:begin + len(wanted)] == wanted:
-            return begin
+        return len(lines)
+    if eof and len(lines) - len(wanted) >= start:
+        try:
+            return _find_sequence(lines, wanted, len(lines) - len(wanted))
+        except ValueError:
+            pass
+    for normalize in (lambda line: line, str.rstrip, str.strip):
+        expected = [normalize(line) for line in wanted]
+        for begin in range(start, len(lines) - len(wanted) + 1):
+            if [normalize(line) for line in lines[begin:begin + len(wanted)]] == expected:
+                return begin
     raise ValueError("patch context does not match the current file")
 
 
 def _apply_hunks(before: str, body: str) -> str:
     """Small fallback for environments that do not expose the Codex patch CLI."""
     body = MOVE_RE.sub("", body)
-    chunks = re.split(r"^@@.*$", body, flags=re.MULTILINE)
-    lines = before.split("\n")
+    chunks = re.split(r"^(@@[^\n]*)$", body, flags=re.MULTILINE)
+    lines = before.splitlines()
     cursor = 0
+    anchor = None
     for chunk in chunks:
+        if chunk.startswith("@@"):
+            anchor = chunk[3:] if chunk.startswith("@@ ") else None
+            continue
         patch_lines = [line for line in chunk.splitlines()
                        if line != "*** End of File" and line[:1] in {" ", "+", "-"}]
         if not patch_lines:
             continue
+        if anchor:
+            cursor = _find_sequence(lines, [anchor], cursor) + 1
+            anchor = None
         old = [line[1:] for line in patch_lines if line.startswith((" ", "-"))]
         new = [line[1:] for line in patch_lines if line.startswith((" ", "+"))]
-        begin = _find_sequence(lines, old, cursor)
+        begin = _find_sequence(lines, old, cursor, "*** End of File" in chunk.splitlines())
         lines[begin:begin + len(old)] = new
         cursor = begin + len(new)
-    return "\n".join(lines)
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
-def _fallback_apply(command: str, cwd: Path, records: list[PatchRecord]) -> list[EditDelta]:
+def _fallback_apply(command: str, mirror: Path, records: list[PatchRecord]) -> None:
+    """Apply the supported patch operations only inside the temporary mirror."""
     matches = list(PATCH_HEADER_RE.finditer(command))
-    deltas: list[EditDelta] = []
     for index, (match, record) in enumerate(zip(matches, records)):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(command)
         body = command[match.end():end]
-        before = _read(cwd / record.source)
+        source = mirror / record.source
         if record.operation == "Delete":
-            after = ""
+            source.unlink()
+            continue
         elif record.operation == "Add":
             added = [line[1:] for line in body.splitlines() if line.startswith("+")]
             after = "\n".join(added) + ("\n" if added else "")
         else:
-            after = _apply_hunks(before, body)
-        deltas.append(EditDelta(cwd / record.source, before, after))
-    return deltas
+            after = _apply_hunks(source.read_text(encoding="utf-8"), body)
+        (mirror / record.target).write_text(after, encoding="utf-8")
+        if record.target != record.source:
+            source.unlink()
 
 
 def preview_patch(command: str, cwd: Path) -> list[EditDelta]:
+    # Map EVERY path (including absolute paths, ../ paths and move targets)
+    # to a private flat filename before invoking any patch implementation.
+    # Neither implementation can then follow a header out of the mirror.
+    aliases: dict[Path, str] = {}
+
+    def remap(match: re.Match) -> str:
+        path = Path(os.path.abspath(cwd / match.group(2)))
+        alias = aliases.setdefault(path, f"file-{len(aliases)}")
+        return match.group(1) + alias
+
+    command = PATH_HEADER_RE.sub(remap, command)
     records = _records(command)
     if not records:
         return []
     executable = shutil.which("apply_patch")
-    if executable is None:
-        return _fallback_apply(command, cwd, records)
-
     with tempfile.TemporaryDirectory(prefix="hol4-mcp-codex-patch-") as temporary:
         mirror = Path(temporary)
-        _materialize(cwd, mirror, records)
-        completed = subprocess.run(
-            [executable], input=command, text=True, cwd=mirror,
-            capture_output=True, timeout=30, check=False,
-        )
-        if completed.returncode != 0:
-            raise ValueError(completed.stderr.strip() or completed.stdout.strip()
-                             or "unable to preview patch")
-        return [
-            EditDelta(
-                cwd / record.source,
-                _read(cwd / record.source),
-                "" if record.operation == "Delete" else _read(mirror / record.target),
+        before = {}
+        for path, alias in aliases.items():
+            if path.exists():
+                (mirror / alias).write_bytes(path.read_bytes())
+            before[path] = _read(mirror / alias)
+        if executable is None:
+            _fallback_apply(command, mirror, records)
+        else:
+            completed = subprocess.run(
+                [executable], input=command, text=True, cwd=mirror,
+                capture_output=True, timeout=30, check=False,
             )
-            for record in records
+            if completed.returncode != 0:
+                raise ValueError(completed.stderr.strip() or completed.stdout.strip()
+                                 or "unable to preview patch")
+        return [
+            EditDelta(path, before[path], _read(mirror / alias))
+            for path, alias in aliases.items()
         ]
 
 

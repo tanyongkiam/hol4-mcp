@@ -12,6 +12,70 @@ CODEX = ROOT / "integrations" / "codex"
 ADAPTER = CODEX / "hook_adapter.py"
 
 
+@pytest.fixture(params=[False, True], ids=["native", "fallback"])
+def patch_adapter(request, monkeypatch):
+    monkeypatch.syspath_prepend(str(CODEX))
+    import hook_adapter
+    if request.param:
+        monkeypatch.setattr(hook_adapter.shutil, "which", lambda _: None)
+    elif hook_adapter.shutil.which("apply_patch") is None:
+        pytest.skip("native apply_patch executable unavailable")
+    return hook_adapter
+
+
+def test_preview_accepts_absolute_paths_without_writing(patch_adapter, tmp_path):
+    source = tmp_path / "input.txt"
+    source.write_text("old\n")
+    patch = f"*** Begin Patch\n*** Update File: {source}\n@@\n-old\n+new\n*** End Patch\n"
+    deltas = patch_adapter.preview_patch(patch, tmp_path)
+    assert [(d.path, d.before, d.after) for d in deltas] == [(source, "old\n", "new\n")]
+    assert source.read_text() == "old\n"
+
+
+def test_preview_move_checks_destination_and_source(patch_adapter, tmp_path):
+    source = tmp_path / "input.txt"
+    target = tmp_path / "movedScript.sml"
+    source.write_text("old\n")
+    target.write_text("previous target\n")
+    patch = "*** Begin Patch\n*** Update File: input.txt\n*** Move to: movedScript.sml\n@@\n-old\n+new\n*** End Patch\n"
+    deltas = patch_adapter.preview_patch(patch, tmp_path)
+    assert {d.path: (d.before, d.after) for d in deltas} == {
+        source: ("old\n", ""), target: ("previous target\n", "new\n"),
+    }
+    assert source.read_text() == "old\n"
+    assert target.read_text() == "previous target\n"
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("@@ second\n same\n-old\n+new", "first\nsame\nold\nsecond\nsame\nnew\n"),
+    ("@@\n same\n-old\n+new\n*** End of File", "first\nsame\nold\nsecond\nsame\nnew\n"),
+    ("@@\n+last", "first\nsame\nold\nsecond\nsame\nold\nlast\n"),
+])
+def test_preview_hunk_placement(patch_adapter, tmp_path, body, expected):
+    source = tmp_path / "input.txt"
+    before = "first\nsame\nold\nsecond\nsame\nold\n"
+    source.write_text(before)
+    patch = f"*** Begin Patch\n*** Update File: input.txt\n{body}\n*** End Patch\n"
+    deltas = patch_adapter.preview_patch(patch, tmp_path)
+    assert deltas[0].after == expected
+    assert source.read_text() == before
+
+
+@pytest.mark.parametrize("before,body,expected", [
+    ("old\n  old  \n", "@@\n-old\n+new\n*** End of File", "old\nnew\n"),
+    ("old", "@@\n-old\n+new", "new\n"),
+    ("old\n", "@@\n-old", ""),
+    ("a\nb\n", "@@\n-a\n+x\n@@\n-b\n+y", "x\ny\n"),
+])
+def test_preview_preserves_patch_semantics(patch_adapter, tmp_path, before, body, expected):
+    source = tmp_path / "input.txt"
+    source.write_text(before)
+    patch = f"*** Begin Patch\n*** Update File: input.txt\n{body}\n*** End Patch\n"
+    deltas = patch_adapter.preview_patch(patch, tmp_path)
+    assert deltas[0].after == expected
+    assert source.read_text() == before
+
+
 @pytest.fixture
 def run_codex_hook(tmp_path):
     plugin_data = tmp_path / "plugin-data"
@@ -108,6 +172,29 @@ def test_apply_patch_add_file_is_checked(run_codex_hook, tmp_path):
     assert result.returncode == 2
     assert "FIRST" in result.stderr
     assert not (tmp_path / "newScript.sml").exists()
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_move_into_script_runs_proof_policy(run_codex_hook, tmp_path, fallback):
+    source = tmp_path / "draft.txt"
+    before = "Theorem foo:\n  T\nProof\n  simp []\nQED\n"
+    source.write_text(before)
+    target = tmp_path / "newScript.sml"
+    patch = f"""*** Begin Patch
+*** Update File: {source}
+*** Move to: {target}
+@@
+-  simp []
++  TRY (simp [])
+*** End Patch"""
+    result = run_codex_hook(
+        ADAPTER, payload(tmp_path, "apply_patch", {"command": patch}),
+        "h1_banned_tactics.py", env={"PATH": ""} if fallback else None,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "H1" in result.stderr and "TRY" in result.stderr
+    assert source.read_text() == before
+    assert not target.exists()
 
 
 def test_apply_patch_fallback_does_not_depend_on_codex_internal_binary(run_codex_hook, tmp_path):
