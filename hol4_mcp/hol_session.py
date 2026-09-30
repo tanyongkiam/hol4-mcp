@@ -100,23 +100,29 @@ class HOLSession:
         )
         self.maxheap_mb = heap_mb
 
-        # Wait for initial prompt (null-terminated)
-        await self._read_response(timeout=60)
+        try:
+            # Wait for initial prompt (null-terminated).
+            await self._read_response(timeout=60)
 
-        # Load etq.sml (goaltree mode helpers)
-        # NOTE: Legacy - cursor now uses goalstack mode with tactic_prefix.sml instead.
-        # Kept for backwards compatibility with manual goaltree workflows.
-        await self.send(ETQ_PATH.read_text(), timeout=30)
-
-        # Load tactic_prefix for prefix-based replay (includes TacticParse)
-        tactic_prefix = SCRIPT_DIR / "sml_helpers" / "tactic_prefix.sml"
-        if tactic_prefix.exists():
-            await self.send(tactic_prefix.read_text(), timeout=30)
-
-        # Load .hol_init.sml if present
-        init_file = self.workdir / ".hol_init.sml"
-        if init_file.exists():
-            await self.send(init_file.read_text(), timeout=60)
+            # etq supports manual goaltree workflows; tactic_prefix supplies
+            # goalstack replay. A failed helper/init load is a failed startup.
+            startup_files = (
+                (ETQ_PATH, 30),
+                (SCRIPT_DIR / "sml_helpers" / "tactic_prefix.sml", 30),
+                (self.workdir / ".hol_init.sml", 60),
+            )
+            for path, budget in startup_files:
+                if path != ETQ_PATH and not path.exists():
+                    continue
+                output = await self.send(path.read_text(), timeout=budget)
+                if _FAILURE_RE.search(output) or output.startswith("ERROR:"):
+                    raise RuntimeError(f"Failed to load {path.name}: {output}")
+        except BaseException:
+            # __aexit__ is not called if __aenter__/startup raises, and the
+            # server cannot register this session until startup succeeds.
+            # Include cancellation so an abandoned request cannot orphan HOL.
+            await self.stop()
+            raise
 
         return f"HOL started (PID {self.process.pid}, maxheap={heap_mb} MB)"
 
@@ -303,13 +309,10 @@ class HOLSession:
                 await asyncio.wait_for(self.process.wait(), timeout=5)
             except asyncio.TimeoutError:
                 # Force kill entire group if it doesn't terminate
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
+                self.kill_sync()
                 try:
                     await asyncio.wait_for(self.process.wait(), timeout=2)
-                except (asyncio.TimeoutError, Exception):
+                except Exception:
                     pass
         self.process = None
         self._buffer = b""

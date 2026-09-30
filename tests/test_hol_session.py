@@ -1,9 +1,12 @@
 """Tests for HOL session subprocess wrapper."""
 
+import asyncio
+import sys
+
 import pytest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from hol4_mcp.hol_session import HOLSession, escape_sml_string
 from hol4_mcp.hol_cursor import _is_hol_error
@@ -40,6 +43,68 @@ async def test_bad_interactive_heap_does_not_spawn(monkeypatch, tmp_path, value)
     with pytest.raises(ValueError, match="HOL4_MCP_MAXHEAP_MB"):
         await session.start()
     spawn.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["prompt", "helpers"])
+@pytest.mark.parametrize("failure", [TimeoutError, asyncio.CancelledError])
+async def test_startup_failure_reaps_process_and_allows_retry(monkeypatch, tmp_path, phase, failure):
+    # A real child pins process cleanup without waiting for a real HOL timeout.
+    spawn = asyncio.create_subprocess_exec
+    children = []
+
+    async def spawn_idle(*args, **kwargs):
+        child = await spawn(sys.executable, "-c", "import time; time.sleep(60)", **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_idle)
+    session = HOLSession(str(tmp_path))
+    reader = AsyncMock(return_value="")
+    sender = AsyncMock(return_value="")
+    (reader if phase == "prompt" else sender).side_effect = failure("startup failed")
+    monkeypatch.setattr(session, "_read_response", reader)
+    monkeypatch.setattr(session, "send", sender)
+    try:
+        with pytest.raises(failure, match="startup failed"):
+            async with session:
+                pytest.fail("failed startup must not enter the context")
+        assert children[0].returncode is not None, "startup leaked its child"
+        assert session.process is None
+        reader.side_effect = sender.side_effect = None
+        assert "HOL started" in await session.start()
+        assert len(children) == 2
+        assert session.process is children[1]
+    finally:
+        await session.stop()
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+                await child.wait()
+
+
+async def test_startup_reports_init_errors_and_reaps_process(tmp_path):
+    (tmp_path / ".hol_init.sml").write_text('raise Fail "broken startup file";\n')
+    session = HOLSession(str(tmp_path))
+    try:
+        with pytest.raises(RuntimeError, match="broken startup file"):
+            await session.start()
+        assert session.process is None
+    finally:
+        await session.stop()
+
+
+async def test_stop_handles_process_group_lookup_failure(monkeypatch, tmp_path):
+    session = HOLSession(str(tmp_path))
+    process = SimpleNamespace(pid=123, returncode=None,
+                              wait=AsyncMock(side_effect=[TimeoutError, 0]))
+    session.process = process
+    monkeypatch.setattr("hol4_mcp.hol_session.os.getpgid", Mock(side_effect=PermissionError))
+    kill = Mock()
+    monkeypatch.setattr("hol4_mcp.hol_session.os.killpg", kill)
+    await session.stop()
+    assert session.process is None
+    assert process.wait.await_count == 2
+    kill.assert_not_called()
 
 
 async def test_hol_session():
