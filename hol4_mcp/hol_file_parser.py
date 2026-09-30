@@ -560,6 +560,25 @@ def suspension_base(name: str) -> str:
     return name.split('[', 1)[0]
 
 
+def _string_end(content: str, start: int) -> int:
+    """End offset of an SML string, including escaped characters/string gaps."""
+    i = start + 1
+    while i < len(content):
+        if content[i] == '"':
+            return i + 1
+        if content[i] == '\\':
+            i += 1
+            if i < len(content) and content[i].isspace():
+                while i < len(content) and content[i].isspace():
+                    i += 1
+            i += 1
+        elif content[i] == '\n':
+            return i
+        else:
+            i += 1
+    return len(content)
+
+
 def _strip_comments(content: str) -> str:
     """Replace SML comments (* ... *) with spaces, preserving newlines.
 
@@ -570,7 +589,9 @@ def _strip_comments(content: str) -> str:
     i = 0
     n = len(content)
     while i < n - 1:
-        if content[i] == '(' and content[i + 1] == '*':
+        if content[i] == '"':
+            i = _string_end(content, i)
+        elif content[i] == '(' and content[i + 1] == '*':
             # Found comment start - track nesting
             depth = 1
             j = i + 2
@@ -625,34 +646,15 @@ def parse_local_blocks(content: str) -> list[LocalBlock]:
 
     # Word-boundary patterns — match anywhere in line, not just at start.
     # SML 'let' commonly appears mid-line (e.g. "fun f x = let ...").
-    local_re = re.compile(r'\blocal\b')
-    in_re = re.compile(r'\bin\b')
-    let_re = re.compile(r'\blet\b')
-    end_re = re.compile(r'\bend\b')
+    keyword_re = re.compile(r"(?<![\w'])(local|in|let|struct|sig|abstype|end)(?![\w'])")
 
     for line_num, line in enumerate(lines, start=1):
-        # Find all keywords in order of appearance on this line.
-        # Sort by position to handle cases like "let ... in ... end" on one line
-        # or "local ... in" on one line.
-        keywords = []
-        for m in local_re.finditer(line):
-            keywords.append((m.start(), 'local'))
-        for m in in_re.finditer(line):
-            keywords.append((m.start(), 'in'))
-        for m in let_re.finditer(line):
-            keywords.append((m.start(), 'let'))
-        for m in end_re.finditer(line):
-            keywords.append((m.start(), 'end'))
-        keywords.sort()
-
-        if not keywords:
-            continue
-
-        for _, kw in keywords:
+        for match in keyword_re.finditer(line):
+            kw = match.group(1)
             if kw == 'local':
                 stack.append(('local', line_num, 0))
-            elif kw == 'let':
-                stack.append(('let',))
+            elif kw in ('let', 'struct', 'sig', 'abstype'):
+                stack.append((kw,))
             elif kw == 'in':
                 # 'in' closes the most recent opener (local or let)
                 # For 'local', we record the in_line; for 'let', we just
@@ -674,7 +676,7 @@ def parse_local_blocks(content: str) -> list[LocalBlock]:
                         ))
                     # 'let' entries are just discarded — inner block closed
 
-    return blocks
+    return sorted(blocks, key=lambda block: (block.local_line, -block.end_line))
 
 
 def _has_in(entry: tuple) -> bool:
@@ -697,19 +699,7 @@ def _strip_strings(content: str) -> str:
     n = len(content)
     while i < n:
         if content[i] == '"':
-            # Found string start
-            j = i + 1
-            while j < n:
-                if content[j] == '\\' and j + 1 < n:
-                    j += 2  # Skip escaped character
-                elif content[j] == '"':
-                    j += 1  # Include closing quote
-                    break
-                elif content[j] == '\n':
-                    # SML strings can't span lines without \  at end
-                    break
-                else:
-                    j += 1
+            j = _string_end(content, i)
             # Blank out i..j, keeping newlines
             for k in range(i, min(j, n)):
                 if result[k] != '\n':

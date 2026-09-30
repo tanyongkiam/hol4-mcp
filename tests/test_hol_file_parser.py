@@ -678,6 +678,36 @@ end
     assert blocks[0].local_line == 3
 
 
+@pytest.mark.parametrize("declaration", [
+    "structure S = struct val x = 1 end",
+    "signature S = sig val x : int end",
+    "abstype t = T with val x = T end",
+])
+def test_parse_local_blocks_tracks_other_sml_end_delimiters(declaration):
+    content = f"local\n  {declaration}\nin\n  val y = 1\nend\n"
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 5)]
+
+
+def test_parse_local_blocks_outermost_first():
+    content = "local\nval x = 1\nin\nlocal val y = x in\nval z = y\nend\nend\n"
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 7), (4, 4, 6)]
+
+
+def test_parser_keeps_code_after_comment_marker_in_string():
+    content = 'val marker = "(*";\nlocal\nval x = 1\nin\nTheorem example:\n T\nProof\n simp[]\nQED\nend\n'
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(2, 4, 10)]
+    assert [t.name for t in parse_theorems(content)] == ["example"]
+
+
+def test_parse_local_blocks_primed_identifiers_are_not_keywords():
+    content = "local\nval let' = 1\nin\nval end' = let'\nend\n"
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 5)]
+
+
 def test_parse_local_blocks_multiple():
     """Multiple non-nested local blocks."""
     content = '''local open A in
@@ -1398,4 +1428,3 @@ class TestFormatStepContextReal:
         text = "\n".join(result)
         # The inner >- is not decomposed, shows as (simp[] >- fs[])
         assert "(simp[] >- fs[])" in text
-

@@ -435,6 +435,25 @@ async def test_state_at_inside_local_block_with_quoted_let(tmp_path):
         await hol_stop(session="local_quote_let")
 
 
+async def test_state_at_nested_local_with_structure_and_comment_string(tmp_path):
+    content = (FIXTURES_DIR / "localQuoteLetScript.sml").read_text()
+    content = content.replace("val th = helper", 'val th = helper\nval marker = "(*";\nstructure S = struct val x = 1 end;')
+    content = content.replace("in\n\nTheorem inside_local:", "in\n\nlocal val x = S.x in\n\nTheorem inside_local:")
+    content = content.replace("end;\n\nTheorem after_local:", "end;\nend;\n\nTheorem after_local:")
+    script = tmp_path / "localQuoteLetScript.sml"
+    script.write_text(content)
+    lines = content.splitlines()
+    first_qed = lines.index("QED", lines.index("Theorem inside_local_plain:")) + 1
+    last_qed = lines.index("QED", lines.index("Theorem after_local:")) + 1
+    try:
+        for line in (first_qed, last_qed):
+            result = await hol_state_at(file=str(script), session="nested_local", line=line)
+            assert "ERROR" not in result, result
+            assert "proof complete" in result.lower(), result
+    finally:
+        await hol_stop(session="nested_local")
+
+
 async def test_state_at_auto_init(tmp_path):
     """Test hol_state_at with file parameter auto-calls hol_file_init."""
     test_file = tmp_path / "testScript.sml"
