@@ -604,11 +604,17 @@ class LocalBlock:
 def parse_local_blocks(content: str) -> list[LocalBlock]:
     """Parse SML local ... in ... end blocks from file content.
 
-    Uses comment-stripped and string-stripped content to avoid false matches.
-    Returns blocks sorted by local_line.
+    The keyword scan runs on content with comments, string literals, HOL
+    quotations, attribute brackets and holscript statements blanked out:
+    a HOL term's ``let ... in`` has no ``end``, and a ``[local]`` attribute
+    is not an opener, so either would pair the block's ``in``/``end`` with
+    the wrong entry. Returns blocks sorted by local_line.
     """
     stripped = _strip_comments(content)
     stripped = _strip_strings(stripped)
+    stripped = _strip_quotations(stripped)
+    stripped = _strip_attributes(stripped)
+    stripped = _strip_holscript_statements(stripped)
 
     blocks = []
     # Stack entries: ('local', local_line, in_line) or ('let',) etc.
@@ -711,6 +717,88 @@ def _strip_strings(content: str) -> str:
             i = j
         else:
             i += 1
+    return ''.join(result)
+
+
+def _blank_span(result: list[str], start: int, end: int) -> None:
+    """Replace result[start:end] with spaces, keeping newlines."""
+    for k in range(start, min(end, len(result))):
+        if result[k] != '\n':
+            result[k] = ' '
+
+
+def _strip_quotations(content: str) -> str:
+    """Replace HOL quotations with spaces, preserving newlines.
+
+    Handles backquote quotations (single and double) and the Unicode
+    forms ‘...’ and “...”. Preserves character offsets. Run after
+    _strip_strings so a quote character inside a string literal is gone.
+    """
+    result = list(content)
+    i = 0
+    n = len(content)
+    while i < n:
+        c = content[i]
+        if c == '`':
+            close = '``' if i + 1 < n and content[i + 1] == '`' else '`'
+            k = content.find(close, i + len(close))
+            j = n if k < 0 else k + len(close)
+        elif c in '‘“':
+            close = '’' if c == '‘' else '”'
+            depth = 1
+            j = i + 1
+            while j < n and depth > 0:
+                if content[j] == c:
+                    depth += 1
+                elif content[j] == close:
+                    depth -= 1
+                j += 1
+        else:
+            i += 1
+            continue
+        _blank_span(result, i, j)
+        i = j
+    return ''.join(result)
+
+
+_ATTR_RE = re.compile(r'\[[A-Za-z0-9_, \t]*\]')
+
+
+def _strip_attributes(content: str) -> str:
+    """Replace attribute brackets such as ``[local,simp]`` with spaces.
+
+    The pattern only matches a bracket holding bare identifiers, so an SML
+    list expression with an operator or a keyword sequence is untouched.
+    """
+    result = list(content)
+    for m in _ATTR_RE.finditer(content):
+        _blank_span(result, m.start(), m.end())
+    return ''.join(result)
+
+
+_STMT_OPEN_RE = re.compile(r'^(Theorem|Triviality|Resume)\b[^=\n]*?:', re.M)
+_DEF_OPEN_RE = re.compile(
+    r'^(Definition|Inductive|CoInductive|Datatype)\b[^=\n]*?:', re.M
+)
+_PROOF_KW_RE = re.compile(r'\bProof\b')
+_DEF_CLOSE_KW_RE = re.compile(r'\b(End|Termination)\b')
+
+
+def _strip_holscript_statements(content: str) -> str:
+    """Replace holscript statement regions with spaces, preserving newlines.
+
+    A ``Theorem name:`` statement runs to ``Proof``; a ``Definition``,
+    ``Inductive``, ``CoInductive`` or ``Datatype`` body runs to ``End`` or
+    ``Termination``. Both hold HOL syntax, not SML. The ``Theorem name =``
+    form is SML and is left alone. A region with no closer is left alone.
+    """
+    result = list(content)
+    for open_re, close_re in ((_STMT_OPEN_RE, _PROOF_KW_RE),
+                              (_DEF_OPEN_RE, _DEF_CLOSE_KW_RE)):
+        for m in open_re.finditer(content):
+            close = close_re.search(content, m.end())
+            if close:
+                _blank_span(result, m.start(), close.start())
     return ''.join(result)
 
 

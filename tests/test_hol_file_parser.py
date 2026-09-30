@@ -761,6 +761,110 @@ end
     assert lb.end_line == 7
 
 
+def test_parse_local_blocks_ignores_local_attribute():
+    """A [local] attribute on Theorem/Overload/Triviality is not an opener.
+
+    Each spurious opener would sit on the stack above the real one, so the
+    real block's 'in'/'end' would pair with the wrong entry.
+    """
+    content = '''Overload True_ast[local] = "T"
+Theorem helper[local]:
+  T
+Proof
+  simp[]
+QED
+Triviality tiny[local,simp]:
+  T
+Proof
+  simp[]
+QED
+local
+  val th = helper
+in
+Theorem main:
+  T
+Proof
+  simp[th]
+QED
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(12, 14, 20)]
+
+
+def test_parse_local_blocks_ignores_let_in_backquote_quotation():
+    """A HOL `let ... in ...` term has no `end`; it must not be counted
+    as an SML let, or the block's `end` closes the term instead."""
+    content = '''local
+  val code = ``Let (SOME k) x1 (Var (Short k))``
+in
+Theorem Eval_Num_ABS:
+  Eval env x1 (INT i) ==> Eval env ^code (NUM (Num (ABS i)))
+Proof
+  `&(Num (ABS i)) = let k = i in if k < 0 then 0 - k else k` by
+    (FULL_SIMP_TAC std_ss [LET_DEF] THEN intLib.COOPER_TAC)
+  \\\\ simp []
+QED
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 11)]
+
+
+def test_parse_local_blocks_ignores_let_in_unicode_quotation():
+    """Same as above with ‘...’ and “...” quotations, possibly multi-line."""
+    content = '''local
+  val tm = “let x = 1 in
+              x + 1”
+in
+Theorem foo:
+  ‘let y = 2 in y’ = ‘2’
+Proof
+  simp []
+QED
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 4, 10)]
+
+
+def test_parse_local_blocks_ignores_let_in_theorem_statement():
+    """An unquoted `let ... in` in a Theorem statement or a Definition body
+    is HOL syntax; a Theorem-equals form and a Termination block are SML."""
+    content = '''local
+  val th = TRUTH
+in
+Theorem Eval_word_lsr:
+  Eval env x1 (WORD w) ==>
+  Eval env (let w = W8 in
+            let k = 8 in App (Shift w Lsr) [x1]) (WORD (word_lsr w1 n))
+Proof
+  simp [th]
+QED
+Definition f_def:
+  f x = let y = x in y
+Termination
+  WF_REL_TAC `measure I` \\\\ simp []
+End
+Theorem sml_form = TRUTH |> DISCH_ALL
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 17)]
+
+
+def test_parse_local_blocks_keeps_sml_let_after_quotation():
+    """Stripping quotations must leave genuine SML let/in/end balanced."""
+    content = '''local
+  val tm = ‘let x = 1 in x’
+in
+  fun f x = let val y = ``let z = x in z`` in y end
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 5)]
+
+
 class TestStepLineNumbers:
     """Tests for step_line_numbers."""
 

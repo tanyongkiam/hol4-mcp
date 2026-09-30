@@ -410,6 +410,31 @@ async def test_state_at_after_qed_line(tmp_path):
         await hol_stop(session="after_qed_test")
 
 
+async def test_state_at_inside_local_block_with_quoted_let(tmp_path):
+    """A theorem inside `local ... in ... end` whose proof quotes a HOL
+    `let ... in` (no `end`), after `[local]` attributes: the block is sent
+    to HOL as one unit, so its QED and the theorem after it both replay."""
+    test_file = tmp_path / "localQuoteLetScript.sml"
+    shutil.copy(FIXTURES_DIR / "localQuoteLetScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="local_quote_let")
+
+        # inside_local_plain: QED at line 36, inside the block, after the
+        # theorem whose proof quotes the `let ... in`
+        result = await hol_state_at(session="local_quote_let", line=36, col=1)
+        assert "expected keyword 'end'" not in result
+        assert "ERROR" not in result
+        assert "proof complete" in result.lower()
+
+        # after_local: QED at line 44, after the block's `end;`
+        result = await hol_state_at(session="local_quote_let", line=44, col=1)
+        assert "ERROR" not in result
+        assert "proof complete" in result.lower()
+    finally:
+        await hol_stop(session="local_quote_let")
+
+
 async def test_state_at_auto_init(tmp_path):
     """Test hol_state_at with file parameter auto-calls hol_file_init."""
     test_file = tmp_path / "testScript.sml"
