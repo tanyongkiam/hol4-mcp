@@ -52,7 +52,7 @@ def _try_find_json_line(output: str, context: str = "") -> dict:
 # Per-theorem whole-proof replay budget (seconds). Legitimately-slow proofs
 # (e.g. large induction bodies ~80-100s) must validate per-theorem rather than
 # being silently auto-cheated, so this is well above the 60s default.
-PER_THEOREM_TIMEOUT = 120
+PER_THEOREM_TIMEOUT = 1200
 
 
 def dep_load_timeout() -> float:
@@ -1813,7 +1813,7 @@ class FileProofCursor:
                         f"SKIPPED, never ran ({_error_reason(err)})"
                     )
 
-    async def _load_context_to_line(self, target_line: int, timeout: float = 300) -> str | None:
+    async def _load_context_to_line(self, target_line: int, timeout: float = 3000) -> str | None:
         """Load file content up to target_line into HOL session.
         
         Loads content granularly - theorem by theorem - so that a broken proof
@@ -1825,7 +1825,7 @@ class FileProofCursor:
         
         Args:
             target_line: 1-indexed line to load up to (exclusive)
-            timeout: Timeout for HOL send (default 300s for large files)
+            timeout: Timeout for HOL send (default 3000s for large files)
             
         Returns:
             Error message if failed, None if success.

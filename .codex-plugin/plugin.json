@@ -1,6 +1,6 @@
 {
   "name": "hol4-mcp",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260908195019",
   "description": "Interactive HOL4 proof development for Codex through MCP tools, workflow guidance, and proof-policy hooks.",
   "author": {
     "name": "HOL4 MCP contributors"
