@@ -14,6 +14,7 @@ data directory without changing the Claude implementation or its state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ast
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -196,6 +197,20 @@ def _run(script_name: str, payload: dict[str, Any]) -> subprocess.CompletedProce
     script = plugin_root() / "hooks" / script_name
     if not script.is_file():
         raise ValueError(f"hook script not found: {script_name}")
+    # Inspect literal registration metadata without importing policy modules:
+    # imports could write state or depend on the child's isolated HOME.
+    metadata = {}
+    for node in ast.parse(script.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {"HOOK_EVENT", "HOOK_MATCHER"}:
+                    metadata[target.id] = ast.literal_eval(node.value)
+    if not {"HOOK_EVENT", "HOOK_MATCHER"} <= metadata.keys():
+        raise ValueError(f"hook registration metadata missing: {script_name}")
+    matcher = metadata["HOOK_MATCHER"]
+    if (metadata["HOOK_EVENT"] != (payload.get("hook_event_name") or "PreToolUse")
+            or (matcher is not None and not re.fullmatch(matcher, payload.get("tool_name", "")))):
+        return subprocess.CompletedProcess([sys.executable, str(script)], 0, "", "")
     runtime_home = data_root() / "runtime-home"
     runtime_home.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()

@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shlex
+import time
 
 import pytest
 
@@ -296,3 +298,73 @@ def test_plugin_files_reference_only_existing_codex_components():
     assert all("${PLUGIN_ROOT}" in command for command in commands)
     assert not any("h14_git_destructive_consent.py" in command for command in commands)
     assert not any("h22_hol4_context.py" in command for command in commands)
+
+
+def test_wired_build_poll_and_cancel_do_not_consume_stale_navigation_override(run_codex_hook, tmp_path):
+    root = tmp_path / "repo"
+    (root / "lib/.hol/objs").mkdir(parents=True)
+    (root / "app").mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    ancestor = root / "lib/libScript.sml"
+    ancestor.write_text("Theory lib\nTheorem example:\n T\nProof\n simp[]\nQED\n")
+    artifact = root / "lib/.hol/objs/libTheory.dat"
+    artifact.write_text("old artifact")
+    os.utime(artifact, (time.time() - 100, time.time() - 100))
+    script = root / "app/appScript.sml"
+    script.write_text("Theory app\nAncestors\n lib\nTheorem target:\n T\nProof\n simp[]\nQED\n")
+    (root / "app/Holmakefile").write_text("INCLUDES = ../lib\n")
+    wiring = json.loads((ROOT / "hooks/hooks.json").read_text())
+    group = next(g for g in wiring["hooks"]["PreToolUse"] if g["matcher"] == "^mcp__hol4__")
+    hooks = shlex.split(group["hooks"][0]["command"])[2:]
+    nav = payload(root, "mcp__hol4__hol_state_at", {"file": str(script), "line": 6})
+    denied = run_codex_hook(ADAPTER, nav, *hooks)
+    assert denied.returncode == 2 and "libScript.sml" in denied.stderr, denied
+    state = run_codex_hook.plugin_data / "runtime-home/.claude/hook-state/codex-test/soft_blocks.json"
+    before = state.read_bytes()
+    for tool, args in [
+        ("holmake", {"workdir": str(root / "lib"), "target": "libTheory.uo"}),
+        ("hol_build_status", {"job": "existing-job"}),
+        ("hol_build_status", {"job": "existing-job", "cancel": True}),
+    ]:
+        result = run_codex_hook(ADAPTER, payload(root, "mcp__hol4__" + tool, args), *hooks)
+        assert result.returncode == 0 and "OVERRIDDEN" not in result.stdout, result
+        assert state.read_bytes() == before
+    retried = run_codex_hook(ADAPTER, nav, *hooks)
+    assert retried.returncode == 0 and "H30 OVERRIDDEN" in retried.stdout, retried
+    assert not (run_codex_hook.real_home / ".claude").exists()
+
+
+@pytest.mark.parametrize("script,event,tool", [
+    ("h7_holmake_advisory.py", "PreToolUse", "mcp__hol4__holmake"),
+    ("h1_banned_tactics.py", "PreToolUse", "Bash"),
+])
+def test_adapter_skips_hooks_outside_declared_scope(tmp_path, monkeypatch, script, event, tool):
+    monkeypatch.syspath_prepend(str(CODEX))
+    monkeypatch.setenv("PLUGIN_ROOT", str(ROOT))
+    monkeypatch.setenv("PLUGIN_DATA", str(tmp_path / "plugin-data"))
+    import hook_adapter
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("out-of-scope hook must not be launched")
+
+    monkeypatch.setattr(hook_adapter.subprocess, "run", unexpected)
+    result = hook_adapter._run(script, payload(tmp_path, tool, {}, event=event))
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+
+
+def test_adapter_preserves_matching_hook_refusal(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(CODEX))
+    monkeypatch.setenv("PLUGIN_ROOT", str(ROOT))
+    monkeypatch.setenv("PLUGIN_DATA", str(tmp_path / "plugin-data"))
+    import hook_adapter
+    call = payload(tmp_path, "Edit", {"new_string": "TRY (simp[])"})
+    invocations = []
+
+    def refused(*args, **kwargs):
+        invocations.append(json.loads(kwargs["input"]))
+        return subprocess.CompletedProcess(args[0], 2, "", "H1 refuses TRY")
+
+    monkeypatch.setattr(hook_adapter.subprocess, "run", refused)
+    result = hook_adapter._run("h1_banned_tactics.py", call)
+    assert result.returncode == 2 and "H1" in result.stderr
+    assert invocations == [call]

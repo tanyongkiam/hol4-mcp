@@ -4,7 +4,7 @@ This directory is an adapter layer; the MCP server itself is client-neutral.
 
 ## Installing the local release
 
-The `0.1.0+codex.20260930` release is a local snapshot, not an upstream release.
+The `0.1.0+codex.20260930.1` release is a local snapshot, not an upstream release.
 Use the supplied wheel and plugin bundle together. Python 3.11 or newer and a
 built HOL4 installation are required; set `HOLDIR` if HOL is outside `~/HOL`.
 
@@ -13,7 +13,7 @@ From that directory, install the supplied wheel into a dedicated environment:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install dist/hol4_mcp-0.1.0+codex.20260930-py3-none-any.whl
+.venv/bin/python -m pip install dist/hol4_mcp-0.1.0+codex.20260930.1-py3-none-any.whl
 export PATH="$PWD/.venv/bin:$PATH"
 ```
 
@@ -31,9 +31,8 @@ marketplace points to it. The marketplace layout follows the
 [official OpenAI plugin documentation](https://developers.openai.com/plugins/build/plugins).
 For server tools alone, use the MCP configuration in the root README instead.
 
-In this packaged snapshot, build jobs that share HOL dependencies must run
-sequentially, even when their working directories differ. It predates the
-dependency-overlap guards subsequently added on `localfixes`.
+Build dependency coordination and recovery behavior are described by the
+`holmake` tool. This release includes the dependency-overlap guards.
 
 ## Boundary
 
@@ -72,8 +71,9 @@ is auditing Claude's `settings.json` wiring.
 2. `PreToolUse` passes Bash and HOL4 MCP arguments through unchanged. For
    `apply_patch`, the adapter materializes only referenced files in a temporary
    directory and derives an Edit payload without touching the working tree.
-3. The selected `h*.py` policies run sequentially with an isolated HOME. Exit
-   code 2 and stderr remain a hard block; advisory JSON is combined into one
+3. Policies matching their declared `HOOK_EVENT` and `HOOK_MATCHER` run
+   sequentially with an isolated HOME. Exit code 2 and stderr remain a hard
+   block; advisory JSON is combined into one
    Codex-compatible response.
 4. `PostToolUse` forwards `tool_response`, allowing the existing replay,
    failure, build, and proof-sweep advisories to work unchanged.

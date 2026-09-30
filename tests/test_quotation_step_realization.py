@@ -228,6 +228,31 @@ SUFFICES_CHAIN = "ALL_TAC \\\\ `q ∧ p` suffices_by metis_tac[]"
 
 
 class TestSufficesByRealization:
+    @pytest.mark.parametrize("quotes", [("`", "`"), ("‘", "’")])
+    async def test_cakeml_existential_assertion_agrees_with_native(self, hol_session, quotes):
+        # The assertion from completeness's nPTbase arm. Fix its otherwise
+        # polymorphic token/location types through the parked goal.
+        assertion = "∃e l t. pfx ++ sfx = (e,l)::t ∧ e ≠ LparT ∧ ¬isTyvarT e"
+        goal = assertion.replace("pfx ++", "(pfx : (num # num) list) ++")
+        quotation = quotes[0] + assertion + quotes[1]
+        source = quotation + " suffices_by (strip_tac >> metis_tac[])"
+        steps = await call_step_plan(hol_session, source)
+        actual = await remaining_goals(hol_session, steps[:1], goal)
+        assert actual is not None and len(actual) == 2
+        actual_json = await hol_session.send('goals_json();', timeout=10)
+        await hol_session.send(f'drop_all(); gf `{goal}`;', timeout=10)
+        native = await hol_session.send(
+            f'ef(goalFrag.expand (Q_TAC SUFF_TAC {quotation}));', timeout=10)
+        assert "Exception-" not in native and "error:" not in native, native
+        assert actual_json == await hol_session.send('goals_json();', timeout=10)
+        # Run the stripping closer too; compare assumptions as well as goals.
+        assert await remaining_goals(hol_session, steps, goal) is not None
+        actual_json = await hol_session.send('goals_json();', timeout=10)
+        await hol_session.send(f'drop_all(); gf `{goal}`;', timeout=10)
+        native = await hol_session.send(f'ef(goalFrag.expand ({source}));', timeout=10)
+        assert "Exception-" not in native and "error:" not in native, native
+        assert actual_json == await hol_session.send('goals_json();', timeout=10)
+
     @pytest.mark.parametrize("quotation", ["`q ∧ p`", "‘q ∧ p’"])
     async def test_closer_receives_native_implication(self, hol_session, quotation):
         steps = await call_step_plan(

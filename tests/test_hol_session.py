@@ -14,6 +14,24 @@ from hol4_mcp.hol_cursor import _is_hol_error
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+async def test_server_applies_and_restarts_with_explicit_heap_configuration(tmp_path):
+    from hol4_mcp import hol_mcp_server as srv
+    name = "heap_configuration"
+    try:
+        result = await srv.hol_start(str(tmp_path), name=name,
+                                     env={"HOL4_MCP_MAXHEAP_MB": "12288"})
+        assert "maxheap=12288 MB" in result, result
+        original_pid = srv._sessions[name].session.process.pid
+        assert srv._sessions[name].session.maxheap_mb == 12288
+        result = await srv.hol_setenv({"HOL4_MCP_MAXHEAP_MB": "10240"}, session=name)
+        assert "maxheap=10240 MB" in result, result
+        assert srv._sessions[name].session.process.pid != original_pid
+        assert srv._sessions[name].session.maxheap_mb == 10240
+        assert "2" in await srv.hol_send("1 + 1;", session=name)
+    finally:
+        await srv.hol_stop(session=name)
+
+
 @pytest.mark.parametrize("inherited,explicit,expected", [
     (None, None, 8192), ("10240", None, 10240),
     ("10240", "12288", 12288), (None, "256", 256),
