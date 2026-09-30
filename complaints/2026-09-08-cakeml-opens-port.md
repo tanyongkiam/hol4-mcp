@@ -12,25 +12,6 @@ document as permission to disable proof safeguards or to upstream the local-only
 
 ## Implementation ledger — 2026-09-09
 
-### Follow-up: approval ordering with bounded Codex history
-
-Observed in the real source-to-flat commit workflow: pending review
-`a2966eec2289` stored `after_user_count=64`, while Codex retained exactly 64
-prompts and placed the user's exact approval at index 63. The old shared
-approval policy could therefore never accept a new approval once that window
-was full. This was not user wording error or absent consent.
-
-The shared policy now matches hashed history suffix/prefix boundaries and
-uses monotone positions for both disclosure ordering and processed events.
-Append-only Claude transcripts and rolling Codex transcripts use the same
-implementation; no extra work is added to ordinary proving or status calls.
-Unknown/discontinuous history and legacy pending state are re-disclosed, not
-retroactively approved. Scope, class separation, expiry and revocation remain.
-Regressions cover rolling-window acceptance, preapproval rejection, expiry,
-revocation without old-message replay, and lost-boundary migration. The identical
-helper repair was deployed to the installed Codex cache; no approval state was
-manually edited and no hook registration or safeguard was disabled.
-
 Shared-code repairs are local and uncommitted. No client hook registration,
 real `~/.claude` state, Codex adapter, or CakeML proof was changed. The second
 batch repairs shared hook behavior, as authorized by the active goal.
@@ -49,7 +30,6 @@ batch repairs shared hook behavior, as authorized by the active goal.
 | C09 (partial) | Prefix operations record phase/item/span/elapsed/budget metadata, visible through `hol_sessions` without a HOL command. Timeout and repeated-slow-prefix advice no longer blames the target proof. Busy sessions are exempt from idle pruning. H6 does not turn prefix timeouts into repeated target-proof warnings. | Focused progress/timeout/checkpoint tests exercised the metadata and existing cache paths. The initial progress test exposed an early-initialization status KeyError, now fixed. Reusable expensive translation-gap checkpoints still need specific testing/repair. |
 | C10 (additional) | Context admission history is explicitly not a dependency list; actual kernel oracle evidence remains a separate warning, and target self-taint still refuses validation. Failures retain full submitted command/response and available phase metadata in private temporary JSON logs, including partial cancelled replies. | Live-HOL regression verifies that a later failed load remains visible as history but does not falsely label an earlier independent target as oracle-dependent. Genuine oracle-use tests remain. Evidence tests cover full multiline output, success-path zero disk writes, cancellation, failed log writes and live HOL protocol continuity. |
 | C11 | Explicit `holmake(..., trace_discovery=True)` records Linux syscall/path traces plus workdir/command/server PID/mount namespace metadata. Regular builds do not prepare or invoke a tracer. Tracer setup/permission errors are distinguished from proof failures. | The sandbox denied `PTRACE_TRACEME` before Holmake started; the same isolated test passed with approved tracing permission, recording the exact failed `chdir(...)=ENOENT` and namespace. Sandboxed full runs explicitly skip this live trace test when that capability is denied; the restricted diagnostic and no-trace fast path remain tested. No missing directory is silently created/ignored. |
-| C12 | H27 exceptions now require an explicitly approved review ID bound to repository/command/proof contents/findings. Style and incomplete-proof classes expire independently after 30 minutes; approvals survive status questions but do not create Git authority. The broad early `wip ok` bypass is removed. | Tests cover disclosure before approval, changed-scope rejection, separate admission/style classes, expiry without cross-class renewal, revocation, quoted/negated/history rejection, and status tools leaving approval state byte-identical. H14's existing Git gate is unchanged; a subsequent Git-permission message need not repeat the still-valid scoped audit approval. |
 
 Focused runs passed: 40 quotation/reporting tests; 46 heap/dependency/lifecycle
 tests. Corpus consistency: zero issues across 32 files. Final full suite:
@@ -84,11 +64,9 @@ predicted script content and left the index untouched during inspection; all
 C02's explicit recovery and dependency-performance regressions now pass; the
 third full suite passed **648 tests in 162.17 seconds**. Historical self-taint
 is never simply erased in a polluted heap, and oracle checks remain required.
-C09's translation-gap checkpoint validation, remaining C10 coverage,
-and C12 scoped consent remain open. C11's local opt-in tracing is implemented and validated with the
-required tracing permission. The H27
-message no longer tells the agent to request a magic consent phrase, but that
-alone does not resolve C12's scope/lifetime design.
+C09's translation-gap checkpoint validation and remaining C10 coverage
+remain open. C11's local opt-in tracing is implemented and validated with the
+required tracing permission.
 
 ### Regular-workflow performance requirement
 
@@ -150,12 +128,6 @@ postdate the 663-test full-suite result and require a final combined run.
 
 ### Remaining implementation/acceptance work
 
-- C12: replace unscoped/latest-message-only WIP bypass behavior with explicit
-  operation/content/finding-scoped approval and expiry. Keep Git authority,
-  incomplete-proof approval and style exceptions distinct. Status/automatic
-  goal turns must not manufacture or consume approval; do not preserve an
-  old broad pregrant indefinitely. The early WIP return currently also skips
-  prospective-content diagnosis and needs to move behind scope resolution.
 - C09: exercise effectful current-file prefixes across target edits, backward
   verification and invalidation. Keep valid existing checkpoint reuse; add a
   new checkpoint mechanism only if the test demonstrates a missing reuse path.
@@ -224,7 +196,7 @@ Evidence labels below distinguish:
   that a currently broken MCP component caused it.
 
 The original complaint preparation used read-only source inspection and the
-existing work record. Sections C01–C12 describe that inspection snapshot,
+existing work record. Sections C01–C11 describe that inspection snapshot,
 before the repairs in the implementation ledger above. No CakeML
 counterexample proofs were introduced. The ledger records subsequent tests.
 Historical repro-test docstrings in this repository are leads, not evidence
@@ -245,7 +217,6 @@ that every bug they describe still exists today.
 | C09 | P1 | Shared replay/diagnostics | Expensive prefixes and bad recovery advice |
 | C10 | P1 | Shared failure reporting | Raw failures and provenance are lost |
 | C11 | P2 | Environment/build diagnostics | Opaque discovery ENOENT; locally recovered |
-| C12 | P2 | Shared policy and client consent adapters | Override/consent ambiguity |
 
 P0 means verification semantics or reliable interpretation is affected. It
 does not mean an unsound HOL theorem was observed being accepted.
@@ -648,31 +619,6 @@ a proof failure. Document any required sandbox/host path contract for Codex.
 or safe handling; a truly missing required source remains an error. Do not
 recommend repeated unchanged builds based on the last printed scan line.
 
-## C12 — Override policy is inconsistent and insufficiently scoped
-
-**Policy/design issue observed while trying to commit completed work.**
-
-H27 offers a literal WIP override, while the skill says not to ask for a consent
-phrase. The user had earlier authorized local/WIP commits, but H27's
-`latest_user_message` checks only the latest turn. Other policies use broader
-session pregrants. The distinction between permission to commit, permission to
-commit admissions, and approval of an audited style exception is not clear.
-
-Calling a completed, kernel-checked proof “WIP” merely to waive inherited style
-findings also conflates two materially different approvals. Conversely,
-reusing an old broad pregrant forever would be unsafe. No such override was
-used for the blocked completed-proof tranches in this handoff.
-
-**Potential resolution:** reconcile skill, hook messages and client consent
-handling. Provide explicit, narrow approval scopes: named finding class,
-files/content fingerprint, intended operation, and expiry. Separate reviewed
-style exceptions from permission to record incomplete proofs. Do not infer
-consent from this complaint, a status question, or an automatic goal turn.
-
-**Acceptance:** both Claude and Codex represent the same approval consistently;
-unrelated new edits cannot inherit it; a status poll cannot consume or create
-an override. The user need not learn contradictory magic-phrase rules.
-
 ## Things this complaint does not blame on the tooling
 
 - Missing Open grammar alternatives and missing theorem cases were real port
@@ -708,8 +654,7 @@ an override. The user need not learn contradictory magic-phrase rules.
 1. Define the C06 distinction between precise hard gates and heuristic style
    advice, including reviewed exceptions.
 2. Make C07 audit the actual prospective commit tree; test partial staging.
-3. Add assertion-only and heavy-prefix workflows (C08/C09), and reconcile the
-   consent rules (C12) across runtime messages and the canonical skill.
+3. Add assertion-only and heavy-prefix workflows (C08/C09).
 4. Make H30 defensively reject only its intended operation classes even if
    invoked by an overly broad dispatcher. Preserve real freshness protection.
 
@@ -720,8 +665,7 @@ an override. The user need not learn contradictory magic-phrase rules.
 2. Update `integrations/codex/` and `hooks/hooks.json` to preserve per-policy
    matcher/event semantics. Cover actual manifest-to-adapter-to-hook execution,
    not just isolated child hooks.
-3. Preserve plugin-owned state isolation and stable prompt capture. Verify
-   equivalent approval semantics without silently broadening permissions.
+3. Preserve plugin-owned state isolation and stable prompt capture.
 4. Synchronize the bundled skill/messages, account for plugin cache/version
    changes, and report the effective server/helper/client revisions at startup.
 5. Re-run the CakeML cases on Codex before resuming the opens implementation.
