@@ -22,3 +22,8 @@ Before changing the HOL4 skill, hook policy, or MCP server guidance, read
 `skills/hol4-proving/notes/reference_hol4_docs.md`. Before changing this local
 server, also read `skills/hol4-proving/notes/reference_hol4_mcp.md` and preserve
 the local-only branch policy documented there.
+
+Whenever any agent encounters a suspected MCP bug or usability rough edge,
+record it in `complaints/` immediately, even if unconfirmed. Follow the report
+and periodic cleanup workflow in
+`skills/hol4-proving/notes/reference_hol4_mcp.md` (Complaint inbox).

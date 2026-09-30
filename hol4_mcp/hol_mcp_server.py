@@ -624,6 +624,9 @@ read the one you are about to call rather than guessing. Server-enforced
 refusals (a second concurrent session, shadow bindings) are policy firing,
 not errors to retry.
 
+Record suspected MCP issues and usability rough edges using the Complaint inbox
+workflow in ~/hol4-mcp/skills/hol4-proving/notes/reference_hol4_mcp.md.
+
 Do NOT:
 - Call hol_restart after file edits (state_at auto-detects changes)
 """)

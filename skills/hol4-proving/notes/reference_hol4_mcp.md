@@ -10,3 +10,26 @@ metadata:
 
 # `localfixes` branch — don't upstream
 `~/hol4-mcp` runs the `localfixes` branch, carrying user-curated commits intentionally NOT in `origin/master` (navigation/timeout fixes, diagnostics, guidance text, SDK monkey-patch). It is pushed to `origin/localfixes` as a backup; that is not a step towards merging. Don't propose cherry-picking them or opening a PR unless the user explicitly asks. When behaviour depends on a local-only commit, rely on `~/hol4-mcp` being live — that (not GitHub) is the source of truth for the running MCP.
+
+# Complaint inbox
+
+Every agent must record each suspected MCP issue or usability rough edge in
+`~/hol4-mcp/complaints/` as soon as it is encountered. Unconfirmed observations
+belong here too; label them **suspected**, rather than presenting a cause as
+established. Search existing reports first and append evidence to a matching
+report; otherwise create `YYYY-MM-DD-short-description.md`.
+
+Include the tool/operation, expected and observed behavior, relevant inputs
+and output, and the impact on the task. Prefer a minimal reproducer or regression
+test, with its command and result; if none is practical yet, say what remains
+untested. Keep reports concise and exclude credentials or unrelated private
+content. Recording a complaint does not require permission or authorize a
+repair outside the current task. If the inbox cannot be written, include the
+report in the user handoff and state the write failure.
+
+During MCP maintenance, review the inbox at the start and before finishing.
+Move useful reproducers into permanent tests. Once a report is fixed and tested,
+disproved with evidence, or explicitly dismissed by the user, record that
+disposition in the maintenance commit and remove the report. Retain unresolved
+reports; periodically empty resolved material rather than maintaining a second
+history here. Keep `complaints/.gitkeep` so the inbox remains tracked when empty.
