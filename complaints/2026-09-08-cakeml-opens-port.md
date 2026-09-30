@@ -48,7 +48,6 @@ batch repairs shared hook behavior, as authorized by the active goal.
 | C08 | H7 fingerprints the named target's authored proof blocks instead of relying on directory-wide script mtimes. | Assertion-only tests, translation-prefix edits, unrelated script edits and timestamp-only touches are silent; a real proof edit still triggers the reminder. |
 | C09 (partial) | Prefix operations record phase/item/span/elapsed/budget metadata, visible through `hol_sessions` without a HOL command. Timeout and repeated-slow-prefix advice no longer blames the target proof. Busy sessions are exempt from idle pruning. H6 does not turn prefix timeouts into repeated target-proof warnings. | Focused progress/timeout/checkpoint tests exercised the metadata and existing cache paths. The initial progress test exposed an early-initialization status KeyError, now fixed. Reusable expensive translation-gap checkpoints still need specific testing/repair. |
 | C10 (additional) | Context admission history is explicitly not a dependency list; actual kernel oracle evidence remains a separate warning, and target self-taint still refuses validation. Failures retain full submitted command/response and available phase metadata in private temporary JSON logs, including partial cancelled replies. | Live-HOL regression verifies that a later failed load remains visible as history but does not falsely label an earlier independent target as oracle-dependent. Genuine oracle-use tests remain. Evidence tests cover full multiline output, success-path zero disk writes, cancellation, failed log writes and live HOL protocol continuity. |
-| C13 (local validation/repair) | Use the installed Holmake's existing per-target locks, without adding a global lock. The MCP no longer deletes the entire target directory's prior/peer theory logs before spawning a build; failure excerpts distinguish changed logs from the request's own output. | Live tests run sibling builds against a shared artifact and detect overlapping writers/partial reads; both succeed. Cancelling one detached build leaves the independent job running to completion. A failed new build preserves unrelated diagnostic logs and does not attribute unchanged old logs to itself. Additional cancellation/shared-dependency stress coverage remains useful. |
 | C11 | Explicit `holmake(..., trace_discovery=True)` records Linux syscall/path traces plus workdir/command/server PID/mount namespace metadata. Regular builds do not prepare or invoke a tracer. Tracer setup/permission errors are distinguished from proof failures. | The sandbox denied `PTRACE_TRACEME` before Holmake started; the same isolated test passed with approved tracing permission, recording the exact failed `chdir(...)=ENOENT` and namespace. Sandboxed full runs explicitly skip this live trace test when that capability is denied; the restricted diagnostic and no-trace fast path remain tested. No missing directory is silently created/ignored. |
 | C12 | H27 exceptions now require an explicitly approved review ID bound to repository/command/proof contents/findings. Style and incomplete-proof classes expire independently after 30 minutes; approvals survive status questions but do not create Git authority. The broad early `wip ok` bypass is removed. | Tests cover disclosure before approval, changed-scope rejection, separate admission/style classes, expiry without cross-class renewal, revocation, quoted/negated/history rejection, and status tools leaving approval state byte-identical. H14's existing Git gate is unchanged; a subsequent Git-permission message need not repeat the still-valid scoped audit approval. |
 
@@ -86,8 +85,7 @@ C02's explicit recovery and dependency-performance regressions now pass; the
 third full suite passed **648 tests in 162.17 seconds**. Historical self-taint
 is never simply erased in a polluted heap, and oracle checks remain required.
 C09's translation-gap checkpoint validation, remaining C10 coverage,
-C12 scoped consent, and further C13 shared-dependency cancellation coverage
-remain open. C11's local opt-in tracing is implemented and validated with the
+and C12 scoped consent remain open. C11's local opt-in tracing is implemented and validated with the
 required tracing permission. The H27
 message no longer tells the agent to request a magic consent phrase, but that
 alone does not resolve C12's scope/lifetime design.
@@ -128,12 +126,6 @@ assert the explicit history label while retaining genuine oracle-use checks.
 The shared skill/notes are being reconciled with these behavioral changes; the
 same Codex cache-refresh deployment caveat applies to copied skill files.
 
-C13 investigation found existing native per-target locks in this HOL checkout
-(`HM_BuildLock`, `multibuild`) and cancellation/cache cleanup safeguards in
-`BuildCommand`. No additional build-wide lock has been added. Two live tests
-of overlap and independent cancellation passed in 0.35 seconds; this verifies
-those cases on the installed local Holmake, not every platform/toolchain.
-
 The next full run had **659 passes and one failure**: the concurrency fixture
 used the repository's read-only fixture directory, so each navigation's failed
 checkpoint generated a distinct evidence path. The fixture now copies its
@@ -167,8 +159,6 @@ postdate the 663-test full-suite result and require a final combined run.
 - C09: exercise effectful current-file prefixes across target edits, backward
   verification and invalidation. Keep valid existing checkpoint reuse; add a
   new checkpoint mechanism only if the test demonstrates a missing reuse path.
-- C13: coordination now guards jobs in one MCP server; investigate separate
-  server processes and retaining failed-output evidence across a restart.
 - C01/C03: perform the outstanding real CakeML parser-arm and heavy Candle
   dependency checks; existing toy/native-equivalence and heap tests are not
   those project-level checks.
@@ -234,7 +224,7 @@ Evidence labels below distinguish:
   that a currently broken MCP component caused it.
 
 The original complaint preparation used read-only source inspection and the
-existing work record. Sections C01–C13 describe that inspection snapshot,
+existing work record. Sections C01–C12 describe that inspection snapshot,
 before the repairs in the implementation ledger above. No CakeML
 counterexample proofs were introduced. The ledger records subsequent tests.
 Historical repro-test docstrings in this repository are leads, not evidence
@@ -256,7 +246,6 @@ that every bug they describe still exists today.
 | C10 | P1 | Shared failure reporting | Raw failures and provenance are lost |
 | C11 | P2 | Environment/build diagnostics | Opaque discovery ENOENT; locally recovered |
 | C12 | P2 | Shared policy and client consent adapters | Override/consent ambiguity |
-| C13 | P2 | Build orchestration | Overlapping builds can disturb shared artifacts |
 
 P0 means verification semantics or reliable interpretation is affected. It
 does not mean an unsound HOL theorem was observed being accepted.
@@ -683,26 +672,6 @@ consent from this complaint, a status question, or an automatic goal turn.
 **Acceptance:** both Claude and Codex represent the same approval consistently;
 unrelated new edits cannot inherit it; a status poll cannot consume or create
 an override. The user need not learn contradictory magic-phrase rules.
-
-## C13 — Independent-looking builds can write the same dependency artifacts
-
-**Partially repaired, 2026-09-30.** Native locks protected competing writers
-but a late-starting peer skipped an existing partial dependency. Cancellation
-also let a peer report success after copying a leftover partial file. Both
-failures reproduced before repair, including physical `.hol/objs/*.ui` output.
-
-The MCP now refuses overlapping mutable dependency directories among its own
-jobs and retains changed outputs from failed/cancelled builds as suspect.
-Independent jobs sharing read-only dependencies remain parallel. Tests also
-cover repair/retry, recursive cleanup, pre-exec rules/diagnostics, and budgets.
-`tests/test_build_coordination.py`: 13 passes; full suite: 754 passes, one
-capability skip. The tracing test passed separately outside the sandbox.
-
-**Remaining, suspected:** the registry and failed-output evidence are held in
-one server's memory. Separate MCP processes may still overlap; a restart loses
-the suspect-output registry. Add process-isolated and restart regressions before
-extending coordination. Preserve independent parallelism, job IDs/logs and
-process-group cancellation; do not treat an observation timeout as termination.
 
 ## Things this complaint does not blame on the tooling
 

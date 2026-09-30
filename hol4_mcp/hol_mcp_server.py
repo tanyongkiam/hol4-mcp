@@ -1708,7 +1708,7 @@ async def _kill_process_group(proc):
 _PROGRESS_INTERVAL = 10  # seconds
 
 
-async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace_discovery=False):
+async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace_discovery=False, detach=False):
     """Discover without executing recipes, then reserve mutable dependencies.
 
     Explicit targets bypass --json in some Holmake versions. --dirs takes
@@ -1734,6 +1734,7 @@ async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace
             heading = build_failure_heading(proc.returncode, output, bool(trace_note))
             raise ValueError(f"{heading}\n{output[-2000:]}")
         claim = claim_from_graph(stdout.decode("utf-8"), workdir, target)
+        claim.detached = detach
         claim.preflight_output += stderr.decode("utf-8", errors="replace")
     except asyncio.TimeoutError:
         return (f"ERROR: dependency preflight timed out after {timeout}s in {workdir}. "
@@ -1748,7 +1749,7 @@ async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace
     try:
         error = build_claims.register(claim)
         return error or claim
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return f"ERROR: dependency reservation in {workdir}: {exc}. No build was started."
 
 
@@ -1782,11 +1783,14 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
              With detach: the job id and log path.
 
     Before recipes run, checks the requested target's dependency graph. Refuses
-    directory overlaps with another build in this MCP server when either job
-    writes there; read-only dependencies may be shared. The error names the
+    directory overlaps with another MCP build on the same host and user when
+    either job writes there; read-only dependencies may be shared. The error names the
     blocking job/build and directories; wait for it to finish, then retry.
-    Changed outputs from failed/cancelled jobs may be partial and cannot be
-    reused unchanged as up-to-date dependencies. Inspect/remove and rebuild
+    Changed outputs from failed/cancelled jobs, or jobs whose controller died,
+    may be partial or unverified and cannot be reused unchanged as up-to-date
+    dependencies. Evidence survives server restarts in .hol4-mcp/build-state
+    beside the outputs; keep this generated directory out of version control.
+    Inspect/remove and rebuild
     them, or use a build whose graph explicitly schedules their reconstruction.
     Requires Holmake's --json/--dirs graph interface. External build processes
     and undeclared recipe/pre-exec outputs are outside this coordination.
@@ -1839,7 +1843,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
     start_time = time.monotonic()
     claim = await _build_claim(holmake_bin, workdir_path, proc_env, target,
-                               1800 if detach else timeout, trace_discovery)
+                               1800 if detach else timeout, trace_discovery, detach)
     if isinstance(claim, str):
         return claim
     if detach:
@@ -1858,6 +1862,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            pass_fds=tuple(claim.lock_fds),
         )
         claim.proc = proc
 
@@ -1953,6 +1958,7 @@ class _BuildJob:
     started: float
     finished: float | None = None
     trace_note: str = ""
+    claim: object = None
 
 
 _build_jobs: dict[str, _BuildJob] = {}
@@ -1976,6 +1982,7 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
             *cmd, cwd=workdir_path, env=proc_env,
             stdout=log_fh, stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            pass_fds=tuple(claim.lock_fds) if claim is not None else (),
         )
     finally:
         log_fh.close()
@@ -1983,14 +1990,15 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
         claim.proc = proc
         claim.detached = True
     job = _BuildJob(proc=proc, workdir=workdir_path, target=target, log=log,
-                    started=time.time(), trace_note=trace_note)
+                    started=time.time(), trace_note=trace_note, claim=claim)
     _build_jobs[job_id] = job
 
     async def _reap():
         await proc.wait()
-        job.finished = time.time()
+        await _kill_process_group(proc)
         if claim is not None:
             build_claims.finish(claim)
+        job.finished = time.time()
     asyncio.create_task(_reap())
     return (f"Build started in background: job={job_id} target={target or '(all)'} "
             f"workdir={workdir_path}\nlog={log}\n{trace_note}\n"
@@ -2017,6 +2025,8 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
     proc = entry.proc
     if cancel and proc.returncode is None:
         await _kill_process_group(proc)
+        if entry.claim is not None:
+            build_claims.finish(entry.claim)
         entry.finished = time.time()
         state = "cancelled"
     elif proc.returncode is None:
@@ -2031,6 +2041,8 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
     except OSError:
         text = ""
     head = f"{state}: job={job} target={entry.target or '(all)'} workdir={entry.workdir} [{elapsed:.0f}s]"
+    if entry.claim is not None and entry.claim.state_error:
+        head += f"\nWARNING: {entry.claim.state_error}"
     if state == "done":
         verdict = ("Build succeeded" if proc.returncode == 0 else
                    build_failure_heading(proc.returncode, text, bool(entry.trace_note)))

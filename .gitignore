@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .hol/
+.hol4-mcp/
 .agent-files/
 .agent-files.git/
 node_modules/
