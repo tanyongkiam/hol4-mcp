@@ -31,9 +31,9 @@ marketplace points to it. The marketplace layout follows the
 [official OpenAI plugin documentation](https://developers.openai.com/plugins/build/plugins).
 For server tools alone, use the MCP configuration in the root README instead.
 
-Build jobs that share HOL dependencies must run sequentially, even when their
-working directories differ. The known shared-build race remains covered by
-an expected-failure regression in `tests/test_build_coordination.py`.
+In this packaged snapshot, build jobs that share HOL dependencies must run
+sequentially, even when their working directories differ. It predates the
+dependency-overlap guards subsequently added on `localfixes`.
 
 ## Boundary
 

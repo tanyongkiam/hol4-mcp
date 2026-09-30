@@ -25,6 +25,8 @@ from weakref import WeakValueDictionary
 
 import anyio
 
+from .build_coordination import build_claims, claim_from_graph
+
 from . import _mcp_cancel_patch  # noqa: F401 — patches mcp SDK on import
 from fastmcp import FastMCP
 
@@ -1706,6 +1708,50 @@ async def _kill_process_group(proc):
 _PROGRESS_INTERVAL = 10  # seconds
 
 
+async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace_discovery=False):
+    """Discover without executing recipes, then reserve mutable dependencies.
+
+    Explicit targets bypass --json in some Holmake versions. --dirs takes
+    the graph-only path; select the requested target's closure ourselves.
+    Pre-exec hooks run here so generated rules participate in discovery;
+    the actual build disables them to avoid running them twice.
+    """
+    proc = None
+    trace_note = ""
+    try:
+        command = [str(holmake_bin), "--json", "--dirs", "."]
+        if target in {"clean", "cleanDeps", "cleanAll"}:
+            command.append("--no_preexecs")  # Native cleaning skips hooks.
+        command, trace_note = traced_build(command, workdir, trace_discovery, environment)
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=workdir, env=environment, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, start_new_session=True,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+        if proc.returncode:
+            output = (stderr + stdout).decode("utf-8", errors="replace")
+            heading = build_failure_heading(proc.returncode, output, bool(trace_note))
+            raise ValueError(f"{heading}\n{output[-2000:]}")
+        claim = claim_from_graph(stdout.decode("utf-8"), workdir, target)
+        claim.preflight_output += stderr.decode("utf-8", errors="replace")
+    except asyncio.TimeoutError:
+        return (f"ERROR: dependency preflight timed out after {timeout}s in {workdir}. "
+                f"No build was started; this is not a proof verdict.\n{trace_note}").rstrip()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return (f"ERROR: dependency preflight in {workdir}: {type(exc).__name__}: {exc}. "
+                f"No build was started; this is not a proof verdict.\n{trace_note}").rstrip()
+    finally:
+        await _kill_process_group(proc)
+    # No await between reservation and handoff: cancellation while cleaning
+    # up the discovery process must not strand an unowned reservation.
+    try:
+        error = build_claims.register(claim)
+        return error or claim
+    except OSError as exc:
+        return f"ERROR: dependency reservation in {workdir}: {exc}. No build was started."
+
+
 @mcp.tool()
 async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 600, heap_size: int = 12288, jobs: int = None, detach: bool = False, trace_discovery: bool = False) -> str:
     """Run Holmake --qof in directory.
@@ -1721,10 +1767,11 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         timeout: Max seconds to wait (default 600, max 1800). Ignored with detach.
         heap_size: Max heap size in MB for Poly/ML builds (default 12288)
         jobs: Max parallel jobs (-j flag). Default from HOL4_MCP_HOLMAKE_JOBS env var, or 1.
-        detach: Start the build in the background and return at once with
+        detach: After dependency discovery, start the build in the background with
                 `job=<id>` and the log path; poll hol_build_status(job=...).
                 For builds longer than the synchronous budget — never a shell
                 `nohup Holmake` (hook H28), which nothing reports on.
+                Discovery has its own 1800-second safety limit for detached jobs.
         trace_discovery: Opt-in Linux/strace diagnostic for opaque filesystem
                 or discovery failures (e.g. SysErr noent). Retains syscall/path
                 evidence and execution-context metadata under .hol. Adds
@@ -1733,6 +1780,16 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
              With detach: the job id and log path.
+
+    Before recipes run, checks the requested target's dependency graph. Refuses
+    directory overlaps with another build in this MCP server when either job
+    writes there; read-only dependencies may be shared. The error names the
+    blocking job/build and directories; wait for it to finish, then retry.
+    Changed outputs from failed/cancelled jobs may be partial and cannot be
+    reused unchanged as up-to-date dependencies. Inspect/remove and rebuild
+    them, or use a build whose graph explicitly schedules their reconstruction.
+    Requires Holmake's --json/--dirs graph interface. External build processes
+    and undeclared recipe/pre-exec outputs are outside this coordination.
     """
     # Validate limits
     timeout = max(1, min(timeout, 1800))
@@ -1764,7 +1821,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         jobs = int(os.environ.get("HOL4_MCP_HOLMAKE_JOBS", "1"))
     jobs = max(1, jobs)
 
-    cmd = [str(holmake_bin), "--qof", f"--heap-size={heap_size}"]
+    cmd = [str(holmake_bin), "--no_preexecs", "--qof", f"--heap-size={heap_size}"]
     if jobs > 1:
         cmd.extend(["-j", str(jobs)])
     if target:
@@ -1780,8 +1837,17 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     except (OSError, ValueError) as exc:
         return f"ERROR: preparing build diagnostics in {workdir_path}: {exc}"
 
+    start_time = time.monotonic()
+    claim = await _build_claim(holmake_bin, workdir_path, proc_env, target,
+                               1800 if detach else timeout, trace_discovery)
+    if isinstance(claim, str):
+        return claim
     if detach:
-        return await _start_detached_build(cmd, workdir_path, proc_env, target, trace_note)
+        try:
+            return await _start_detached_build(cmd, workdir_path, proc_env, target, trace_note, claim)
+        except BaseException:
+            build_claims.finish(claim)
+            raise
 
     proc = None
     try:
@@ -1793,16 +1859,16 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        claim.proc = proc
 
         # Poll stdout. Progress notifications were removed: a notification
         # in flight when the response is emitted races on the wire and the
         # client tears down the stdio transport on the late progressToken.
-        start_time = time.time()
-        stdout_chunks = []
+        stdout_chunks = [claim.preflight_output.encode("utf-8")]
         timed_out = False
 
         while True:
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
             if elapsed >= timeout:
                 timed_out = True
                 break
@@ -1827,7 +1893,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                     break
                 continue  # Keep polling
 
-        wall = time.time() - start_time
+        wall = time.monotonic() - start_time
 
         if timed_out:
             return f"ERROR: Build timed out after {timeout}s.\n{trace_note}"
@@ -1875,6 +1941,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         return f"ERROR: build in {workdir_path}: {type(e).__name__}: {e}\n{trace_note}".rstrip()
     finally:
         await _kill_process_group(proc)
+        build_claims.finish(claim)
 
 
 @dataclass
@@ -1892,16 +1959,19 @@ _build_jobs: dict[str, _BuildJob] = {}
 
 
 async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: dict,
-                                target: str | None, trace_note: str = "") -> str:
+                                target: str | None, trace_note: str = "", claim=None) -> str:
     """Spawn Holmake with its output on a log file under `.hol/` and register
     it as a job for hol_build_status."""
     import uuid
-    job_id = uuid.uuid4().hex[:8]
+    job_id = claim.token if claim is not None else uuid.uuid4().hex[:12]
     log_dir = workdir_path / ".hol"
     log_dir.mkdir(parents=True, exist_ok=True)
     log = log_dir / f"mcp-build-{job_id}.log"
     log_fh = open(log, "wb")
     try:
+        if claim is not None:
+            log_fh.write(claim.preflight_output.encode("utf-8"))
+            log_fh.flush()
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=workdir_path, env=proc_env,
             stdout=log_fh, stderr=asyncio.subprocess.STDOUT,
@@ -1909,6 +1979,9 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
         )
     finally:
         log_fh.close()
+    if claim is not None:
+        claim.proc = proc
+        claim.detached = True
     job = _BuildJob(proc=proc, workdir=workdir_path, target=target, log=log,
                     started=time.time(), trace_note=trace_note)
     _build_jobs[job_id] = job
@@ -1916,6 +1989,8 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     async def _reap():
         await proc.wait()
         job.finished = time.time()
+        if claim is not None:
+            build_claims.finish(claim)
     asyncio.create_task(_reap())
     return (f"Build started in background: job={job_id} target={target or '(all)'} "
             f"workdir={workdir_path}\nlog={log}\n{trace_note}\n"

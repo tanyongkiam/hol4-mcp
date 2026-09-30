@@ -167,9 +167,8 @@ postdate the 663-test full-suite result and require a final combined run.
 - C09: exercise effectful current-file prefixes across target edits, backward
   verification and invalidation. Keep valid existing checkpoint reuse; add a
   new checkpoint mechanism only if the test demonstrates a missing reuse path.
-- C13: strengthen cancellation coverage for two jobs sharing a dependency,
-  including a peer starting while the first is already building. Native locks
-  are demonstrated in the tested cases, not assumed to solve every race.
+- C13: coordination now guards jobs in one MCP server; investigate separate
+  server processes and retaining failed-output evidence across a restart.
 - C01/C03: perform the outstanding real CakeML parser-arm and heavy Candle
   dependency checks; existing toy/native-equivalence and heap tests are not
   those project-level checks.
@@ -687,24 +686,23 @@ an override. The user need not learn contradictory magic-phrase rules.
 
 ## C13 — Independent-looking builds can write the same dependency artifacts
 
-**Observed operational collision; agent scheduling contributed.**
+**Partially repaired, 2026-09-30.** Native locks protected competing writers
+but a late-starting peer skipped an existing partial dependency. Cancellation
+also let a peer report success after copying a leftover partial file. Both
+failures reproduced before repair, including physical `.hol/objs/*.ui` output.
 
-A failed compiler-proof build killed its SexpProg work while a concurrent
-standard-kernel build depended on the same artifacts. The latter failed with a
-missing `SexpProgScript.ui`. Serializing the resumed prerequisite chain resolved
-the incident. This is not proof that the kernel proof or SexpProg was false,
-and it should not be blamed wholly on the server: overlapping chains were
-started by the agent.
+The MCP now refuses overlapping mutable dependency directories among its own
+jobs and retains changed outputs from failed/cancelled builds as suspect.
+Independent jobs sharing read-only dependencies remain parallel. Tests also
+cover repair/retry, recursive cleanup, pre-exec rules/diagnostics, and budgets.
+`tests/test_build_coordination.py`: 13 passes; full suite: 754 passes, one
+capability skip. The tracing test passed separately outside the sandbox.
 
-**Potential resolution:** expose dependency overlap, lock shared build outputs,
-or warn before overlapping writers. Cancellation should report affected
-artifacts and jobs, not leave the caller guessing whether another build is
-still safe. Preserve independent parallelism where closures do not overlap.
-
-**Acceptance:** overlapping jobs cannot silently consume partially written
-shared interfaces; cancellation does not kill an unrelated process group.
-Status timeout is not treated as job termination or grounds for automatic
-restart. Existing detached job IDs/logs are useful and should be retained.
+**Remaining, suspected:** the registry and failed-output evidence are held in
+one server's memory. Separate MCP processes may still overlap; a restart loses
+the suspect-output registry. Add process-isolated and restart regressions before
+extending coordination. Preserve independent parallelism, job IDs/logs and
+process-group cancellation; do not treat an observation timeout as termination.
 
 ## Things this complaint does not blame on the tooling
 
