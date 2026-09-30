@@ -98,6 +98,8 @@ tool_timeout_sec = 1800
 
 The MCP-only setup exposes the tools, but not the bundled proof skill or
 lifecycle hooks. See `integrations/codex/README.md` for the adapter boundary.
+For the local release bundle and installation commands, see
+[`integrations/codex/README.md`](integrations/codex/README.md#installing-the-local-release).
 
 ### Claude Desktop
 

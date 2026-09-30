@@ -2,6 +2,39 @@
 
 This directory is an adapter layer; the MCP server itself is client-neutral.
 
+## Installing the local release
+
+The `0.1.0+codex.20260930` release is a local snapshot, not an upstream release.
+Use the supplied wheel and plugin bundle together. Python 3.11 or newer and a
+built HOL4 installation are required; set `HOLDIR` if HOL is outside `~/HOL`.
+
+Extract the plugin bundle into `~/hol4-mcp` (or another permanent directory).
+From that directory, install the supplied wheel into a dedicated environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install dist/hol4_mcp-0.1.0+codex.20260930-py3-none-any.whl
+export PATH="$PWD/.venv/bin:$PATH"
+```
+
+Start Codex from a shell with this `PATH` and your `HOLDIR`. Register the bundled
+local marketplace and install its plugin:
+
+```bash
+codex plugin marketplace add "$PWD"
+codex plugin add hol4-mcp@hol4-local
+```
+
+Restart Codex, enable/trust the bundled hooks through `/hooks`, and ask it to
+start a HOL session and evaluate `1 + 1;`. Keep the extracted directory: the
+marketplace points to it. The marketplace layout follows the
+[official OpenAI plugin documentation](https://developers.openai.com/plugins/build/plugins).
+For server tools alone, use the MCP configuration in the root README instead.
+
+Build jobs that share HOL dependencies must run sequentially, even when their
+working directories differ. The known shared-build race remains covered by
+an expected-failure regression in `tests/test_build_coordination.py`.
+
 ## Boundary
 
 | Concern | Codex implementation | Shared/Claude implementation |
