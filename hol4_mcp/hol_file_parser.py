@@ -133,15 +133,17 @@ def _needs_infix_parens(text: str) -> bool:
 def _frag_to_cmd(kind: str, text: str) -> str:
     """Wrap a fragment (type, text) into an SML ef() command string.
 
-    - expand: ef(goalFrag.expand(<text>));  (parens added if text starts with >-)
-    - expand_list: ef(goalFrag.expand_list(<text>));  (for >~ pattern selectors)
+    - expand: ef(goalFrag.expand(<text>)(Context.snapshot()));  (parens added if text starts with >-)
+    - expand_list: ef(goalFrag.expand_list(<text>)(Context.snapshot()));  (for >~ pattern selectors)
     - open/mid/close: ef(goalFrag.<text>);
+
+    goalFrag.expand/expand_list take the Context.t to run the tactic against.
     """
     if kind == "expand":
         inner = f"({text})" if _needs_infix_parens(text) else text
-        return f"ef(goalFrag.expand({inner}));"
+        return f"ef(goalFrag.expand({inner})(Context.snapshot()));"
     elif kind == "expand_list":
-        return f"ef(goalFrag.expand_list({text}));"
+        return f"ef(goalFrag.expand_list({text})(Context.snapshot()));"
     else:
         return f"ef(goalFrag.{text});"
 

@@ -46,15 +46,15 @@ class TestGoalfragStepPlanBasic:
         """Single tactic returns one step."""
         result = await call_step_plan(hol_session, "simp[]")
         assert len(result) == 1
-        assert "ef(goalFrag.expand(simp[]))" in result[0].cmd
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()))" in result[0].cmd
 
     async def test_then_chain(self, hol_session):
         """>> chain returns one step per tactic."""
         result = await call_step_plan(hol_session, "a >> b >> c")
         assert len(result) == 3
-        assert "ef(goalFrag.expand(a))" in result[0].cmd
-        assert "ef(goalFrag.expand(b))" in result[1].cmd
-        assert "ef(goalFrag.expand(c))" in result[2].cmd
+        assert "ef(goalFrag.expand(a)(Context.snapshot()))" in result[0].cmd
+        assert "ef(goalFrag.expand(b)(Context.snapshot()))" in result[1].cmd
+        assert "ef(goalFrag.expand(c)(Context.snapshot()))" in result[2].cmd
 
     async def test_ends_are_monotonic(self, hol_session):
         """End offsets should be monotonically non-decreasing."""
@@ -87,14 +87,14 @@ class TestGoalfragThen1Decomposition:
         """`a >- b` → expand(a), open_then1, expand(b), close_paren."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[]")
         cmds = [s.cmd for s in result]
-        assert "ef(goalFrag.expand(conj_tac));" in cmds
+        assert "ef(goalFrag.expand(conj_tac)(Context.snapshot()));" in cmds
         assert "ef(goalFrag.open_then1);" in cmds
-        assert "ef(goalFrag.expand(simp[]));" in cmds
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()));" in cmds
         assert "ef(goalFrag.close_paren);" in cmds
         # Order: expand base, open, expand arm, close
-        assert cmds.index("ef(goalFrag.expand(conj_tac));") < cmds.index("ef(goalFrag.open_then1);")
-        assert cmds.index("ef(goalFrag.open_then1);") < cmds.index("ef(goalFrag.expand(simp[]));")
-        assert cmds.index("ef(goalFrag.expand(simp[]));") < cmds.index("ef(goalFrag.close_paren);")
+        assert cmds.index("ef(goalFrag.expand(conj_tac)(Context.snapshot()));") < cmds.index("ef(goalFrag.open_then1);")
+        assert cmds.index("ef(goalFrag.open_then1);") < cmds.index("ef(goalFrag.expand(simp[])(Context.snapshot()));")
+        assert cmds.index("ef(goalFrag.expand(simp[])(Context.snapshot()));") < cmds.index("ef(goalFrag.close_paren);")
 
     async def test_nested_then1(self, hol_session):
         """Chained >- decomposes each arm."""
@@ -111,9 +111,9 @@ class TestGoalfragThen1Decomposition:
         """`by` (sugar for >-) decomposes the same way."""
         result = await call_step_plan(hol_session, "strip_tac by simp[]")
         cmds = [s.cmd for s in result]
-        assert "ef(goalFrag.expand(strip_tac));" in cmds
+        assert "ef(goalFrag.expand(strip_tac)(Context.snapshot()));" in cmds
         assert "ef(goalFrag.open_then1);" in cmds
-        assert "ef(goalFrag.expand(simp[]));" in cmds
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()));" in cmds
         assert "ef(goalFrag.close_paren);" in cmds
 
 
@@ -473,9 +473,9 @@ class TestByDistribution:
         # Goal: T /\ T  (after conj_tac, 2 identical T goals)
         cmd = (
             'verify_theorem_json "T /\\\\ T" "by_multigoal_thm" '
-            '["ef(goalFrag.expand(conj_tac))",'
-            ' "ef(goalFrag.expand(`1+1 = 2` by EVAL_TAC))",'
-            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH))"] false 10.0;'
+            '["ef(goalFrag.expand(conj_tac)(Context.snapshot()))",'
+            ' "ef(goalFrag.expand(`1+1 = 2` by EVAL_TAC)(Context.snapshot()))",'
+            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH)(Context.snapshot()))"] false 10.0;'
         )
         result = await hol_session.send(cmd, timeout=30)
         ok_line = next(
@@ -505,12 +505,12 @@ class TestByDistribution:
         await hol_session.send('drop_all();', timeout=5)
         cmd = (
             'verify_theorem_json "T /\\\\ T" "by_multigoal_thm_old" '
-            '["ef(goalFrag.expand(conj_tac))",'
-            ' "ef(goalFrag.expand(sg `1+1 = 2`))",'
+            '["ef(goalFrag.expand(conj_tac)(Context.snapshot()))",'
+            ' "ef(goalFrag.expand(sg `1+1 = 2`)(Context.snapshot()))",'
             ' "ef(goalFrag.open_then1)",'
-            ' "ef(goalFrag.expand(EVAL_TAC))",'
+            ' "ef(goalFrag.expand(EVAL_TAC)(Context.snapshot()))",'
             ' "ef(goalFrag.close_paren)",'
-            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH))"] false 10.0;'
+            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH)(Context.snapshot()))"] false 10.0;'
         )
         result = await hol_session.send(cmd, timeout=30)
         ok_line = next(
@@ -878,7 +878,7 @@ class TestResumeGoalExtraction:
         # `ASM_REWRITE_TAC[]` closes `p` given `p` is in the asms (added by strip_tac).
         cmd = (
             'verify_resume_json "split_conj" "p_case" "split_conj_p_case" '
-            '["ef(goalFrag.expand(ASM_REWRITE_TAC[]))"] false 10.0;'
+            '["ef(goalFrag.expand(ASM_REWRITE_TAC[])(Context.snapshot()))"] false 10.0;'
         )
         result = await hol_session.send(cmd, timeout=20)
         ok_line = next(

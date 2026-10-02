@@ -242,14 +242,14 @@ class TestSufficesByRealization:
         actual_json = await hol_session.send('goals_json();', timeout=10)
         await hol_session.send(f'drop_all(); gf `{goal}`;', timeout=10)
         native = await hol_session.send(
-            f'ef(goalFrag.expand (Q_TAC SUFF_TAC {quotation}));', timeout=10)
+            f'ef(goalFrag.expand (Q_TAC SUFF_TAC {quotation}) (Context.snapshot()));', timeout=10)
         assert "Exception-" not in native and "error:" not in native, native
         assert actual_json == await hol_session.send('goals_json();', timeout=10)
         # Run the stripping closer too; compare assumptions as well as goals.
         assert await remaining_goals(hol_session, steps, goal) is not None
         actual_json = await hol_session.send('goals_json();', timeout=10)
         await hol_session.send(f'drop_all(); gf `{goal}`;', timeout=10)
-        native = await hol_session.send(f'ef(goalFrag.expand ({source}));', timeout=10)
+        native = await hol_session.send(f'ef(goalFrag.expand ({source}) (Context.snapshot()));', timeout=10)
         assert "Exception-" not in native and "error:" not in native, native
         assert actual_json == await hol_session.send('goals_json();', timeout=10)
 
@@ -262,7 +262,7 @@ class TestSufficesByRealization:
         actual_json = await hol_session.send('goals_json();', timeout=10)
         await hol_session.send('drop_all(); gf `p ∧ q`;', timeout=10)
         native = await hol_session.send(
-            f'ef(goalFrag.expand (Q_TAC SUFF_TAC {quotation}));', timeout=10)
+            f'ef(goalFrag.expand (Q_TAC SUFF_TAC {quotation}) (Context.snapshot()));', timeout=10)
         assert "Exception-" not in native and "error:" not in native, native
         native_json = await hol_session.send('goals_json();', timeout=10)
         assert actual_json == native_json
@@ -275,7 +275,7 @@ class TestSufficesByRealization:
         actual = await remaining_goals(hol_session, steps, goal)
         await hol_session.send('drop_all();', timeout=10)
         await hol_session.send(f'gf `{goal}`;', timeout=10)
-        native = await hol_session.send(f'ef(goalFrag.expand ({source}));', timeout=10)
+        native = await hol_session.send(f'ef(goalFrag.expand ({source}) (Context.snapshot()));', timeout=10)
         assert "Exception-" not in native and "error:" not in native, native
         expected = await hol_session.send('goals_json();', timeout=10)
         expected = next(json.loads(l)['ok'] for l in expected.splitlines()

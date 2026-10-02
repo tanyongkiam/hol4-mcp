@@ -238,10 +238,17 @@ fun altSpan (TacticParse.Subgoal (s, e)) = SOME (s, e)
   | altSpan (TacticParse.LSelectGoals p) = SOME p
   | altSpan _ = NONE
 
-(* Extract fragment type: "expand", "open", "mid", "close", or "select" *)
+(* Extract fragment type: "expand", "open", "mid", "close", "select", or
+   "open_by"/"open_suffices_by" (merged away by merge_by_steps) *)
 fun frag_type (TacticParse.FAtom (TacticParse.LSelectGoal _)) = "select"
   | frag_type (TacticParse.FAtom (TacticParse.LSelectGoals _)) = "selects"
-  | frag_type (TacticParse.FAtom _) = "expand"
+  | frag_type (TacticParse.FAtom (TacticParse.OOpaque _)) = "expand"
+  | frag_type (TacticParse.FAtom (TacticParse.List _)) = "expand"
+  | frag_type (TacticParse.FAtom a) =
+      (* list_tactic atoms (e.g. THEN_LT Q.SELECT_GOALS_LT_THEN ...) need expand_list *)
+      if TacticParse.isTac a then "expand" else "expand_list"
+  | frag_type (TacticParse.FFOpen (TacticParse.FOpenBy _)) = "open_by"
+  | frag_type (TacticParse.FFOpen (TacticParse.FOpenSufficesBy _)) = "open_suffices_by"
   | frag_type (TacticParse.FFOpen _) = "open"
   | frag_type (TacticParse.FFMid _) = "mid"
   | frag_type (TacticParse.FFClose _) = "close"
@@ -303,6 +310,10 @@ fun frag_text proofBody (TacticParse.FAtom a) =
              if spanIsTactic a then raw else "Q.RENAME_TAC " ^ raw
          | _ => raw
       end
+  | frag_text proofBody (TacticParse.FFOpen (TacticParse.FOpenBy (s, e))) =
+      String.substring(proofBody, s, e - s)
+  | frag_text proofBody (TacticParse.FFOpen (TacticParse.FOpenSufficesBy (s, e))) =
+      String.substring(proofBody, s, e - s)
   | frag_text _ (TacticParse.FFOpen opn) = openFragName opn
   | frag_text _ (TacticParse.FFMid mid) = midFragName mid
   | frag_text _ (TacticParse.FFClose cls) = closeFragName cls
@@ -474,7 +485,8 @@ fun merge_select_steps [] acc = rev acc
           val (sels, afterSels) = collectSelects rest [patText]
           (* Build the SELECT_GOAL_LT/SELECT_GOALS_LT prefix *)
           fun mkSelectPrefix [] = ""  (* shouldn't happen *)
-            | mkSelectPrefix [p] = "Q.SELECT_GOAL_LT " ^ p
+            | mkSelectPrefix [p] =
+                (if kind = "selects" then "Q.SELECT_GOALS_LT " else "Q.SELECT_GOAL_LT ") ^ p
             | mkSelectPrefix (p :: ps) = "Q.SELECT_GOAL_LT " ^ p ^ " >>~ Q.SELECT_GOALS_LT " ^
                 String.concatWith " >>~ Q.SELECT_GOALS_LT " ps
           val selectPrefix = mkSelectPrefix sels
@@ -621,8 +633,48 @@ fun merge_by_steps [] acc = rev acc
         end
       else
         merge_by_steps rest ((endP, "expand", subgoalText) :: acc)
-  | merge_by_steps (step :: rest) acc =
-      merge_by_steps rest (step :: acc)
+  | merge_by_steps ((endP, kind, q) :: rest) acc =
+      if kind = "open_by" orelse kind = "open_suffices_by" then
+        (* Newer TacticParse linearizes `q by tac` as [open_by q, body, close].
+           Merge into one atomic step as above; if the body is not a flat
+           arm, open it natively with open_then1_with, as HOL's LSP does. *)
+        let
+          val (conn, byA) = if kind = "open_by"
+                            then (" by ", "BasicProvers.byA")
+                            else (" suffices_by ", "BasicProvers.suffices_byA")
+          fun walkArm [] _ = NONE
+            | walkArm ((closeEnd, "close", _) :: rest') texts =
+                (case rev texts of
+                   [] => NONE
+                 | [single] => SOME (q ^ conn ^ single, closeEnd, rest')
+                 | many => SOME (q ^ conn ^ "(" ^
+                                 String.concatWith " >> " many ^ ")",
+                                 closeEnd, rest'))
+            | walkArm ((_, "expand", t) :: rest') texts =
+                walkArm rest' (t :: texts)
+            | walkArm _ _ = NONE
+          (* `tac1 by tac2` with a tactic on the left means tac1 >- tac2 *)
+          val isQuote = startsWithQuote q
+        in
+          if not isQuote then
+            merge_by_steps rest ((endP, "open", "open_then1") ::
+                                 (endP, "expand", q) :: acc)
+          else if kind = "open_suffices_by" then
+            (* step through it, realizing the operand as frag_text does for
+               the older ThenLT (Subgoal, [LReverse]) form *)
+            merge_by_steps rest ((endP, "open", "open_then1") ::
+                                 (endP, "expand", "Q_TAC SUFF_TAC " ^ q) :: acc)
+          else
+          case walkArm rest [] of
+            SOME (combinedText, closeEnd, rest') =>
+              merge_by_steps rest' ((closeEnd, "expand", combinedText) :: acc)
+          | NONE =>
+              merge_by_steps rest
+                ((endP, "open", "open_then1_with (" ^ byA ^ " (" ^ q ^
+                                ", Tactical.ALL_TAC)) (Context.snapshot())") :: acc)
+        end
+      else
+        merge_by_steps rest ((endP, kind, q) :: acc)
 
 (* goalfrag_step_plan: Generate fragment steps from linearize fragments.
    Returns (end_offset, type, text) triples for every navigable position.
@@ -656,6 +708,8 @@ fun goalfrag_step_plan proofBody =
             val (endPos, newLast) = case f of
                 TacticParse.FAtom _ =>
                   (let val e = fragEnd f in (e, e) end)
+              | TacticParse.FFOpen (TacticParse.FOpenBy (_, e)) => (e, e)
+              | TacticParse.FFOpen (TacticParse.FOpenSufficesBy (_, e)) => (e, e)
               | _ => (lastAtomEnd, lastAtomEnd)
           in
             if String.size x > 0
@@ -941,7 +995,7 @@ fun run_resume_canonical_json suspension_name label_name name tactics store time
         "let val hol4mcp_tac = (" ^ combined ^ ") " ^
         "    val hol4mcp_resume_thm = markerLib.resume " ^
         "{suspension_name = \"" ^ String.toString suspension_name ^
-        "\", label_name = \"" ^ String.toString label_name ^ "\"} hol4mcp_tac " ^
+        "\", label_name = \"" ^ String.toString label_name ^ "\"} hol4mcp_tac (Context.snapshot()) " ^
         save_decl ^
         "    val () = hol4mcp_resume_oracles := ((Lib.set_diff (fst (Tag.dest_tag (Thm.tag hol4mcp_resume_thm))) [\"DISK_THM\"]) handle _ => []) " ^
         "in () end"

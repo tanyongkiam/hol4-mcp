@@ -83,7 +83,8 @@ async def test_marker_resume_registers_subsuspensions(hol_session_tmpdir):
     await _stash_parent_with_suspend_A(hol_session_tmpdir)
     out = await hol_session_tmpdir.send(
         'val _ = markerLib.resume {suspension_name="nested", label_name="A"} '
-        '  (strip_tac >> conj_tac >- markerLib.suspend "B" >- first_assum ACCEPT_TAC);'
+        '  (strip_tac >> conj_tac >- markerLib.suspend "B" >- first_assum ACCEPT_TAC)'
+        '  (Context.snapshot());'
         ' val pt_nested = #1 (valOf (markerLib.lookup_suspension "nested"));'
         ' val b_resumptions = markerLib.lookup_resumption '
         '   {parent_thy=pt_nested, parent_name="nested", label="B"};'

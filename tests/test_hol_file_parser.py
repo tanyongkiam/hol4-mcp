@@ -1143,10 +1143,10 @@ class TestNeedsInfixParens:
 
 class TestFragToCmdInfix:
     def test_bare_infix_gets_parens(self):
-        assert _frag_to_cmd("expand", ">- strip_tac") == "ef(goalFrag.expand((>- strip_tac)));"
+        assert _frag_to_cmd("expand", ">- strip_tac") == "ef(goalFrag.expand((>- strip_tac))(Context.snapshot()));"
 
     def test_normal_tactic_no_extra_parens(self):
-        assert _frag_to_cmd("expand", "strip_tac") == "ef(goalFrag.expand(strip_tac));"
+        assert _frag_to_cmd("expand", "strip_tac") == "ef(goalFrag.expand(strip_tac)(Context.snapshot()));"
 
     def test_open_step_unchanged(self):
         assert _frag_to_cmd("open", "open_then1") == "ef(goalFrag.open_then1);"
