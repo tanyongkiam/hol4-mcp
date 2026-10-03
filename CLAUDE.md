@@ -17,8 +17,9 @@ $PY -m pip install -e .
 $PY -m pytest tests/ -q
 ```
 
-Requires `pytest`, `pytest-asyncio` and `pytest-xdist` (for the `-n` in the
-`pyproject` addopts) in that same environment.
+Requires `pytest` and `pytest-asyncio` in that same environment.  Run the
+suite serially: the HOL process and build-coordination integration tests are
+not safe under pytest-xdist.
 
 ## FastMCP
 
