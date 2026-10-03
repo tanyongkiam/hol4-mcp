@@ -62,9 +62,10 @@ async def test_hol_log_reads_byte_tail_or_explicit_unlimited(tmp_path, monkeypat
 async def test_build_status_reads_only_requested_bytes(tmp_path, monkeypatch, tail):
     path = tmp_path / "build.log"
     path.write_bytes(b"x" * (1024 * 1024) + "αβγ".encode())
-    entry = SimpleNamespace(proc=SimpleNamespace(returncode=0), log=path,
-                            started=time.time(), finished=time.time(),
-                            target="result", workdir=tmp_path, trace_note="", claim=None)
+    entry = srv._BuildJob(proc=SimpleNamespace(returncode=0), workdir=tmp_path,
+                          target="result", log=path, started=time.time(),
+                          finished=time.time())
+    entry.done.set()
     monkeypatch.setitem(srv._build_jobs, "log-limit", entry)
     requests = _watch_reads(monkeypatch, path, tail)
     result = await srv.hol_build_status("log-limit", tail=tail)

@@ -536,7 +536,7 @@ class FileProofCursor:
         # Include absent interfaces and earlier load-path candidates: a newly
         # built or newly shadowing artifact invalidates the loaded context too.
         self._dep_artifacts: dict[str, dict[Path, tuple[int, int, int] | None]] = {}
-        self._dep_parent_stamps: dict[Path, tuple | None] = {}
+        self._dep_parent_stamps: dict[Path, tuple[tuple | None, bool]] = {}
         self._dep_dangling_links: dict[Path, str] = {}
         self._dep_present_artifacts: list[tuple[str, Path, tuple]] = []
         self._dep_absent_artifacts: dict[Path, list[tuple[str, Path]]] = {}
@@ -623,6 +623,12 @@ class FileProofCursor:
                 f"(budget {budget:g}s per dependency, env "
                 f"HOL4_MCP_DEP_LOAD_TIMEOUT). The Holmakefile {heap}.")
 
+    # Filesystem timestamps are coarse (kernel tick, or whole seconds on some
+    # filesystems): a directory entry created within this window of the
+    # directory's own mtime can leave that mtime unchanged, so a stamp taken
+    # inside the window cannot prove the directory unchanged.
+    _RACY_WINDOW_NS = 2_000_000_000
+
     @staticmethod
     def _artifact_stamp(path: Path) -> tuple[int, int, int] | None:
         try:
@@ -660,7 +666,7 @@ class FileProofCursor:
                     # be hidden behind a newer directory snapshot.
                     parent = path.parent
                     if parent not in self._dep_parent_stamps:
-                        self._dep_parent_stamps[parent] = self._directory_stamp(parent)
+                        self._dep_parent_stamps[parent] = self._directory_sample(parent)
                     stamp = self._artifact_stamp(path)
                     artifacts[path] = stamp
                     if stamp is not None:
@@ -678,6 +684,13 @@ class FileProofCursor:
             return None
         return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev
 
+    def _directory_sample(self, path: Path) -> tuple[tuple | None, bool]:
+        """(stamp, trusted): a stamp is trusted to prove the directory unchanged
+        only once its mtime is older than _RACY_WINDOW_NS at sampling time."""
+        stamp = self._directory_stamp(path)
+        trusted = stamp is None or time.time_ns() - stamp[0] > self._RACY_WINDOW_NS
+        return stamp, trusted
+
     def _check_dep_artifacts(self) -> str | None:
         """First dependency changed, created or removed since initialization.
 
@@ -686,9 +699,10 @@ class FileProofCursor:
         """
         # Large load paths have many absent candidates. An unchanged parent
         # cannot acquire a new directory entry; stat it once per call rather
-        # than every absent file. No TTL or relaxed freshness window. Existing
-        # files and dangling symlinks still need direct stats (the latter's
-        # target can appear without changing the link's own directory).
+        # than every absent file, unless its recorded stamp is untrusted
+        # (_directory_sample), in which case the candidates are scanned.
+        # Existing files and dangling symlinks still need direct stats (the
+        # latter's target can appear without changing the link's own directory).
         if not self._dep_artifacts:
             return None
         for dep, path, stamp in self._dep_present_artifacts:
@@ -699,8 +713,9 @@ class FileProofCursor:
                 return dep
         parents = {}
         for parent, candidates in self._dep_absent_artifacts.items():
-            parents[parent] = self._directory_stamp(parent)
-            if parents[parent] == self._dep_parent_stamps[parent]:
+            recorded, trusted = self._dep_parent_stamps[parent]
+            parents[parent] = self._directory_sample(parent)
+            if trusted and parents[parent][0] == recorded:
                 continue
             for dep, path in candidates:
                 if self._artifact_stamp(path) is not None:

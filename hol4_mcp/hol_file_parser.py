@@ -1,18 +1,8 @@
 """Parse HOL4 script files for theorem structure."""
 
-import bisect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-
-
-@dataclass
-class TacticSpan:
-    """A tactic with its source position."""
-    text: str
-    start: tuple[int, int]  # (line, col), 1-indexed
-    end: tuple[int, int]    # (line, col), 1-indexed
-    use_eall: bool = False  # True if tactic should apply to ALL goals (for >> chains)
 
 
 def build_line_starts(content: str) -> list[int]:
@@ -26,14 +16,6 @@ def build_line_starts(content: str) -> list[int]:
         if c == '\n':
             starts.append(i + 1)  # Next line starts after newline
     return starts
-
-
-def offset_to_line_col(offset: int, line_starts: list[int]) -> tuple[int, int]:
-    """Convert char offset to (line, col), both 1-indexed."""
-    # Find the line: largest line_starts[i] <= offset
-    line = bisect.bisect_right(line_starts, offset)
-    col = offset - line_starts[line - 1] + 1
-    return (line, col)
 
 
 def line_col_to_offset(line: int, col: int, line_starts: list[int]) -> int:
@@ -502,32 +484,6 @@ def parse_step_plan_output(output: str, body: str | None = None) -> list[StepPla
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 
 
-def make_tactic_spans(
-    raw_spans: list[tuple[str, int, int, bool]],
-    proof_body_offset: int,
-    line_starts: list[int],
-) -> list[TacticSpan]:
-    """Convert raw (text, start, end, use_eall) tuples to TacticSpan with line/col.
-
-    Args:
-        raw_spans: Output from parse_linearize_with_spans_output (offsets relative to proof body)
-        proof_body_offset: Char offset where proof body starts in the file
-        line_starts: Line start table for the entire file
-
-    Returns:
-        List of TacticSpan with absolute line/col positions in the file.
-    """
-    result = []
-    for text, start, end, use_eall in raw_spans:
-        # Convert relative offsets to absolute
-        abs_start = proof_body_offset + start
-        abs_end = proof_body_offset + end
-        start_lc = offset_to_line_col(abs_start, line_starts)
-        end_lc = offset_to_line_col(abs_end, line_starts)
-        result.append(TacticSpan(text=text, start=start_lc, end=end_lc, use_eall=use_eall))
-    return result
-
-
 @dataclass
 class TheoremInfo:
     """Information about a theorem in a HOL script file."""
@@ -543,11 +499,6 @@ class TheoremInfo:
     attributes: list[str] = field(default_factory=list)
     suspension_name: str | None = None  # For Resume: base theorem name
     label_name: str | None = None       # For Resume: first attribute = label
-
-    @property
-    def line_before_qed(self) -> int:
-        """Line number of QED - 1 (last line of proof body)."""
-        return self.proof_end_line - 2
 
 
 def suspension_base(name: str) -> str:

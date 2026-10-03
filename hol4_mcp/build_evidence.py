@@ -1,11 +1,24 @@
 """Opt-in build-discovery tracing. Ordinary builds do not invoke a tracer."""
+import functools
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import uuid
+
+
+@functools.lru_cache(maxsize=None)
+def _tracer_options(tracer: str) -> tuple[str, ...]:
+    """The optional strace flags this tracer accepts (`--kill-on-exit` needs strace >= 5.17)."""
+    try:
+        usage = subprocess.run([tracer, "-h"], capture_output=True, text=True,
+                               timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    return tuple(flag for flag in ("--kill-on-exit",) if flag in usage)
 
 
 def build_failure_heading(returncode: int, output: str, traced: bool) -> str:
@@ -34,7 +47,7 @@ def traced_build(command: list[str], workdir: Path, enabled: bool,
     with metadata.open("x", encoding="utf-8") as stream:
         json.dump({"command": command, "workdir": str(workdir),
                    "server_pid": os.getpid(), "mount_namespace": namespace}, stream)
-    wrapped = [tracer, "-f", "--kill-on-exit", "-s", "4096", "-e",
+    wrapped = [tracer, "-f", *_tracer_options(tracer), "-s", "4096", "-e",
                "trace=chdir,fchdir,openat,newfstatat,getdents64",
                "-o", str(trace), "--", *command]
     note = (f"[Discovery trace: {trace}; context: {metadata}; "

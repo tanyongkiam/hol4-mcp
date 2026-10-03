@@ -1,8 +1,7 @@
-"""Failing regression tests for caller-facing reporting/classification bugs.
+"""Regression tests for caller-facing reporting/classification bugs.
 
-Each test asserts the CORRECT behaviour and is marked ``xfail(strict=True)``,
-so it reports XFAIL today and turns into a hard failure the moment the bug is
-fixed (at which point the marker comes off).
+Each test asserts the CORRECT behaviour; they were written red under
+``xfail(strict=True)`` and the markers came off when the fixes landed.
 
 Covered findings (``MCP_BUGS_review.md``):
 

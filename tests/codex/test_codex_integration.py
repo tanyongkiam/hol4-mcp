@@ -330,7 +330,11 @@ def test_plugin_files_reference_only_existing_codex_components():
     hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())
     assert manifest["skills"] == "./skills/"
     assert manifest["mcpServers"]["hol4"]["tool_timeout_sec"] >= 600
-    assert not (ROOT / ".mcp.json").exists()
+    # A developer's own .mcp.json may sit in the checkout; only a tracked one
+    # would ship with the plugin.
+    tracked = subprocess.run(["git", "ls-files", "--", ".mcp.json"], cwd=ROOT,
+                             capture_output=True, text=True, check=True).stdout
+    assert not tracked.strip()
     commands = [
         handler["command"]
         for groups in hooks["hooks"].values()

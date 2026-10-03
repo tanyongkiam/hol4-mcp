@@ -4,9 +4,9 @@
 `xfail` marker is gone; the tests below are now ordinary regression tests.
 
 ```
-.venv/bin/python -m pytest tests/ -q
-# 428 passed, 2 failed (both pre-existing and unrelated: test_cli_help,
-#                       test_hol_goals_live_session)
+$PY -m pytest tests/ -q
+# at the review's close (16 Aug 2026): 428 passed, 2 failed (both pre-existing
+# and unrelated: test_cli_help, test_hol_goals_live_session)
 ```
 
 Master index for the navigation/caching defect review. Every finding here is
@@ -42,7 +42,7 @@ to confirm it failed on its *intended assertion* rather than on setup or an
 incidental exception — an xfail that is red for the wrong reason pins nothing.
 
 ```
-.venv/bin/python -m pytest tests/test_repro_*.py tests/test_spec_*.py -o addopts="" -q
+$PY -m pytest tests/test_repro_*.py tests/test_spec_*.py -q
 # 36 passed
 ```
 

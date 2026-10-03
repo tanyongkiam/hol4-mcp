@@ -60,8 +60,9 @@ scripts with `HOME=$PLUGIN_DATA/runtime-home`; consequently their legacy
 this integration reads or writes the user's actual Claude configuration or
 hook state.
 
-`hooks/hooks.json` is the native Codex lifecycle configuration. H14 is omitted
-because it is a general, user-specific Git policy rather than HOL4 policy. H22
+`hooks/hooks.json` is the native Codex lifecycle configuration. H14 and H33 are
+omitted because they are general, user-specific Git/shell policy rather than
+HOL4 policy. H22
 is replaced by the Codex-native session hook because its other responsibility
 is auditing Claude's `settings.json` wiring.
 

@@ -8,8 +8,11 @@ import sys
 import tarfile
 import zipfile
 
+import pytest
+
 
 def test_sdist_wheel_preserves_runtime_assets(tmp_path):
+    pytest.importorskip("hatchling", reason="packaging check needs the dev dependency hatchling")
     root = Path(__file__).resolve().parents[1]
     source = tmp_path / "source"
     source.mkdir()

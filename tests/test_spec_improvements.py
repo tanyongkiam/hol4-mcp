@@ -1,14 +1,9 @@
-"""SPECIFICATION tests for proposed improvements — NOT bug reproductions.
+"""Specification tests for the tactic-cost improvements, now regression tests.
 
-Every test here asserts behaviour that **does not exist yet**. A failure is a
-MISSING FEATURE, never a regression: nothing in ``hol4_mcp/`` is broken by the
-red marks below, and no test here describes a defect. That is the difference
-between this file and its ``test_repro_*.py`` siblings, which pin real bugs.
-
-Each test is ``xfail(strict=True)``, so it reports XFAIL while the feature is
-absent and turns into a hard failure the moment the feature lands — at which
-point the marker comes off and the test becomes an ordinary regression test.
-An XPASS here means the improvement already exists and is off the work list.
+Every test here was written against behaviour that did not exist yet; none
+describes a defect. That is the difference between this file and its
+``test_repro_*.py`` siblings, which pin real bugs. Each was red under
+``xfail(strict=True)`` and the markers came off as the improvements landed.
 
 Design rule followed throughout: a spec test must not invent an output format.
 Assertions are therefore made against structured values the code already

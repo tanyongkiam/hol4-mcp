@@ -1,4 +1,4 @@
-"""Soft hooks (H28, H29, H30, H31, H32) block a situation ONCE, then let an
+"""Soft hooks (H28, H29, H30, H31, H32, H33) block a situation ONCE, then let an
 identical retry through with a prominent override note and a log entry; a
 consent phrase in ANY earlier user turn pre-grants. The hard hooks (H14
 `git ok`, H27 `wip ok`) keep reading the latest message only, and a `git

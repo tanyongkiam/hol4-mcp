@@ -800,18 +800,6 @@ def _gc_cursor_checkpoints(cursor: FileProofCursor):
         pass
 
 
-def _gc_dir_full(ckpt_dir: Path):
-    """Remove all .save files and the checkpoint directory."""
-    if not ckpt_dir or not ckpt_dir.exists():
-        return
-    for f in ckpt_dir.glob("*.save"):
-        f.unlink(missing_ok=True)
-    try:
-        ckpt_dir.rmdir()
-    except OSError:
-        pass
-
-
 def _gc_workdir_orphans(workdir: Path):
     """Clean orphaned per-theorem checkpoints from a workdir.
 
@@ -1841,8 +1829,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     may be partial or unverified and cannot be reused unchanged as up-to-date
     dependencies. Evidence survives server restarts in .hol4-mcp/build-state
     beside the outputs; keep this generated directory out of version control.
-    Inspect/remove and rebuild
-    them, or use a build whose graph explicitly schedules their reconstruction.
+    Inspect/remove and rebuild them, or use a build whose graph explicitly
+    schedules their reconstruction.
     Requires Holmake's --json/--dirs graph interface. External build processes
     and undeclared recipe/pre-exec outputs are outside this coordination.
     """

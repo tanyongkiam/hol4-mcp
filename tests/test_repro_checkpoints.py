@@ -1,9 +1,8 @@
-"""Failing regression tests for checkpoint invalidation, replay cost, and the
+"""Regression tests for checkpoint invalidation, replay cost, and the
 per-theorem load budget.
 
-Each test asserts the CORRECT behaviour and is marked ``xfail(strict=True)``, so
-it reports XFAIL today and becomes a hard failure the moment the finding is
-fixed (at which point the marker comes off).
+Each test asserts the CORRECT behaviour; they were written red under
+``xfail(strict=True)`` and the markers came off when the fixes landed.
 
 Covered findings:
 

@@ -6,8 +6,8 @@ An [MCP](https://modelcontextprotocol.io/) server that gives LLM agents interact
 
 - **Proof cursor** — Navigate to any position in a proof file and see the goal state. The cursor tracks file edits, replays tactics incrementally, and uses PolyML checkpoints for fast state restoration.
 - **Multi-theorem files** — Parse `*Script.sml` files to discover theorems, definitions, and resume blocks. Enter any theorem and step through its proof.
-- **Holmake integration** — Build theories with progress reporting and failure diagnostics (build logs, error context).
-- **Session management** — Multiple named HOL sessions with idle timeout, automatic garbage collection, and SIGINT-based interrupt for runaway tactics.
+- **Holmake integration** — Build theories synchronously or detached, with dependency-overlap guards against concurrent MCP builds and failure diagnostics (build logs, error context).
+- **Session management** — Named HOL sessions (one live session at a time by default) with idle timeout, automatic garbage collection, and SIGINT-based interrupt for runaway tactics.
 - **Change detection** — Content hashing detects file edits automatically. No need to restart sessions after modifying proof files.
 - **Pi extension** — Ships with a [pi](https://github.com/badlogic/pi-mono) extension that registers all tools dynamically.
 
@@ -148,20 +148,23 @@ hol4-mcp serve --transport http --port 8000
 | Tool | Description |
 |------|-------------|
 | `hol_state_at` | Get proof state at a file position (line/col). Auto-inits session and cursor from `file=` parameter. |
+| `hol_goals` | Goal count and structured goal slices at the cursor position, without a full goal dump |
 | `hol_check_proof` | Check if a theorem's proof completes. Reports pass/fail, timing, and failure location. |
 
-### Raw interaction
+### Raw interaction and search
 
 | Tool | Description |
 |------|-------------|
-| `hol_send` | Send raw SML to HOL — use freely for exploration, interactive proof attack, DB queries, term/type inspection. |
+| `hol_send` | Send raw SML to HOL for small probes (a term, a type, a one-tactic check). Not for driving a proof: develop in the file and navigate with `hol_state_at`. |
+| `hol_search` | Search the theorem database by name and/or term pattern |
 | `hol_interrupt` | Send SIGINT to abort a runaway tactic |
 
 ### Build
 
 | Tool | Description |
 |------|-------------|
-| `holmake` | Run `Holmake --qof` with progress reporting and failure log extraction |
+| `holmake` | Run `Holmake --qof` on a named target, with dependency-overlap guards against concurrent MCP builds and failure log extraction; `detach=True` for long builds |
+| `hol_build_status` | State, log tail and cancellation of a detached `holmake` job |
 | `hol_log` | Read a specific theory's build log |
 | `hol_logs` | List available build logs |
 

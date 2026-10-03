@@ -49,7 +49,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H16 | ✅     | PostToolUse           | `mcp__hol4__hol_state_at\|mcp__hol4__hol_send\|mcp__hol4__hol_check_proof` | Inject advisory when goal display contains `⅋ᵣ` / `resconj` — the canonical indicator that multiple subgoals were bundled into one Resume body via a shared `suspend` label (hol4-proving skill "one label = one goal" violation) |
 | H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored non-canonical `suspend` in `*Script.sml` edits: THEN-form (`>>` / `\\` / `THEN` then `suspend "..."`) and the `by (suspend "...")` justification form — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects) |
 | H18 | ✅     | PreToolUse            | `mcp__hol4__hol_send\|Edit\|Write\|MultiEdit` | Block the `markerLib` suspension-lookup query (the `(string*thm) option` one — returns NONE in a bare session, tempts guessing the suspended goal); point to `set_suspended_goal` to actually load it |
-| H19 | ⏭     | PreToolUse            | `mcp__hol4__hol_restart` | ~~Advise (never block) on `hol_restart` without the user asking~~ — superseded by H29 (repeat-keyed block covering `hol_stop` + `hol_restart`); the file is a silent shim until its settings.json entry is removed by hand |
+| H19 | ⏭     | PreToolUse            | `mcp__hol4__hol_restart` | ~~Advise (never block) on `hol_restart` without the user asking~~ — superseded by H29 (repeat-keyed block covering `hol_stop` + `hol_restart`); file and wiring removed |
 | H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥6 THEN-combinators, or ≥8 non-blank lines with ≥2 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
 | H22 | ✅     | SessionStart          | (all sessions)          | In HOL4 directories (Holmakefile/.holpath in cwd or ≤3 ancestors, or `*Script.sml` in cwd), inject a directive to load the `hol4-proving` skill before any proof work. In any directory, name hook-wiring drift (`install_hooks.drift`: scripts here not in settings.json, or wired but absent) |
 | H23 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block the standalone-`prove` workflow in `hol_send` (`prove(` / `store_thm(` / `save_thm(` / `TAC_PROOF(`) — RULE I + RULE G: a proof closed in the scratch session with a hand-typed goal proves nothing about the file form; write a `Theorem … QED` or sub-suspend the arm (`>- suspend` + `Resume`) |
@@ -62,6 +62,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H30 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|hol_goals\|hol_check_proof\|hol_send\|hol_start` | Block HOL navigation of a file whose ANCESTOR theories are stale — script newer than its built artifacts, artifacts missing (mid-rebuild), or built before their own ancestors' artifacts. Forecloses "edited upstream, kept working downstream": sessions and fresh loads read the built `.dat`, so downstream checks silently run against the pre-edit upstream with no native symptom. Make-style check over the `Ancestors`/`open` closure (comment-stripped, duplicate names resolved nearest-first, mtime-memoized under `~/.claude/hook-state/h30/`); self-clears on rebuild; target file itself exempt; also keeps H25's `hol4_file` cache current for `hol_goals`/`hol_start`. SOFT: a given (file, stale set) is blocked once with rebuild commands from each ancestor's own directory; an identical retry passes with an override note; a newly stale theory blocks again. Pre-grant: `stale ok` |
 | H31 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|mcp__hol4__hol_goals` | SOFT. Block `skip_prefix: true` once per file with the RULE K caveat (prefix-skip binds every earlier theorem by `cheat`); an identical retry passes with an override note and is logged. `false`/absent never fires. Pre-grant: `skip prefix ok` |
 | H32 | ✅     | PreToolUse            | `mcp__hol4__holmake`    | SOFT. Build ownership (RULE A): block a `holmake` with no `target` (whole-directory build) once per workdir; an identical retry passes with an override note. Targeted builds always pass — rebuilding stale ancestors in other directories is what H30 asks for. Pre-grant: `build ok` |
+| H33 | ✅     | PreToolUse            | `Bash`                  | SOFT. Block a self-defeating background waiter once — `pgrep -f` with no bracket-escape or `-x` (it matches its own command line, so the loop never ends), an `until`/`while … do … sleep` poll loop, or `sleep N` followed by a log read — redirecting to one read of the job's log, or to backgrounding the command itself; an identical retry passes with an override note. Matched on the raw command (these loops sit inside `bash -c '…'`). General shell policy, not HOL4: Claude-only like H14. Pre-grant: `waiter ok` |
 
 Skipped: H2, H3, H5, H9, H11, H12, H13, H15. H21 (holmake-on-cheated-theory
 blocker) was proposed and rejected. H4 is the only live proposal.
@@ -357,7 +358,7 @@ permit. Absent → block.
 `git ok` is a one-shot grant tied to that specific message — it does not
 persist across subsequent user messages. If you say `git ok` and I push;
 your next message without `git ok` does NOT consent to another push. This is
-the HARD shape, shared only with H27's `wip ok`; the soft hooks (H28–H32)
+the HARD shape, shared only with H27's `wip ok`; the soft hooks (H28–H33)
 pre-grant from any earlier message and pass on a deliberate retry instead
 (see *Soft hooks*).
 
@@ -613,9 +614,32 @@ For builds longer than the synchronous budget the answer is
 `holmake(detach=True)` + `hol_build_status`, never a shell `nohup Holmake`
 (H28).
 
+## H33 — background waiters: read the log instead
+
+**File**: `h33_background_waiter.py`
+**Event**: `PreToolUse`
+**Matcher**: `Bash`
+**Effect**: soft block on three Bash shapes that cannot do what they
+promise: `pgrep -f <pat>` with neither a bracket-escape nor `-x` (the
+waiter's own command line contains `<pat>`, so the condition never turns
+false), an `until`/`while … do … sleep` poll loop, and `sleep N` followed by
+a log reader (a timer whose delay has nothing to do with the state it
+reports). Matched on the raw command rather than `visible_command`, since
+these loops usually sit inside `bash -c '…'`. Keyed per normalised command;
+pre-grant `waiter ok`.
+
+A detached job that writes a log needs no waiter: its state is one read of
+that log, and a waiter's notification can only arrive between turns — when
+the log would have been read anyway. To wait on a job, background the
+command itself (Bash `run_in_background`) so the harness reports its exit.
+Rule source: global `~/.claude/CLAUDE.md` (every background job is
+time-limited; one mechanism per question). This is general shell policy,
+not HOL4 policy, so like H14 it is Claude-only and absent from the Codex
+`hooks.json`.
+
 ## Soft hooks — block once, pass on a deliberate retry
 
-H28, H29, H30, H31 and H32 guard situations the hook cannot judge but the
+H28, H29, H30, H31, H32 and H33 guard situations the hook cannot judge but the
 agent must not miss. They share one protocol (`hook_payload.soft_block`):
 
 1. The first occurrence of a situation (a per-hook fingerprint: the command,
@@ -629,7 +653,7 @@ agent must not miss. They share one protocol (`hook_payload.soft_block`):
 3. A changed situation (another file, a newly stale theory, a different
    command) is a new fingerprint and blocks once again.
 4. A consent phrase (`shell holmake ok`, `restart ok`, `stale ok`,
-   `skip prefix ok`, `build ok`) in ANY user turn of the session pre-grants;
+   `skip prefix ok`, `build ok`, `waiter ok`) in ANY user turn of the session pre-grants;
    the call passes with a `pre-granted` note. No soft-block message tells the
    agent to ask the user for a phrase — they are the user's to volunteer.
 5. The next `git commit` (H14) reports the session's overrides, so the

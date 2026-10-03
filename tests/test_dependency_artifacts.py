@@ -1,5 +1,6 @@
 """Dependency freshness includes missing interfaces, not just existing .uo's."""
 import os
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -94,6 +95,9 @@ async def test_warm_absence_checks_scale_with_directories_not_candidates(tmp_pat
     cursor = cursor_at(tmp_path, 'val it = ' + json.dumps(list(map(str, dirs))))
     artifact = tmp_path / "existingTheory.uo"
     artifact.write_text("built")
+    past = time.time() - 10          # directories last modified well before the snapshot
+    for directory in [tmp_path, *dirs]:
+        os.utime(directory, (past, past))
     await cursor._record_dep_artifacts(["existingTheory"] +
                                       [f"missing{i}Theory" for i in range(200)])
     file_stats, directory_stats = [], []
@@ -113,8 +117,11 @@ async def test_warm_absence_checks_scale_with_directories_not_candidates(tmp_pat
     assert cursor._check_dep_artifacts() is None
     assert file_stats == [artifact]
     assert len(directory_stats) == len(set(directory_stats)) == 2 * (len(dirs) + 1)
-    # An unrelated directory-entry change is inspected once, then stays cheap.
+    # An unrelated directory-entry change is inspected, and once the change has
+    # aged past the racy window the directory is cheap again.
     (dirs[0] / "unrelated").write_text("unrelated")
+    assert cursor._check_dep_artifacts() is None
+    os.utime(dirs[0], (past, past))
     assert cursor._check_dep_artifacts() is None
     file_stats.clear()
     assert cursor._check_dep_artifacts() is None
@@ -122,6 +129,27 @@ async def test_warm_absence_checks_scale_with_directories_not_candidates(tmp_pat
     # No timer window: a shadowing file is caught on the very next call.
     (dirs[0] / "missing100Theory.ui").write_text("built")
     assert cursor._check_dep_artifacts() == "missing100Theory"
+
+
+async def test_fresh_directory_stamp_is_not_trusted(tmp_path, monkeypatch):
+    """A directory modified within the racy window can gain an entry without its
+    stamp changing (coarse filesystem timestamps), so its candidates are scanned."""
+    cursor = cursor_at(tmp_path)
+    await cursor._record_dep_artifacts(["ancestorTheory"])
+    recorded, trusted = cursor._dep_parent_stamps[tmp_path]
+    assert not trusted
+    (tmp_path / "ancestorTheory.uo").write_text("built")
+    monkeypatch.setattr(cursor, "_directory_stamp",
+                        lambda path: recorded if path == tmp_path else None)
+    assert cursor._check_dep_artifacts() == "ancestorTheory"
+
+
+async def test_aged_directory_stamp_is_trusted(tmp_path):
+    past = time.time() - 10
+    os.utime(tmp_path, (past, past))
+    cursor = cursor_at(tmp_path)
+    await cursor._record_dep_artifacts(["ancestorTheory"])
+    assert cursor._dep_parent_stamps[tmp_path][1]
 
 
 def test_missing_interface_diagnostic_names_build_target(tmp_path):
