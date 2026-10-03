@@ -12,7 +12,8 @@ from hol4_mcp import hol_mcp_server as srv
     ("3", None, None, 3),
     ("invalid", "2", None, 2),
     ("invalid", "invalid", 2, 2),
-    (None, None, None, 1),
+    (None, None, 1, 1),
+    (None, None, None, None),
 ])
 async def test_job_setting_precedence_in_real_build(tmp_path, monkeypatch, inherited, supplied, explicit, expected):
     if inherited is None:
@@ -34,8 +35,11 @@ async def test_job_setting_precedence_in_real_build(tmp_path, monkeypatch, inher
     assert "Build succeeded" in result, result
     assert (tmp_path / "result").exists()
     command, environment = launches[0]
-    actual = int(command[command.index("-j") + 1]) if "-j" in command else 1
-    assert actual == expected, command
+    if expected is None:
+        assert "-j" not in command, command   # unset: Holmake's own default
+    else:
+        assert "-j" in command, command       # jobs=1 must cap Holmake's own default
+        assert int(command[command.index("-j") + 1]) == expected, command
     assert environment.get("HOL4_MCP_HOLMAKE_JOBS") == (supplied or inherited)
 
 

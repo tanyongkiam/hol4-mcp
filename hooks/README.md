@@ -56,7 +56,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H24 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Advise (never block) on newly-defined tactic abbreviations (`val foo_tac = …` / `fun foo_tac … = …`) in `*Script.sml` — lifting a tactic needs a strong stated justification; defaults are lift a LEMMA or leave the duplication. Diff-aware on binding names; `*Lib.sml`/`*Syntax.sml` out of scope by the path test |
 | H25 | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|mcp__hol4__hol_state_at\|mcp__hol4__holmake` | Sweep finished proof text for composition defects (adjacent normalisers, `impl_tac` sandwich, `>-` not marking a sibling, near-identical sibling arms, nested splitter ladders, n-ary tactic forms, self-feeding lambdas). Fires per theorem on `hol_check_proof` → `Status: OK`; counts-only backstop on `holmake` for git-modified scripts. Advisory; checks live in `proof_sweep.py` |
 | H26 | ✅     | —                     | —                      | **Implemented inside H6**, not as its own hook: it fires on the same event with the same payload, so a separate hook would mean two messages on one failure. See "The symptom table" under H6 |
-| H27 | ✅     | PreToolUse            | `Bash`                  | HARD. Audit the `*Script.sml` content a `git commit` would record (index blobs, or the selected worktree files for `-a`/`--only`/`--include`; `--amend` against HEAD), never mutating the index. Blocks newly introduced findings — Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem, minus the lone-`>-` prompt (H25's advisory) — not inherited unchanged debt; a deleted `Finalise` counts. In a repository that tracks `*Script.sml`, a command form it cannot model (compound, substitution, shell wrapper, unknown option) is refused with the reason; elsewhere every form passes. Override with `wip ok` |
+| H27 | ✅     | PreToolUse            | `Bash`                  | HARD. Audit the `*Script.sml` content a `git commit` would record (index blobs, or the selected worktree files for `-a`/`--only`/`--include`; `--amend` against HEAD), never mutating the index. Blocks newly introduced findings — Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem, minus the lone-`>-` and trailing-`>-` prompts (H25's advisories) — not inherited debt, including a finding that stood on a line the commit merely retouched; a deleted `Finalise` counts. In a repository that tracks `*Script.sml`, a command form it cannot model (compound, substitution, shell wrapper, unknown option) is refused with the reason; elsewhere every form passes. Override with `wip ok` |
 | H28 | ✅     | PreToolUse            | `Bash`                  | SOFT. Block shell invocations of `Holmake` / raw `poly`\|`hol` once, redirecting to `mcp__hol4__holmake` / `hol_start` (`detach=True` for long builds); an identical retry passes with an override note. Command-position match only, after quoted strings and heredoc bodies are blanked (`hook_payload.visible_command`), so prose, log paths, grep patterns, `hol=...` assignments and `--help`/`-v` queries pass. Pre-grant: `shell holmake ok` |
 | H29 | ✅     | PreToolUse            | `mcp__hol4__hol_stop\|mcp__hol4__hol_restart` | SOFT. Block a REPEAT `hol_stop`/`hol_restart` within 30 min while the cached working file (H25's `hol4_file`) is still in the same directory once — the ritual-stop signature; stop/restart is never part of the edit-check loop (`hol_state_at` auto-detects edits, reloads after an ancestor rebuild and moves the session across workdirs itself; every stop costs a cold prefix reload). First stop, any stop once the working file is in another directory, and a stop within 10 min of a budget TIMEOUT (recorded by H6) pass; an identical retry passes with an override note. Pre-grant: `restart ok` |
 | H30 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|hol_goals\|hol_check_proof\|hol_send\|hol_start` | Block HOL navigation of a file whose ANCESTOR theories are stale — script newer than its built artifacts, artifacts missing (mid-rebuild), or built before their own ancestors' artifacts. Forecloses "edited upstream, kept working downstream": sessions and fresh loads read the built `.dat`, so downstream checks silently run against the pre-edit upstream with no native symptom. Make-style check over the `Ancestors`/`open` closure (comment-stripped, duplicate names resolved nearest-first, mtime-memoized under `~/.claude/hook-state/h30/`); self-clears on rebuild; target file itself exempt; also keeps H25's `hol4_file` cache current for `hol_goals`/`hol_start`. SOFT: a given (file, stale set) is blocked once with rebuild commands from each ancestor's own directory; an identical retry passes with an override note; a newly stale theory blocks again. Pre-grant: `stale ok` |
@@ -535,9 +535,10 @@ hands.
 Only what the commit introduces is judged against HEAD. Ordinary commits use
 index blobs; `-a` includes tracked worktree edits; `--only` and implicit path
 commits use only selected worktree paths; `--include` overlays selected paths
-on the index. `--amend` is compared with the current HEAD. Unchanged inherited
-sweep findings are matched by source-line mapping and finding text, including
-inside edited theorems. Newly introduced findings still block. `cheat`, banned
+on the index. `--amend` is compared with the current HEAD. Inherited sweep
+findings are matched by source-line mapping and finding text, including inside
+edited theorems and on a retouched line whose HEAD counterpart carried the same
+finding. Newly introduced findings still block. `cheat`, banned
 tactics and `Resume` count on ADDED code lines; deletion or misplacement of a
 required `Finalise` is also detected. Findings are grouped per theorem.
 
@@ -555,8 +556,11 @@ text are parsed as arguments, not flags.
 ### What it checks, and what it deliberately does not
 
 Blocks on Gates 1, 2, 3, 5 and the `proof_sweep` composition checks, except
-the lone-`>-` prompt ("the only dispatcher at its level"): its fix (`>>`)
-changes no proof, so it stays H25's post-check advisory and never blocks.
+two dispatcher prompts that stay H25's post-check advisories and never block:
+the lone `>-` ("the only dispatcher at its level"), whose fix (`>>`) changes
+no proof, and the short trailing `>-` run, which a count cannot tell from
+genuine sibling arms — a two- or three-constructor case split with one
+`>- suspend` per arm is the sanctioned form, not a deferred main line.
 
 **Gate 6 (single-use `[local]` helpers) is deliberately excluded.** Its keeper
 case — a small, intent-documenting named fact — is the common and correct idiom,

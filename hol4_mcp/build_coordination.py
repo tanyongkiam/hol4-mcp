@@ -4,6 +4,12 @@ Holmake locks competing writers, but can skip an existing partial dependency.
 Read/read overlap is safe; a write/read or write/write overlap is refused.
 Locks cover cooperating servers on the same host/user; undeclared outputs and
 plain external Holmake processes remain outside this protocol.
+
+When a build ends, each of its outputs is judged on its own: a job Holmake's
+monitor reported as finished wrote complete files even if a later job failed.
+A detached job also leaves a record of itself and, through its wrapper, the
+exit status Holmake ends with, so a server started after the one that
+launched it can report it, cancel it, and apply its outcome.
 """
 
 from dataclasses import dataclass, field
@@ -12,9 +18,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
+import time
 import uuid
 
 
@@ -54,6 +62,10 @@ class BuildClaim:
     lock_fds: list[int] = field(default_factory=list)
     state_error: str = ""
     clean: bool = False
+    # Outputs by the name Holmake's monitor prints for the job writing them,
+    # and the outputs Holmake compiles in its own process (no job line).
+    tags: dict = field(default_factory=dict)
+    in_process: set = field(default_factory=set)
 
     @property
     def label(self):
@@ -111,7 +123,75 @@ def claim_from_graph(output: str, workdir: Path, target: str | None) -> BuildCla
     claim = BuildClaim(workdir, reads, outputs)
     claim.clean = clean
     claim.preflight_output = output[:start]
+    tag_dirs = {}
+    for key in selected:
+        node = graph[key]
+        if not (node["command"] and node["needs_rebuild"]):
+            continue
+        tag = job_tag(nominal[key], str(node["command"]))
+        paths = set(_artifact_paths(nominal[key]))
+        if tag is None:
+            claim.in_process |= paths
+        else:
+            claim.tags.setdefault(tag, set()).update(paths)
+            tag_dirs.setdefault(tag, set()).add(paths_dir(nominal[key]))
+    for tag, dirs in tag_dirs.items():
+        if len(dirs) > 1:
+            del claim.tags[tag]   # the printed name alone cannot tell them apart
     return claim
+
+
+def paths_dir(path):
+    return path.resolve().parent
+
+
+def job_tag(target: Path, command: str) -> str | None:
+    """The name Holmake's monitor prints for the job that writes ``target``,
+    or None when Holmake compiles it in its own process and prints nothing.
+    One BIC_Build job writes a theory's .sml, .sig and .dat under the stem."""
+    if command == "BIC_Compile":
+        return None
+    if command.startswith("BIC_Build"):
+        return target.stem
+    name = target.name
+    return name[:-4] if name.endswith(".sml") else name
+
+
+# Holmake's monitor, when stdout is not a terminal, prints one line as a job
+# starts and one as it ends: `<tag> [dir] (<time>) [k/n]<verdict>`.
+_JOB_START_RE = re.compile(r"^Starting work on (\S+)\s*$")
+_JOB_RESULT_RE = re.compile(
+    r"^(?P<tag>\S+)(?:\s+\S+)?\s+\([^)]*\)\s+(?:\[[^\]]*\])?"
+    r"(?P<verdict>OK|CHEATED|F-CHEAT|CACHED|RETRY|FAIL<[^>]*>)\s*$")
+_SUCCESS_VERDICTS = {"OK", "CHEATED", "F-CHEAT", "CACHED"}
+
+
+def completed_outputs(tags, in_process, output, returncode):
+    """Outputs a build that did not succeed as a whole nevertheless finished.
+
+    A monitored job's outputs are complete when its last line is a success
+    verdict and no later start line reopened it. Holmake's in-process
+    compiles are complete when Holmake exited of its own accord (a small
+    positive status): it writes them one at a time and nothing interrupted
+    it. A signal — cancellation, a timeout kill, a vanished controller —
+    certifies nothing beyond the verdict lines.
+    """
+    state = {}
+    for line in output.splitlines():
+        start = _JOB_START_RE.match(line)
+        if start:
+            state[start.group(1)] = "started"
+            continue
+        result = _JOB_RESULT_RE.match(line)
+        if result:
+            state[result.group("tag")] = result.group("verdict")
+    done = set()
+    for tag, paths in tags.items():
+        if state.get(tag) in _SUCCESS_VERDICTS:
+            done.update(paths)
+    if returncode is not None and 0 < returncode < 128:
+        done.update(in_process)
+    return done
 
 
 def _state_directory(path):
@@ -163,7 +243,7 @@ def _write_state(path, phase, stamp, claim):
             temporary.unlink(missing_ok=True)
 
 
-def _suspect(path):
+def _suspect(path, adopt=True):
     stamp = _stamp(path)
     if stamp is None:
         return None
@@ -173,8 +253,146 @@ def _suspect(path):
     running = _read_state(path, "running")
     if running is not None and stamp != _record_stamp(running):
         # The lock is free, but the controller never certified completion.
+        # Its job may have left an exit status behind for us to apply.
+        if adopt and adopt_finished_job(running["token"]):
+            return _suspect(path, adopt=False)
         return running
     return None
+
+
+# --- detached job records: survive the server that started the job ---------
+
+_TOKEN_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def jobs_directory():
+    directory = _lock_storage() / "jobs"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    return directory
+
+
+def _process_start(pid):
+    """The kernel's start time of ``pid``, so a reused pid is not mistaken
+    for the job; None where /proc is unavailable."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as stream:
+            return stream.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def job_record(claim, *, pid, target, log, exit_file, trace_note, started):
+    return {
+        "token": claim.token, "label": claim.label, "pid": pid,
+        "process_start": _process_start(pid), "workdir": str(claim.workdir),
+        "target": target, "log": str(log), "exit_file": str(exit_file),
+        "trace_note": trace_note, "started": started,
+        "outputs": [str(p) for p in claim.outputs],
+        "before": {str(p): s for p, s in claim.before.items()},
+        "tags": {t: sorted(str(p) for p in ps) for t, ps in claim.tags.items()},
+        "in_process": sorted(str(p) for p in claim.in_process),
+    }
+
+
+def write_job(record):
+    directory = jobs_directory()
+    destination = directory / f"{record['token']}.json"
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                     delete=False) as stream:
+        json.dump(record, stream)
+        temporary = Path(stream.name)
+    os.replace(temporary, destination)
+    cutoff = time.time() - 7 * 24 * 3600
+    for stale in directory.glob("*.json"):
+        if stale != destination:
+            try:
+                data = json.loads(stale.read_text())
+                if data.get("finalized") and data["finalized"]["at"] < cutoff:
+                    stale.unlink()
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+
+
+def read_job(token):
+    if not _TOKEN_RE.match(token or ""):
+        return None
+    try:
+        record = json.loads((jobs_directory() / f"{token}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("token") == token else None
+
+
+def job_exit_status(record):
+    """Holmake's exit status written by the job's wrapper, or None while it
+    runs or if the wrapper itself was killed."""
+    try:
+        return int(Path(record["exit_file"]).read_text().strip())
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def process_alive(record):
+    pid = record.get("pid")
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    start = _process_start(pid)
+    return start is None or record.get("process_start") in (None, start)
+
+
+def finalize_job(record, returncode, output):
+    """Apply a finished (or cancelled: ``returncode`` None) job's outcome to
+    its outputs' coordination records, as its own server would have."""
+    owner = _RecordOwner(record["token"], record["label"])
+    outputs = [Path(p) for p in record["outputs"]]
+    before = {Path(p): (tuple(s) if s is not None else None)
+              for p, s in record["before"].items()}
+    tags = {t: {Path(p) for p in ps} for t, ps in record["tags"].items()}
+    in_process = {Path(p) for p in record["in_process"]}
+    completed = (completed_outputs(tags, in_process, output, returncode)
+                 if returncode else set())
+    finalize(outputs, before, returncode, owner, completed)
+    record["finalized"] = {"returncode": returncode, "at": time.time()}
+    write_job(record)
+
+
+def adopt_finished_job(token):
+    """Finalize a job whose controller is gone but whose wrapper recorded
+    Holmake's exit status. True when something was applied."""
+    record = read_job(token)
+    if record is None or record.get("finalized"):
+        return False
+    returncode = job_exit_status(record)
+    if returncode is None:
+        return False
+    try:
+        output = Path(record["log"]).read_text(encoding="utf-8", errors="replace")
+    except (OSError, KeyError):
+        output = ""
+    try:
+        finalize_job(record, returncode, output)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"Build coordination state could not be finalized for job "
+              f"{token}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def record_finalized(token, returncode):
+    """Note that the job's own server finalized it, so no adoption repeats it."""
+    record = read_job(token)
+    if record is not None and not record.get("finalized"):
+        record["finalized"] = {"returncode": returncode, "at": time.time()}
+        try:
+            write_job(record)
+        except OSError:
+            pass
 
 
 def _lock_storage():
@@ -198,27 +416,42 @@ def _foreign_label(directory):
         return "another MCP server's build"
 
 
+def finalize(outputs, before, returncode, owner, completed=frozenset()):
+    """Record each output's fate once its build has ended.
+
+    ``returncode`` None means cancelled or lost. An output the build did not
+    finish is marked failed if it changed; one it did finish — the whole set
+    on success, ``completed`` otherwise — sheds any stale failure record.
+    """
+    for path in outputs:
+        stamp = _stamp(path)
+        failed = _read_state(path, "failed")
+        if returncode != 0 and path not in completed:
+            if stamp is not None and stamp != before.get(path):
+                _write_state(path, "failed", stamp, owner)
+        elif failed is not None and stamp != _record_stamp(failed):
+            _state_file(path, "failed").unlink(missing_ok=True)
+        running = _read_state(path, "running")
+        if running is not None and running["token"] == owner.token:
+            _state_file(path, "running").unlink(missing_ok=True)
+
+
 class BuildClaims:
     def __init__(self):
         self.active: dict[str, BuildClaim] = {}
 
-    def finish(self, claim):
+    def finish(self, claim, output=""):
+        """``output`` is the build's own stdout (the log, for a detached
+        job): the verdict lines in it decide what a failed build finished."""
         if claim.token not in self.active:
             return
         if claim.proc is not None and claim.proc.returncode is None:
             return  # Keep protection if killing/reaping the process failed.
         try:
-            for path in claim.outputs:
-                stamp = _stamp(path)
-                failed = _read_state(path, "failed")
-                if claim.proc is not None and claim.proc.returncode != 0:
-                    if stamp is not None and stamp != claim.before.get(path):
-                        _write_state(path, "failed", stamp, claim)
-                elif failed is not None and stamp != _record_stamp(failed):
-                    _state_file(path, "failed").unlink(missing_ok=True)
-                running = _read_state(path, "running")
-                if running is not None and running["token"] == claim.token:
-                    _state_file(path, "running").unlink(missing_ok=True)
+            returncode = claim.proc.returncode if claim.proc is not None else None
+            completed = (completed_outputs(claim.tags, claim.in_process, output, returncode)
+                         if returncode else set())
+            finalize(claim.outputs, claim.before, returncode, claim, completed)
         except (OSError, ValueError) as exc:
             # Keep any unfinalized intent conservative, and always release
             # locks. State I/O failure must not strand a resource forever.

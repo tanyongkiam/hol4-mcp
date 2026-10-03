@@ -869,15 +869,20 @@ val _ = load "Defn" handle _ => ();
 
 exception MCP_TC_Rollback;
 
-fun extract_tc_goal_json body_str =
+(* The body arrives as the quotation HOL's own filter would compile, so its
+   ANTIQUOTE frags name SML values of the session. The goal goes back as a
+   string that is reparsed in the file's grammar: with every variable and
+   numeral typed, an unannotated `-` or `<` cannot resolve to another
+   overload there (int, once integerTheory is open). *)
+fun extract_tc_goal_json_q (q : term frag list) =
   let
     val result = ref ""
     fun inner () =
       let
-        val d = Defn.Hol_defn "mcp_tc_extract" [QUOTE body_str]
+        val d = Defn.Hol_defn "mcp_tc_extract" q
         val _ = Defn.tgoal d
         val (_, t) = hd (top_goals())
-        val _ = result := term_to_string t
+        val _ = result := Lib.with_flag (Globals.show_types, true) term_to_string t
         val _ = ((drop_all(); ()) handle _ => ())
       in
         raise MCP_TC_Rollback
@@ -890,6 +895,8 @@ fun extract_tc_goal_json body_str =
     print (json_ok (json_string (!result)) ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
+
+fun extract_tc_goal_json body_str = extract_tc_goal_json_q [QUOTE body_str];
 
 (* =============================================================================
  * Resume Goal Extraction

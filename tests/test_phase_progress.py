@@ -66,6 +66,24 @@ async def test_cancelled_prefix_retains_honest_timeout_phase(tmp_path):
     assert "build the ancestors (holmake)" not in result
 
 
+async def test_failed_resync_after_budget_abort_schedules_restart():
+    async def hang(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    session = SimpleNamespace(interrupt=lambda: None, resync=AsyncMock(return_value=False))
+    reinit = []
+    cursor = SimpleNamespace(
+        state_at=hang, session=session, mark_interrupted=lambda: None, _phase={},
+        _schedule_full_reinit=lambda reason=None: reinit.append(reason))
+    result = await srv._state_at_budgeted(cursor, 1, timeout=0.05)
+    assert "NOT recovered" in result.error and "restarts" in result.error, result.error
+    assert reinit, "an unsynchronised pipe must force a fresh HOL process"
+    session.resync.return_value = True
+    reinit.clear()
+    result = await srv._state_at_budgeted(cursor, 1, timeout=0.05)
+    assert "session recovered" in result.error and not reinit, result.error
+
+
 def test_slow_prefix_does_not_blame_target_proof():
     for _ in range(3):
         lines = srv._slow_nav_lines("prefix", "file", "trivial", 200, 199)

@@ -38,6 +38,7 @@ from .hol_file_parser import (
 )
 from .quote_check import quote_diagnosis_lines
 from .build_evidence import traced_build, build_failure_heading
+from . import build_coordination as coordination
 
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -213,13 +214,21 @@ async def _state_at_budgeted(
         # or it becomes the next command's reply and the pipe stays one frame
         # behind for the rest of the session.
         try:
-            await cursor.session.resync()
+            recovered = bool(await cursor.session.resync())
         except Exception:
-            pass
+            recovered = False
         try:
             cursor.mark_interrupted()
         except Exception:
             pass
+        if not recovered:
+            # The aborted reply may still be in the pipe, where the next send
+            # would read it as its own; only a fresh process is trusted.
+            try:
+                cursor._schedule_full_reinit(
+                    "HOL did not resynchronise after the budget abort")
+            except Exception:
+                pass
         return StateAtResult(
             goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
             file_hash="",
@@ -227,17 +236,21 @@ async def _state_at_budgeted(
                                       target_started=started is not None,
                                       phase=(getattr(cursor, "_phase", None)
                                              if getattr(cursor, "_phase", {}).get("interrupted")
-                                             else None)),
+                                             else None),
+                                      recovered=recovered),
         )
 
 
 def _timeout_error_text(budget: float, prefix_s: float, target_s: float,
-                        target_started: bool, phase: dict | None = None) -> str:
+                        target_started: bool, phase: dict | None = None,
+                        recovered: bool = True) -> str:
     """The TIMEOUT message, attributed: `prefix=` is dependency load plus the
     theorems before the target, `target=` the target's own tactics."""
+    state = ("session recovered" if recovered else
+             "session NOT recovered: HOL restarts on the next call")
     head = (
         f"TIMEOUT: state_at exceeded its overall {budget:.0f}s budget and was "
-        f"aborted (HOL interrupted; session recovered). Spent: prefix={prefix_s:.1f}s "
+        f"aborted (HOL interrupted; {state}). Spent: prefix={prefix_s:.1f}s "
         f"(dependencies + current-file declarations + earlier theorems), target={target_s:.1f}s (this "
         f"theorem's own tactics). "
     )
@@ -406,6 +419,7 @@ async def _state_caveat_lines(
     # Name any deps auto-cheated while loading the file prefix (the state
     # shown was computed with those theorems replaced by `cheat`).
     lines.extend(_auto_cheated_deps_lines(cursor, active_theorem))
+    lines.extend(_prefix_error_lines(cursor))
 
     # Notice when prefix-skip navigation deliberately cheated the prefix.
     lines.extend(_prefix_skip_lines(cursor))
@@ -439,6 +453,21 @@ def _failure_evidence_lines(session) -> list[str]:
     if evidence.get("path"):
         return [f"[Latest HOL failure evidence ({evidence['kind']}): {evidence['path']}]"]
     return [f"[HOL failure evidence could not be saved: {evidence.get('log_error', 'unknown')}]"]
+
+
+def _prefix_error_lines(cursor) -> list[str]:
+    """Top-level SML spans of the loaded prefix in which an item raised. The
+    raise ends the span: that item (a Definition whose automatic termination
+    proof failed defines nothing) and everything after it in the span did
+    not run, so their bindings are absent from the heap and a later use of
+    one fails or silently refers to something else."""
+    errors = getattr(cursor, "_prefix_errors", None)
+    if not errors:
+        return []
+    rendered = "; ".join(f"lines {a}-{b}: {reason}" for a, b, reason in errors)
+    return ["", f"[prefix errors (top-level SML that raised; the raising item and "
+                f"the rest of its span did not run, so what they define is missing "
+                f"from the heap): {rendered}]"]
 
 
 def _auto_cheated_deps_lines(cursor, target_name: str | None = None) -> list[str]:
@@ -635,6 +664,36 @@ _RAISED_FAIL_MARKER = (
     "  <-- replay stopped here (raised exception; true fault may be earlier)"
 )
 _RAISED_FAIL_HEADER = "=== Where replay stopped (raised exception) ==="
+
+
+def _is_static_error(err: str | None) -> bool:
+    """True iff a replay error is a Poly/ML COMPILE error in the step's SML —
+    an undeclared name, a type error, a syntax error — so no tactic ran and
+    the goal is untouched. Distinct from a tactic that ran and failed."""
+    if not err:
+        return False
+    return ("Static Errors" in err or "has not been declared" in err
+            or "poly: : error:" in err.lower())
+
+
+def _static_error_lines(err: str | None) -> list[str]:
+    """The compiler's own diagnostics for a step whose SML did not compile."""
+    picked = [ln.strip() for ln in (err or "").splitlines()
+              if re.search(r"error:|has not been declared|Static Errors", ln)]
+    out = ["  SML compile error — no tactic ran; this is not a logical proof failure:"]
+    out.extend(f"    {ln[:200]}" for ln in picked[:4])
+    if not picked and err and err.strip():
+        out.append(f"    {err.strip().splitlines()[0][:200]}")
+    out.append(
+        "  An undeclared name is a source error — a missing binding, or a forward "
+        "reference to a block that is still below the parked position; a TYPE error "
+        "at a line of valid HOL may be a step-realization fault (skill note: Type "
+        "error at a replayed step). Sub-suspending cannot localize either.")
+    return out
+
+
+_STATIC_FAIL_MARKER = "  <-- does not compile (no tactic ran)"
+_STATIC_FAIL_HEADER = "=== Step whose SML did not compile ==="
 
 
 _PARSE_ERROR_RE = re.compile(r"parse|unknown character|lex", re.I)
@@ -1179,13 +1238,24 @@ def _undeclared_name_hint(session: str, output: str) -> str | None:
         return None
     parked = (f"in {cursor._active_theorem}" if cursor._active_theorem
               else "before the first theorem")
+    # The line after a QED is between blocks and not navigable; the block is
+    # admitted by navigating INTO the proof that follows it.
+    later = [t for t in cursor._theorems if t.start_line > thm.start_line]
+    following = min(later, key=lambda t: t.start_line) if later else None
+    if following is not None:
+        route = (f"navigate INTO the next proof, `{following.name}` — "
+                 f"hol_state_at(line={following.proof_start_line}) — whose prefix "
+                 f"admits `{name}`")
+    else:
+        route = (f"`{name}` is the file's last block, so no later proof admits it "
+                 f"for hol_state_at; hol_check_proof(theorem=\"{name}\") validates it, "
+                 f"and a consumer theorem added after it would bring it into scope")
     return (
         f"[hint: `{name}` is a {thm.kind if hasattr(thm, 'kind') else 'theorem'} "
         f"at line {thm.start_line} of {Path(cursor.file).name}, AFTER the parked "
         f"position (loaded through line {max(loaded - 1, 0)}, {parked}). A name "
-        f"exists in the session only once navigation has passed its QED: "
-        f"hol_state_at at or after line {thm.proof_end_line} first, or work at a "
-        f"position where it is already in scope.]"
+        f"exists in the session only once navigation has passed its QED: {route}; "
+        f"or work at a position where it is already in scope.]"
     )
 
 
@@ -1805,8 +1875,11 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                    0 for unlimited)
         timeout: Max seconds to wait (default 600, max 1800). Ignored with detach.
         heap_size: Max heap size in MB for Poly/ML builds (default 12288)
-        jobs: Max parallel jobs (-j flag). Overrides HOL4_MCP_HOLMAKE_JOBS in
-              env, then the inherited environment; default 1.
+        jobs: Max parallel jobs, passed as -j — jobs=1 included, which forces
+              a sequential build in which Holmake streams each theory's
+              output inline and writes no per-theory .hol/logs. Overrides
+              HOL4_MCP_HOLMAKE_JOBS in env, then the inherited environment;
+              unset: Holmake's own default (parallel, with .hol/logs).
         detach: After dependency discovery, start the build in the background with
                 `job=<id>` and the log path; poll hol_build_status(job=...).
                 For builds longer than the synchronous budget — never a shell
@@ -1825,12 +1898,19 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     directory overlaps with another MCP build on the same host and user when
     either job writes there; read-only dependencies may be shared. The error names the
     blocking job/build and directories; wait for it to finish, then retry.
-    Changed outputs from failed/cancelled jobs, or jobs whose controller died,
-    may be partial or unverified and cannot be reused unchanged as up-to-date
-    dependencies. Evidence survives server restarts in .hol4-mcp/build-state
+    When a build fails or is cancelled, each changed output is judged on its
+    own: one whose Holmake job reported success keeps its standing, as do the
+    .uo/.ui files Holmake compiles in its own process when Holmake exited
+    normally; the rest may be partial or unverified and cannot be reused
+    unchanged as up-to-date dependencies (a sequential `jobs=1` build prints
+    no per-job verdicts, so all of its changed outputs are judged by the exit
+    status alone). Evidence survives server restarts in .hol4-mcp/build-state
     beside the outputs; keep this generated directory out of version control.
-    Inspect/remove and rebuild them, or use a build whose graph explicitly
-    schedules their reconstruction.
+    Inspect/remove and rebuild suspect outputs, or use a build whose graph
+    explicitly schedules their reconstruction. A detached job also records
+    itself and, when Holmake exits, its exit status, so a server started later
+    adopts it: hol_build_status reports or cancels it, and a build that meets
+    its outputs applies that status before judging them.
     Requires Holmake's --json/--dirs graph interface. External build processes
     and undeclared recipe/pre-exec outputs are outside this coordination.
     """
@@ -1864,14 +1944,15 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     if env:
         proc_env.update(env)
     setting = "HOL4_MCP_HOLMAKE_JOBS" if jobs is None else "jobs"
-    value = proc_env.get(setting, "1") if jobs is None else jobs
-    try:
-        jobs = max(1, int(value))
-    except (TypeError, ValueError):
-        return f"ERROR: {setting} must be an integer, got {value!r}. No build was started."
+    value = proc_env.get(setting) if jobs is None else jobs
+    if value is not None:
+        try:
+            jobs = max(1, int(value))
+        except (TypeError, ValueError):
+            return f"ERROR: {setting} must be an integer, got {value!r}. No build was started."
 
     cmd = [str(holmake_bin), "--no_preexecs", "--qof", f"--heap-size={heap_size}"]
-    if jobs > 1:
+    if jobs is not None:
         cmd.extend(["-j", str(jobs)])
     if target:
         cmd.append(target)
@@ -1894,6 +1975,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
             raise
 
     proc = None
+    stdout_chunks = []
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1986,7 +2068,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         return f"ERROR: build in {workdir_path}: {type(e).__name__}: {e}\n{trace_note}".rstrip()
     finally:
         await _kill_process_group(proc)
-        build_claims.finish(claim)
+        build_claims.finish(claim, b''.join(stdout_chunks).decode("utf-8", errors="replace"))
 
 
 @dataclass
@@ -2015,24 +2097,40 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     log_dir = workdir_path / ".hol"
     log_dir.mkdir(parents=True, exist_ok=True)
     log = log_dir / f"mcp-build-{job_id}.log"
+    # A shell wrapper outlives Holmake just long enough to record its exit
+    # status, so a server started later can tell a finished job from a lost
+    # one. Killing the process group kills the wrapper too: no status, which
+    # is the honest answer for a cancelled build.
+    exit_file = log_dir / f"mcp-build-{job_id}.exit"
+    exit_file.unlink(missing_ok=True)
+    wrapped = ["/bin/sh", "-c",
+               '"$@"; s=$?; printf %s "$s" > "$0.tmp" && mv -f "$0.tmp" "$0"; exit "$s"',
+               str(exit_file), *cmd]
     log_fh = open(log, "wb")
     try:
         if claim is not None:
             log_fh.write(claim.preflight_output.encode("utf-8"))
             log_fh.flush()
         proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=workdir_path, env=proc_env,
+            *wrapped, cwd=workdir_path, env=proc_env,
             stdout=log_fh, stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
             pass_fds=tuple(claim.lock_fds) if claim is not None else (),
         )
     finally:
         log_fh.close()
+    started = time.time()
     if claim is not None:
         claim.proc = proc
         claim.detached = True
+        try:
+            coordination.write_job(coordination.job_record(
+                claim, pid=proc.pid, target=target, log=log, exit_file=exit_file,
+                trace_note=trace_note, started=started))
+        except OSError as exc:
+            claim.state_error = f"Build job record could not be written: {exc}"
     job = _BuildJob(proc=proc, workdir=workdir_path, target=target, log=log,
-                    started=time.time(), trace_note=trace_note, claim=claim)
+                    started=started, trace_note=trace_note, claim=claim)
     _build_jobs[job_id] = job
 
     async def _reap():
@@ -2045,7 +2143,12 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
         finally:
             try:
                 if claim is not None:
-                    build_claims.finish(claim)
+                    try:
+                        output = _read_log_tail(log, 0)[0]
+                    except OSError:
+                        output = ""
+                    build_claims.finish(claim, output)
+                    coordination.record_finalized(claim.token, proc.returncode)
             finally:
                 job.finished = time.time()
                 job.done.set()
@@ -2054,6 +2157,69 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
             f"workdir={workdir_path}\nlog={log}\n{trace_note}\n"
             f"Poll hol_build_status(job=\"{job_id}\"); it reports running/done "
             f"with the log tail, and cancel=True stops it.")
+
+
+async def _adopted_build_status(job: str, cancel: bool, tail: int) -> str:
+    """Report a job this server did not start, from the record its starter
+    left: running, done (its wrapper recorded Holmake's exit status, applied
+    to its outputs here), cancelled, or lost — controller and process both
+    gone with no status, so its changed outputs stay suspect until rebuilt."""
+    record = coordination.read_job(job)
+    if record is None:
+        known = ", ".join(sorted(_build_jobs)) or "none"
+        return (f"ERROR: unknown build job '{job}' (known to this server: {known}; "
+                f"no record of it on this host).")
+    returncode = coordination.job_exit_status(record)
+    alive = returncode is None and coordination.process_alive(record)
+    cancelled = False
+    if cancel and alive:
+        cancelled = True
+        for sig, grace in ((signal.SIGTERM, 2.5), (signal.SIGKILL, 1.0)):
+            try:
+                os.killpg(record["pid"], sig)
+            except OSError:
+                break
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline and coordination.process_alive(record):
+                await asyncio.sleep(0.05)
+            if not coordination.process_alive(record):
+                break
+        alive = coordination.process_alive(record)
+        returncode = coordination.job_exit_status(record)
+    log = Path(record["log"])
+    try:
+        text = _read_log_tail(log, tail)[0] if tail > 0 else ""
+        full = _read_log_tail(log, 0)[0]
+    except OSError:
+        text = full = ""
+    finalized = record.get("finalized")
+    if not finalized and (returncode is not None or (cancelled and not alive)):
+        try:
+            coordination.finalize_job(record, returncode, full)
+            finalized = record["finalized"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            text = f"WARNING: build coordination state could not be finalized: {exc}\n\n{text}"
+    if returncode is not None:
+        state = "done"
+    elif cancelled and not alive:
+        state = "cancelled"
+    elif alive:
+        state = "running"
+    else:
+        state = "lost"
+    end = finalized["at"] if finalized else time.time()
+    elapsed = end - record.get("started", end)
+    head = (f"{state} (adopted: started by a previous MCP server): job={job} "
+            f"target={record.get('target') or '(all)'} workdir={record['workdir']} "
+            f"[{elapsed:.0f}s]")
+    if state == "done":
+        verdict = ("Build succeeded" if returncode == 0 else
+                   build_failure_heading(returncode, text, bool(record.get("trace_note"))))
+        head += f"\n{verdict}."
+    elif state == "lost":
+        head += ("\nThe controller and the build process are both gone and no exit "
+                 "status was recorded: its changed outputs stay suspect until rebuilt.")
+    return f"{head}\nlog={log}\n{record.get('trace_note', '')}\n\n{text}".rstrip()
 
 
 @mcp.tool()
@@ -2068,11 +2234,13 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
     Returns: job state with elapsed time, exit code and the log tail; a done
              job's line says `Build succeeded` or `Build failed`. Cancellation
              is not reported complete until the reaper releases its claim.
+             A job started by a previous MCP server (replaced or crashed) is
+             adopted from its on-disk record and reported as running, done
+             (its exit status is applied to its outputs), cancelled or lost.
     """
     entry = _build_jobs.get(job)
     if entry is None:
-        known = ", ".join(sorted(_build_jobs)) or "none"
-        return f"ERROR: unknown build job '{job}' (known: {known})."
+        return await _adopted_build_status(job, cancel, tail)
     proc = entry.proc
     if cancel and not entry.done.is_set() and proc.returncode is None:
         entry.cancel_requested = True
@@ -2399,6 +2567,18 @@ async def hol_state_at(
         inside one opaque step and its goal is not observable; the line
         carries the sub-suspend recipe. Goals are withheld unless
         show_partial=True, and then they are the step's ENTRY state.
+      - "... of a Termination proof" / "the step's SML does not compile" —
+        two cases where the sub-suspend recipe does NOT apply: a Definition
+        cannot be sub-suspended (probe the arm in place from its first
+        tactic), and a Poly/ML compile error (undeclared name, type error)
+        means no tactic ran — the compiler's lines are quoted; fix the
+        binding or forward reference.
+      - "[prefix errors (top-level SML that raised ...): lines A-B: ...]" —
+        a Definition or other top-level item before the target raised when
+        it ran (classically a failed automatic termination proof). The raise
+        ends that span: the item and everything after it in lines A-B did
+        not run, so their names are missing from the heap although
+        navigation continued with the next span.
       - "Theorem: X ⚠ context has admission history" — inspect the history
         below; this does not assert that every recorded admission was used.
       - "Latest HOL failure evidence" — retained request/response JSON path,
@@ -2536,19 +2716,43 @@ async def hol_state_at(
         # rename) can fire from anywhere inside a lumped/opaque step, so the
         # pinned step is only where replay STOPPED, not a confident fault site.
         is_exc = _is_raised_exception(result.error)
-        sc_marker = _RAISED_FAIL_MARKER if is_exc else "  <-- FAILED"
-        sc_header = _RAISED_FAIL_HEADER if is_exc else "=== Failing tactic ==="
+        is_static = _is_static_error(result.error)
+        # A Termination proof is not a Theorem: `suspend` inside it leaves the
+        # Definition unsaved, so the sub-suspend recipe does not apply.
+        is_definition = thm is not None and thm.kind == "Definition"
+        sc_marker = (_STATIC_FAIL_MARKER if is_static else
+                     _RAISED_FAIL_MARKER if is_exc else "  <-- FAILED")
+        sc_header = (_STATIC_FAIL_HEADER if is_static else
+                     _RAISED_FAIL_HEADER if is_exc else "=== Failing tactic ===")
+        opaque_remedy = (
+            None if is_static else
+            "Probe the arm in place from its first tactic — a Definition cannot "
+            "be sub-suspended." if is_definition else
+            "Use Suspend/Resume or extract as a lemma.")
 
         if opaque_multiline:
             range_str = f"lines {fail_loc[0]}-{fail_end_loc[0]}"
             fail_str = range_str  # footer uses this too
-            lines.append(
-                f"PROOF BROKEN in opaque step {fail_idx} ({range_str}); the goal "
-                f"at the failure is not observable — sub-suspend the arm "
-                f"(`>- suspend \"X\"` + "
-                f"`Resume {suspension_base(active_theorem or 'thm')}[X]: cheat QED`) "
-                f"to navigate inside it"
-            )
+            if is_static:
+                lines.append(
+                    f"PROOF BROKEN in opaque step {fail_idx} ({range_str}): the "
+                    f"step's SML does not compile, so no tactic ran"
+                )
+            elif is_definition:
+                lines.append(
+                    f"PROOF BROKEN in opaque step {fail_idx} ({range_str}) of a "
+                    f"Termination proof; the goal at the failure is not observable, "
+                    f"and a Definition cannot be sub-suspended — probe the arm in "
+                    f"place (below)"
+                )
+            else:
+                lines.append(
+                    f"PROOF BROKEN in opaque step {fail_idx} ({range_str}); the goal "
+                    f"at the failure is not observable — sub-suspend the arm "
+                    f"(`>- suspend \"X\"` + "
+                    f"`Resume {suspension_base(active_theorem or 'thm')}[X]: cheat QED`) "
+                    f"to navigate inside it"
+                )
             lines.append(
                 f"ERROR: the failing step is a SINGLE opaque tactic spanning "
                 f"{range_str}; the replay cannot localize WHERE inside it the "
@@ -2560,27 +2764,46 @@ async def hol_state_at(
             if is_exc:
                 lines.extend(_exception_advisory_lines(result.error))
             lines.append("")
-            lines.append(
-                f"To localize: SUB-SUSPEND the arm — replace the failing "
-                f"`>- (...)` / `>|` / `\\\\`-chain arm with `>- suspend \"X\"` and "
-                f"add `Resume thm[X]: cheat QED` after the parent QED. Each arm "
-                f"becomes a navigable Resume body whose prefix the FILE owns, so "
-                f"`hol_state_at` lands on the real goal. This is the DEFAULT for an "
-                f"opaque break (99% of the time). Do NOT bisect by moving a `cheat` "
-                f"through the chain, and do NOT reconstruct the goal with "
-                f"`hol_send`/`e`/`sg` (a scratch goal diverges from the file form). "
-                f"The goal available here is the state ENTERING this opaque step, "
-                f"not the failure point."
-            )
+            if is_static:
+                lines.extend(_static_error_lines(result.error))
+            elif is_definition:
+                lines.append(
+                    f"To localize: this is a Termination proof, and `suspend`/`Resume` "
+                    f"is unavailable inside a Definition — the Definition does not load "
+                    f"while its termination proof holds a suspension. Navigate to the "
+                    f"step's start, hol_state_at(line={fail_loc[0]}, col={fail_loc[1]}), "
+                    f"to read the goal ENTERING the arm, then apply the arm's tactics "
+                    f"one at a time with hol_send to find the failing one. Do NOT "
+                    f"reconstruct the goal in a scratch session, and do NOT bisect by "
+                    f"moving a `cheat` through the chain."
+                )
+            else:
+                lines.append(
+                    f"To localize: SUB-SUSPEND the arm — replace the failing "
+                    f"`>- (...)` / `>|` / `\\\\`-chain arm with `>- suspend \"X\"` and "
+                    f"add `Resume thm[X]: cheat QED` after the parent QED. Each arm "
+                    f"becomes a navigable Resume body whose prefix the FILE owns, so "
+                    f"`hol_state_at` lands on the real goal. This is the DEFAULT for an "
+                    f"opaque break (99% of the time). Do NOT bisect by moving a `cheat` "
+                    f"through the chain, and do NOT reconstruct the goal with "
+                    f"`hol_send`/`e`/`sg` (a scratch goal diverges from the file form). "
+                    f"The goal available here is the state ENTERING this opaque step, "
+                    f"not the failure point."
+                )
             if thm:
                 s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
                 lines.extend(format_step_context(
                     step_plan, fail_idx, s_lines,
                     context_before=context_before, context_after=context_after,
                     fail_marker=sc_marker, failing_header=sc_header,
+                    opaque_remedy=opaque_remedy,
                 ))
         else:
-            if is_exc:
+            if is_static:
+                lines.append(f"PROOF BROKEN at {fail_str}: the step's SML does not "
+                             f"compile, so no tactic ran")
+                lines.extend(_static_error_lines(result.error))
+            elif is_exc:
                 lines.append(f"PROOF BROKEN at {fail_str} (replay stopped on a raised exception)")
             else:
                 lines.append(f"PROOF BROKEN at {fail_str}")
@@ -2594,6 +2817,7 @@ async def hol_state_at(
                     step_plan, fail_idx, s_lines,
                     context_before=context_before, context_after=context_after,
                     fail_marker=sc_marker, failing_header=sc_header,
+                    opaque_remedy=opaque_remedy,
                 ))
 
             if is_exc:
@@ -2654,7 +2878,20 @@ async def hol_state_at(
                 lines.append(f"  {g['goal']}")
 
         # Error footer for truncation safety
-        if opaque_multiline:
+        if is_static:
+            error_footer = (
+                f"ERROR: PROOF BROKEN at {fail_str}: the step's SML does not compile "
+                f"(no tactic ran). Fix the named binding or forward reference; this is "
+                f"not a logical proof failure and sub-suspending localizes nothing."
+            )
+        elif opaque_multiline and is_definition:
+            error_footer = (
+                f"ERROR: PROOF BROKEN somewhere in the opaque step at {fail_str} of a "
+                f"Termination proof. A Definition cannot be sub-suspended: probe the "
+                f"arm in place from its first tactic (hol_state_at there, then one "
+                f"hol_send per tactic)."
+            )
+        elif opaque_multiline:
             error_footer = (
                 f"ERROR: PROOF BROKEN somewhere in the opaque step at {fail_str}. "
                 f"The line shown is the step's start, not the failure — SUB-SUSPEND: "
@@ -2863,6 +3100,7 @@ async def hol_check_proof(
     ]
     lines.extend(_session_notice_lines(cursor))
     lines.extend(_auto_cheated_deps_lines(cursor, theorem))
+    lines.extend(_prefix_error_lines(cursor))
     lines.append("")
 
     if thm.has_cheat:

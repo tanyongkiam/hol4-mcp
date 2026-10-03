@@ -166,6 +166,185 @@ async def test_hol_send_undeclared_name_points_at_parked_position(tmp_path):
         assert "has not been declared" in r, r
         assert "later_thm" in r and "line 13" in r and "opaque_fail" in r, r
         assert "hol_state_at" in r, r
+        # later_thm is the file's last block: no later proof admits it.
+        assert "last block" in r and 'hol_check_proof(theorem="later_thm")' in r, r
+        assert "line 17" not in r, r   # the line after QED is not a position
+    finally:
+        await hol_stop(session)
+
+
+TRIO_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "trio";
+
+Theorem first_thm:
+  T
+Proof
+  simp []
+QED
+
+Theorem second_thm:
+  T
+Proof
+  simp []
+QED
+
+Theorem third_thm:
+  T
+Proof
+  simp []
+QED
+
+val _ = export_theory();
+"""
+
+
+async def test_hol_send_undeclared_name_routes_into_the_next_proof(tmp_path):
+    session = "fo_send_next"
+    try:
+        await init(tmp_path, "trio", TRIO_SCRIPT, session)
+        await hol_state_at(line=8, col=3, session=session)   # parked in first_thm
+        r = await hol_send(command="second_thm;", session=session)
+        assert "has not been declared" in r, r
+        # The route is INTO third_thm's proof body (line 20), not the line
+        # after second_thm's QED.
+        assert "third_thm" in r and "hol_state_at(line=20)" in r, r
+    finally:
+        await hol_stop(session)
+
+
+STATIC_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "stat";
+
+Theorem static_fail:
+  !x:num. x + 0 = x
+Proof
+  gen_tac >>
+  (simp [] >>
+   mp_tac undeclared_thm_xyz)
+QED
+
+val _ = export_theory();
+"""
+
+
+async def test_static_sml_error_is_not_an_opaque_proof_failure(tmp_path):
+    session = "fo_static"
+    try:
+        await init(tmp_path, "stat", STATIC_SCRIPT, session)
+        r = await hol_state_at(line=11, col=1, session=session)
+        assert "PROOF BROKEN" in r, r
+        assert "does not compile" in r and "undeclared_thm_xyz" in r, r
+        assert "has not been declared" in r, r
+        assert "`>- suspend" not in r and "Use Suspend/Resume" not in r, r
+    finally:
+        await hol_stop(session)
+
+
+TERMINATION_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "term";
+
+Definition count_def:
+  count (n:num) = if n = 0 then 0 else count (n - 1)
+Termination
+  Q.EXISTS_TAC `measure I` >>
+  (conj_tac >>
+   FAIL_TAC "inside")
+End
+
+val _ = export_theory();
+"""
+
+SUSPENDED_TERMINATION_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "susterm";
+
+Definition count_def:
+  count (n:num) = if n = 0 then 0 else count (n - 1)
+Termination
+  WF_REL_TAC `measure I`
+  >- suspend "Dec"
+End
+
+Resume count_def[Dec]:
+  cheat
+QED
+
+Finalise count_def;
+
+Theorem after_count:
+  T
+Proof
+  simp []
+QED
+
+val _ = export_theory();
+"""
+
+
+async def test_opaque_break_in_termination_proof_does_not_prescribe_suspend(tmp_path):
+    session = "fo_term"
+    try:
+        await init(tmp_path, "term", TERMINATION_SCRIPT, session)
+        r = await hol_state_at(line=11, col=1, session=session)   # End line
+        first = body(r)[0]
+        assert first.startswith("PROOF BROKEN in opaque step"), r
+        assert "Termination proof" in first, r
+        assert "hol_send" in r and "cannot be sub-suspended" in r, r
+        assert "`>- suspend" not in r and "Use Suspend/Resume" not in r, r
+    finally:
+        await hol_stop(session)
+
+
+async def test_suspend_inside_termination_leaves_the_definition_unsaved(tmp_path):
+    session = "fo_susterm"
+    try:
+        await init(tmp_path, "susterm", SUSPENDED_TERMINATION_SCRIPT, session)
+        r = await hol_state_at(line=22, col=3, session=session)   # inside after_count
+        assert "count_def" in r and ("failed" in r or "prefix errors" in r), r
+    finally:
+        await hol_stop(session)
+
+
+PREFIX_ERROR_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "pfx";
+
+Definition bad_def:
+  bad (n:num) = if n = 0 then 0 else bad (n + 1)
+End
+
+Theorem after_bad:
+  T
+Proof
+  simp []
+QED
+
+val _ = export_theory();
+"""
+
+
+async def test_failed_top_level_definition_is_reported_as_prefix_error(tmp_path):
+    session = "fo_prefix_error"
+    try:
+        f = await init(tmp_path, "pfx", PREFIX_ERROR_SCRIPT, session)
+        r = await hol_state_at(line=12, col=3, session=session)
+        # The span is the whole pre-theorem chunk that was sent, and the
+        # raise ended it: bad_def and anything after it in the span did not run.
+        assert "[prefix errors" in r and "lines 1-8" in r and "bad_def" in r, r
+        assert "rest of its span did not run" in r, r
+        assert "PROOF BROKEN" not in r, r
+        # Fixing the span clears the report on the next navigation.
+        f.write_text(PREFIX_ERROR_SCRIPT.replace("bad (n + 1)", "bad (n - 1)"))
+        r = await hol_state_at(line=12, col=3, session=session)
+        assert "[prefix errors" not in r, r
     finally:
         await hol_stop(session)
 

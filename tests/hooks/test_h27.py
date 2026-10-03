@@ -80,6 +80,31 @@ def test_lone_dispatcher_is_not_a_blocker(run_hook, repo):
     assert code == 0, err
 
 
+def test_short_sibling_dispatch_ladder_is_not_a_blocker(run_hook, repo):
+    stage(repo, "rw [] >> strip_tac\n  >- metis_tac []",
+          "Cases_on `x`\n  >- simp []\n  >- metis_tac []")
+    code, err, _ = run(run_hook, repo, "git commit -m 'dispatch foo_two'")
+    assert code == 0, err
+
+
+def test_retouched_line_keeps_its_inherited_finding(run_hook, repo):
+    p = repo / "fooScript.sml"
+    p.write_text(SCRIPT.replace(
+        "val _ = export_theory();",
+        "Theorem bar:\n  T\nProof\n  rw []\n  >> fs [fooTheory.x_def]\nQED\n\n"
+        "val _ = export_theory();"))
+    git(repo, "add", "fooScript.sml")
+    git(repo, "commit", "-qm", "fixture")
+    stage(repo, "fs [fooTheory.x_def]", "fs [barTheory.x_def]")
+    code, err, _ = run(run_hook, repo, "git commit -m 'rename'")
+    assert code == 0, err
+    # A retouch that also creates a new adjacency is still judged new.
+    stage(repo, "  >> fs [barTheory.x_def]",
+          "  >> fs [barTheory.x_def]\n  >> gvs []\n  >> simp []")
+    code, err, _ = run(run_hook, repo, "git commit -m 'rename'")
+    assert code == 2 and "adjacent normalisers `gvs >> simp`" in err, err
+
+
 def test_amend_body_edit_adding_cheat_is_refused(run_hook, repo):
     stage(repo, "  >- metis_tac []", "  >- cheat")
     code, err, _ = run(run_hook, repo)

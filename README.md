@@ -164,7 +164,7 @@ hol4-mcp serve --transport http --port 8000
 | Tool | Description |
 |------|-------------|
 | `holmake` | Run `Holmake --qof` on a named target, with dependency-overlap guards against concurrent MCP builds and failure log extraction; `detach=True` for long builds |
-| `hol_build_status` | State, log tail and cancellation of a detached `holmake` job |
+| `hol_build_status` | State, log tail and cancellation of a detached `holmake` job, including one started by an earlier server process |
 | `hol_log` | Read a specific theory's build log |
 | `hol_logs` | List available build logs |
 

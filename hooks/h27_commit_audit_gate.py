@@ -69,8 +69,9 @@ MAX_SHOWN = 12
 # junk; below this it is flagged, at or above it is the sanctioned form.
 LADDER_MIN = 2
 # Sweep findings that stay H25's post-check advisory and never block a commit:
-# a lone `>-` is a style prompt whose fix (`>>`) changes no proof.
-ADVISORY_ONLY = ("`>-` is the only dispatcher",)
+# a lone `>-` is a style prompt whose fix (`>>`) changes no proof, and a short
+# trailing `>-` run cannot be told from genuine sibling arms by counting them.
+ADVISORY_ONLY = ("`>-` is the only dispatcher", "trailing `>-`:")
 
 # Gate 6 (single-use `[local]` helpers) is deliberately NOT enforced here. Its
 # keeper case — a small, intent-documenting named fact — is the common, correct
@@ -81,15 +82,20 @@ ADVISORY_ONLY = ("`>-` is the only dispatcher",)
 
 
 def changed_lines(before, after):
-    """Added lines and an exact unchanged-line mapping into HEAD."""
+    """Added lines, and each new line's counterpart in HEAD: unchanged lines
+    exactly, the lines of a replaced block positionally — so a finding that
+    already stood on a line this commit merely retouches (a renamed theorem
+    in a rewrite list) is matched against the same finding in HEAD."""
     old, new = before.splitlines(), after.splitlines()
-    added, unchanged = {}, {}
+    added, counterpart = {}, {}
     for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
         if tag == "equal":
-            unchanged.update({j + 1: a + j - c + 1 for j in range(c, d)})
+            counterpart.update({j + 1: a + j - c + 1 for j in range(c, d)})
         elif tag in ("insert", "replace"):
             added.update({j + 1: new[j] for j in range(c, d)})
-    return added, unchanged
+            if tag == "replace":
+                counterpart.update({j + 1: a + j - c + 1 for j in range(c, min(d, c + b - a))})
+    return added, counterpart
 
 
 def blocks(text):
@@ -117,7 +123,7 @@ def block_of(blks, ln):
 
 
 def audit(before, text):
-    added, unchanged = changed_lines(before, text)
+    added, counterpart = changed_lines(before, text)
     # Strip comments for token checks; keep line structure so numbers stay real.
     clean_lines = proof_sweep.clean(text).splitlines()
     bare = {n: clean_lines[n - 1] for n in added}
@@ -160,14 +166,14 @@ def audit(before, text):
         found.append((0, f"Gate 2: `Resume {name}` present with no `Finalise "
                          f"{name};` after its last body — the theorem stays cheated"))
 
-    # Compare semantic findings at unchanged source lines, not just their
+    # Compare semantic findings at their HEAD counterparts, not just their
     # counts. Also catch new adjacency created solely by deleting a line.
     inherited = set(proof_sweep.sweep(before))
     for ln, msg in proof_sweep.sweep(text):
         if not any(kind != "Definition" and body <= ln < last
                    for _, kind, _, body, last in blks):
             continue
-        if ((unchanged.get(ln), msg) not in inherited
+        if ((counterpart.get(ln), msg) not in inherited
                 and not msg.startswith(ADVISORY_ONLY)):
             found.append((ln, msg))
     return found

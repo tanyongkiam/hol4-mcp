@@ -12,6 +12,7 @@ import sys
 import pytest
 
 from hol4_mcp import hol_mcp_server as srv
+from hol4_mcp import build_coordination as coordination
 
 
 async def _wait_for_job_finished(job, timeout=10):
@@ -141,7 +142,7 @@ async def test_failed_output_remains_suspect_in_a_new_server(tmp_path, artifact)
         await srv.hol_build_status(job, cancel=True)
 
 
-async def test_build_keeps_reservation_after_its_controller_exits(tmp_path):
+async def test_orphaned_job_keeps_its_reservation_then_certifies_itself(tmp_path):
     shared, peer, output = _shared_fixture(tmp_path)
     foreign = await _exiting_controller(shared, "ready")
     try:
@@ -150,8 +151,9 @@ async def test_build_keeps_reservation_after_its_controller_exits(tmp_path):
         assert foreign["job"] in result, result
         assert not (peer / "result").exists()
         (shared / "release").touch()
-        # The vanished controller cannot certify the job's exit status.
-        # Once it stops writing, an unchanged unverified output remains suspect.
+        # The vanished controller cannot certify the job, but the job's wrapper
+        # records Holmake's exit status as it ends; the next build to meet the
+        # output applies it instead of treating the output as unverified.
         async def released():
             while True:
                 result = await srv.holmake(str(peer), target="result", timeout=10)
@@ -159,8 +161,56 @@ async def test_build_keeps_reservation_after_its_controller_exits(tmp_path):
                     return result
                 await asyncio.sleep(.02)
         result = await asyncio.wait_for(released(), 10)
+        assert "Build succeeded" in result, result
+        assert (peer / "result").read_text() == "complete"
+        record = coordination.read_job(foreign["job"])
+        assert record and record["finalized"]["returncode"] == 0, record
+    finally:
+        (shared / "release").touch()
+        try:
+            os.killpg(foreign["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+async def test_adopted_job_reports_running_then_done(tmp_path):
+    shared, peer, output = _shared_fixture(tmp_path)
+    foreign = await _exiting_controller(shared, "ready")
+    try:
+        status = await srv.hol_build_status(foreign["job"])
+        assert status.startswith("running (adopted"), status
+        (shared / "release").touch()
+
+        async def done():
+            while True:
+                status = await srv.hol_build_status(foreign["job"])
+                if status.startswith("done"):
+                    return status
+                await asyncio.sleep(.02)
+        status = await asyncio.wait_for(done(), 10)
+        assert "Build succeeded" in status and "adopted" in status, status
+        result = await srv.holmake(str(peer), target="result", timeout=10)
+        assert "Build succeeded" in result, result
+        assert (peer / "result").read_text() == "complete"
+    finally:
+        (shared / "release").touch()
+        try:
+            os.killpg(foreign["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+async def test_adopted_job_can_be_cancelled_and_its_output_stays_suspect(tmp_path):
+    shared, peer, output = _shared_fixture(tmp_path)
+    foreign = await _exiting_controller(shared, "ready")
+    try:
+        status = await srv.hol_build_status(foreign["job"], cancel=True)
+        assert status.startswith("cancelled (adopted"), status
+        result = await srv.holmake(str(peer), target="result", timeout=10)
         assert result.startswith("ERROR:") and "partial" in result.lower(), result
+        assert foreign["job"] in result and str(output) in result, result
         output.unlink()
+        (shared / "release").touch()
         result = await srv.holmake(str(peer), target="result", timeout=10)
         assert "Build succeeded" in result, result
         assert (peer / "result").read_text() == "complete"

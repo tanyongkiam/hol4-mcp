@@ -42,6 +42,18 @@ def strip(text):
     return STRING_RE.sub('""', COMMENT_RE.sub("", text))
 
 
+def _continuation(text, start):
+    """The indented lines following the position ``start`` — an SML
+    binding's right-hand side continues only onto indented lines; the first
+    column-0 line opens the next declaration or block."""
+    out = []
+    for line in text[start:].split("\n")[1:]:
+        if line and not line[0].isspace():
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
 def tactic_bindings(text):
     """Names bound by this text whose value looks like a tactic."""
     cleaned = strip(text)
@@ -50,9 +62,7 @@ def tactic_bindings(text):
         name, _args, rhs_head = m.group(1), m.group(2), m.group(3)
         if name == "_":
             continue
-        # RHS may continue on following lines; look at a bounded window.
-        window = cleaned[m.end(3) : m.end(3) + 200]
-        rhs = rhs_head + window
+        rhs = rhs_head + _continuation(cleaned, m.end(3))
         if NAME_RE.match(name) or COMBINATOR_RE.search(rhs):
             found.add(name)
     return found

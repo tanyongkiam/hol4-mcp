@@ -329,6 +329,7 @@ def format_step_context(
     context_after: int = 0,
     fail_marker: str = "  <-- FAILED",
     failing_header: str = "=== Failing tactic ===",
+    opaque_remedy: str | None = "Use Suspend/Resume or extract as a lemma.",
 ) -> list[str]:
     """Format step plan context around a failing step.
 
@@ -338,6 +339,10 @@ def format_step_context(
     is a RAISED EXCEPTION (e.g. a qpat/qmatch no-match HOL_ERR): the step the
     replay stopped at is then only an upper bound on the fault location, not a
     confident pin, so the marker must not read as 'this tactic failed'.
+
+    ``opaque_remedy`` follows the "cannot inspect inside" note on an opaque
+    step; None drops the note (the step's SML did not compile, so there is
+    nothing inside to inspect).
     """
     if fail_idx < 0 or fail_idx >= len(step_plan):
         return []
@@ -348,12 +353,12 @@ def format_step_context(
     failing_display = _STEP_DISPLAY.get(failing_kind, failing_text)
     shown = elide_long_text(failing_display)
     out = ["", failing_header, shown]
-    if failing_kind in ("expand", "expand_list"):
+    if failing_kind in ("expand", "expand_list") and opaque_remedy is not None:
         # Naming the tactic again is only useful while it is short enough to
         # read; for an elided body it would repeat what was just printed.
         target = (f"inside of {failing_display}"
                   if shown == failing_display else "inside it")
-        out.append(f"Opaque tactic — cannot inspect {target}. Use Suspend/Resume or extract as a lemma.")
+        out.append(f"Opaque tactic — cannot inspect {target}. {opaque_remedy}")
 
     if context_before <= 0 and context_after <= 0:
         return out

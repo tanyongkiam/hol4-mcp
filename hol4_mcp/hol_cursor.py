@@ -42,6 +42,28 @@ class SessionPosition:
 
 
 
+_ANTIQUOTE_RE = re.compile(
+    r"\^(?:\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)|([A-Za-z_][A-Za-z0-9_']*))")
+
+
+def definition_quotation(body: str) -> str:
+    """The SML `term frag list` for a Definition body, as HOL's quotation
+    filter compiles it: `^x` / `^(e)` antiquote SML values in scope, and
+    `:^ty` a type. Inside a quotation `^` has no other reading."""
+    parts, pos = [], 0
+    for m in _ANTIQUOTE_RE.finditer(body):
+        if m.start() > pos:
+            parts.append(f'QUOTE "{escape_sml_string(body[pos:m.start()])}"')
+        expr = m.group(1) if m.group(1) is not None else m.group(2)
+        in_type = re.search(r":\s*$", body[pos:m.start()]) is not None
+        parts.append(f"ANTIQUOTE (ty_antiq ({expr}))" if in_type
+                     else f"ANTIQUOTE ({expr})")
+        pos = m.end()
+    if pos < len(body) or not parts:
+        parts.append(f'QUOTE "{escape_sml_string(body[pos:])}"')
+    return "[" + ", ".join(parts) + "]"
+
+
 def _try_find_json_line(output: str, context: str = "") -> dict:
     """Best-effort JSON parse from HOL output. Returns {} on failure."""
     try:
@@ -515,6 +537,9 @@ class FileProofCursor:
         # auto-cheated to prevent cascading compile errors, mapped to a short
         # reason ("timeout >Ns …" / "error: …"). Cleared on file change.
         self._failed_proofs: dict[str, str] = {}
+        # Top-level SML spans of the prefix (start, end, reason) that raised
+        # when sent: their bindings are missing although loading continued.
+        self._prefix_errors: list[tuple[int, int, str]] = []
 
         # Per-step cost of the last step-by-step replay:
         # (step index, elapsed seconds, "ok" | "budget" | "failed").
@@ -746,6 +771,7 @@ class FileProofCursor:
         self._tc_goals.clear()
         self._resume_goals.clear()
         self._failed_proofs.clear()
+        self._prefix_errors.clear()
         self._theorem_oracles.clear()
         for ckpt_path in [self._base_checkpoint_path, self._deps_checkpoint_path]:
             if ckpt_path and ckpt_path.exists():
@@ -1348,6 +1374,8 @@ class FileProofCursor:
         its label (which may already be consumed after the Resume ran).
         """
         current_thm_names = {thm.name for thm in self._theorems}
+        # A top-level span at or after the change is re-sent on the next load.
+        self._prefix_errors = [e for e in self._prefix_errors if e[1] < start_line]
 
         # Build name → theorem lookup for fast suspension-source queries
         name_to_thm = {thm.name: thm for thm in self._theorems}
@@ -1657,9 +1685,12 @@ class FileProofCursor:
     async def _extract_tc_goal(self, thm: TheoremInfo) -> None:
         """Extract termination conditions goal for a Definition block.
 
-        Calls extract_tc_goal_json which temporarily creates the defn via
+        Calls extract_tc_goal_json_q which temporarily creates the defn via
         Hol_defn inside try_grammar_extension + try_theory_extension,
-        extracts the TC goal string, then rolls back all changes.
+        extracts the TC goal string (every variable and numeral typed, so the
+        later reparse cannot pick another overload), then rolls back all
+        changes. The body goes over as the quotation HOL's own filter would
+        compile, so its `^x` antiquotes resolve to the session's SML values.
 
         MUST be called BEFORE the Definition block is processed (before
         the function constant exists in the theory).
@@ -1667,9 +1698,8 @@ class FileProofCursor:
         Results are cached in self._tc_goals[thm.name].
         """
         goal_body = thm.goal.replace('\n', ' ').strip()
-        escaped = escape_sml_string(goal_body)
         tc_result = await self.session.send(
-            f'extract_tc_goal_json "{escaped}";', timeout=30
+            f'extract_tc_goal_json_q {definition_quotation(goal_body)};', timeout=30
         )
         tc_data = _try_find_json_line(tc_result)
         if 'ok' in tc_data and tc_data['ok']:
@@ -1831,6 +1861,14 @@ class FileProofCursor:
                                         start_line=start_line, end_line=end_line)
         if _is_fatal_hol_error(result):
             return f"Error executing file content: {_format_context_error(result)}"
+        if any(line.startswith("Exception-") for line in result.split('\n')):
+            # An uncaught exception in one top-level item (classically a
+            # Definition whose automatic termination proof failed) ends the
+            # chunk: that item and everything after it in this span did not
+            # run, although loading continues with the next span.
+            span = (start_line, end_line)
+            self._prefix_errors = [e for e in self._prefix_errors if e[:2] != span]
+            self._prefix_errors.append((start_line, end_line, _error_reason(result)))
         return None
 
     async def _handle_theorem_error(self, thm: TheoremInfo, result: str) -> str | None:

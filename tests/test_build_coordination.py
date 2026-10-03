@@ -1,5 +1,6 @@
 """Exercise shared build behavior with the installed Holmake, not a mock lock."""
 import asyncio
+from pathlib import Path
 import re
 import shlex
 import sys
@@ -7,6 +8,75 @@ import sys
 import pytest
 
 from hol4_mcp import hol_mcp_server as srv
+from hol4_mcp.build_coordination import completed_outputs, job_tag
+
+
+MONITOR_OUTPUT = """\
+Scanning $(HOLDIR)/src/boss
+Scanned 2 directories
+Building 3 theory files
+Starting work on aTheory
+Starting work on bTheory
+aTheory                                                  (3s)   [1/3]OK
+bTheory                  ../other                       (12s)   [2/3]CHEATED
+Starting work on cTheory
+cTheory                                                  (1s)   RETRY
+Starting work on cTheory
+Starting work on dTheory
+dTheory                                                  (0s)   FAIL<1>
+Starting work on result
+result                                                   (0s)   OK
+"""
+
+
+def test_completed_outputs_follows_the_monitor_verdicts():
+    tags = {t: {Path(f"/w/{t}.dat")}
+            for t in ("aTheory", "bTheory", "cTheory", "dTheory", "eTheory", "result")}
+    compiled = {Path("/w/aTheory.uo")}
+    done = completed_outputs(tags, compiled, MONITOR_OUTPUT, 1)
+    assert done == {Path("/w/aTheory.dat"), Path("/w/bTheory.dat"),
+                    Path("/w/result.dat"), Path("/w/aTheory.uo")}
+    # A signal exit certifies verdict lines only, never the in-process compiles.
+    for signalled in (-15, 143):
+        done = completed_outputs(tags, compiled, MONITOR_OUTPUT, signalled)
+        assert Path("/w/aTheory.dat") in done and Path("/w/aTheory.uo") not in done
+    assert completed_outputs(tags, compiled, "", None) == set()
+
+
+def test_job_tag_names_the_monitor_line():
+    assert job_tag(Path("/w/fooTheory.dat"), "BIC_Build /w/foo") == "fooTheory"
+    assert job_tag(Path("/w/fooTheory.sml"), "BIC_Build /w/foo") == "fooTheory"
+    assert job_tag(Path("/w/fooTheory.uo"), "BIC_Compile") is None
+    assert job_tag(Path("/w/result"), "touch result") == "result"
+    assert job_tag(Path("/w/gen.sml"), "python gen.py") == "gen"
+
+
+async def test_failed_build_keeps_the_prerequisite_its_monitor_reported_complete(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    python = shlex.quote(sys.executable)
+    (shared / "Holmakefile").write_text(
+        f"ready:\n\t{python} -c \"from pathlib import Path; Path('ready').write_text('complete')\"\n"
+        f"broken: ready\n\t{python} -c \"from pathlib import Path; import sys; "
+        "Path('broken').write_text('partial'); sys.exit(1)\"\n")
+    result = await srv.holmake(str(shared), target="broken", timeout=30)
+    assert "Build failed" in result, result
+    assert (shared / "ready").read_text() == "complete"
+    assert (shared / "broken").read_text() == "partial"
+
+    def consumer(name, dependency):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "Holmakefile").write_text(
+            f"INCLUDES = ../shared\nresult: ../shared/{dependency}\n\t{python} -c "
+            f"\"from pathlib import Path; "
+            f"Path('result').write_text(Path('../shared/{dependency}').read_text())\"\n")
+        return root
+
+    accepted = await srv.holmake(str(consumer("uses_ready", "ready")), target="result", timeout=30)
+    assert "Build succeeded" in accepted, accepted
+    refused = await srv.holmake(str(consumer("uses_broken", "broken")), target="result", timeout=30)
+    assert refused.startswith("ERROR:") and "partial" in refused.lower(), refused
 
 
 async def _wait_for_job_finished(job, timeout=10):
