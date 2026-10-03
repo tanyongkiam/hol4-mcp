@@ -407,6 +407,33 @@ async def test_timing_line_reports_assumption_count(monkeypatch):
     )
 
 
+async def test_failed_goal_query_is_not_reported_as_proof_complete(monkeypatch):
+    cursor = _TimingStubCursor()
+
+    async def fake_get_cursor(name):
+        return cursor
+
+    async def fake_state_at_bounded(cur, line, col=1, **kwargs):
+        return StateAtResult(
+            goals=[],
+            tactic_idx=2,
+            tactics_replayed=2,
+            tactics_total=2,
+            file_hash="deadbeef",
+            error="goals_json: Interrupt",
+            timings={"total": 1.0, "replay": 0.9, "strategy": "replay"},
+        )
+
+    monkeypatch.setattr(server, "_get_cursor", fake_get_cursor)
+    monkeypatch.setattr(server, "_state_at_bounded", fake_state_at_bounded)
+
+    out = await hol_state_at(line=8, session="spec_impr_goal_error", max_output=8000)
+
+    assert "proof complete" not in out.lower(), out
+    assert "Goals unavailable" in out, out
+    assert "ERROR: goals_json: Interrupt" in out, out
+
+
 # ---------------------------------------------------------------------------
 # Improvement 5 — one bad-position message, always naming the valid range
 # ---------------------------------------------------------------------------

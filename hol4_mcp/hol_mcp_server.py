@@ -288,9 +288,9 @@ def _classify_state_at(result: StateAtResult) -> tuple[bool, bool, bool]:
     stopped BEFORE the requested position: the goals are the failure point's,
     not the position's.
     """
+    empty_goal_query_succeeded = not result.error or "no goals" in result.error.lower()
     is_proof_complete = bool(
-        result.error
-        and "no goals" in result.error.lower()
+        empty_goal_query_succeeded
         and result.tactics_replayed == result.tactics_total
         and not result.goals
     )
@@ -2651,7 +2651,10 @@ async def hol_state_at(
             lines.append("No goals (proof complete)")
         else:
             lines.append("=== Goals ===")
-            lines.append("No goals (proof complete)")
+            if result.error:
+                lines.append("Goals unavailable (goal query failed; see ERROR below)")
+            else:
+                lines.append("No goals (proof status indeterminate)")
 
     lines.extend(await _state_caveat_lines(cursor, result, active_theorem, thm, line))
     lines.extend(_session_notice_lines(cursor))

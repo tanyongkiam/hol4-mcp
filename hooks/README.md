@@ -433,10 +433,13 @@ merged `resconj` goal directly. Exact text lives in the hook.
 **File**: `h17_then_suspend.py`
 **Event**: `PreToolUse`
 **Matcher**: `Edit|Write|MultiEdit`
-**Effect**: blocks (exit 2) if the new content of a `*Script.sml` edit places
+**Effect**: blocks (exit 2) when a `*Script.sml` edit newly introduces
 `suspend "..."` non-canonically — either after a THEN-form combinator (`>>`,
 `\\`, or the word `THEN`), or as a `by` justification
-(`` `P` by (suspend "X") `` / `` `P` by suspend "X" ``).
+(`` `P` by (suspend "X") `` / `` `P` by suspend "X" ``). For `Edit` and
+`MultiEdit`, matching occurrences already present in the replaced text are
+subtracted, so inherited debt cannot block an unrelated change. A `Write`
+checks the complete new file.
 
 ### Why
 
@@ -459,8 +462,8 @@ parked off-pattern instead of dispatched with `>-`. No legitimate `by ... suspen
 exists, so no false positives; the THEN regex never sees these (`suspend` is
 preceded by `by`/`(`, not a THEN-form).
 
-Both fire anywhere in the edit text, including inside parens
-(`>- (... >> suspend "L")`).
+Both detect newly introduced occurrences anywhere in the replacement text,
+including inside parens (`>- (... >> suspend "L")`).
 
 ### Correct forms (not blocked)
 

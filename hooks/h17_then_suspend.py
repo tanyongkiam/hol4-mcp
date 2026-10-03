@@ -24,8 +24,10 @@ Correct forms:
   - `>- (tac1 >> tac2 >- suspend "L")`  (chain on first goal, ending in suspend)
   - `>~ [pat] >- suspend "L"`     (pattern-guided dispatch)
 
-Block fires on any `(>>|\\\\|THEN)\\s+suspend\\s*"..."` in the
-Edit/Write/MultiEdit new content. Stateless, no transcript read.
+Block fires when an Edit/MultiEdit introduces a new
+`(>>|\\\\|THEN)\\s+suspend\\s*"..."` occurrence, or when a Write contains one.
+Inherited occurrences outside the changed text do not block unrelated edits.
+Stateless, no transcript read.
 
 Rule source: hol4-proving skill 'HOL4 - suspend/Resume/Finalise' / 'One label = one goal'.
 """
@@ -36,6 +38,7 @@ HOOK_MATCHER = "Edit|Write|MultiEdit"   # None = all calls for this event
 import json
 import re
 import sys
+from collections import Counter
 
 # Match THEN (in any of its surface forms: `>>`, `\\`, or the word `THEN`)
 # followed by `suspend "..."` separated only by whitespace (including
@@ -94,7 +97,7 @@ directly, or restructure so the goal is reached and dispatched with `>-`."""
 
 
 def extract_edits(payload):
-    """Return list of (file_path, new_text) candidates from tool_input.
+    """Return list of (file_path, old_text, new_text) candidates from tool_input.
     Only HOL4 proof scripts (*Script.sml) are scanned; other paths bypass."""
     ti = payload.get("tool_input", {}) or {}
     tool = payload.get("tool_name", "")
@@ -103,13 +106,21 @@ def extract_edits(payload):
         return []
     out = []
     if tool == "Edit":
-        out.append((path, ti.get("new_string", "")))
+        out.append((path, ti.get("old_string", ""), ti.get("new_string", "")))
     elif tool == "Write":
-        out.append((path, ti.get("content", "")))
+        out.append((path, "", ti.get("content", "")))
     elif tool == "MultiEdit":
         for e in ti.get("edits", []) or []:
-            out.append((path, e.get("new_string", "")))
+            out.append((path, e.get("old_string", ""), e.get("new_string", "")))
     return out
+
+
+def find_offenders(text):
+    offenders = []
+    for regex in (BAD_THEN_SUSPEND_RE, BAD_BY_SUSPEND_RE):
+        for match in regex.finditer(text):
+            offenders.append((match.group(1), match.group(0)))
+    return offenders
 
 
 def main():
@@ -120,13 +131,16 @@ def main():
     if payload.get("tool_name", "") not in {"Edit", "Write", "MultiEdit"}:
         return 0
     offenders = []
-    for path, text in extract_edits(payload):
-        if not text:
+    for path, old_text, new_text in extract_edits(payload):
+        if not new_text:
             continue
-        for m in BAD_THEN_SUSPEND_RE.finditer(text):
-            offenders.append((path, m.group(1), m.group(0)))
-        for m in BAD_BY_SUSPEND_RE.finditer(text):
-            offenders.append((path, m.group(1), m.group(0)))
+        inherited = Counter(find_offenders(old_text))
+        for label, snippet in find_offenders(new_text):
+            key = (label, snippet)
+            if inherited[key]:
+                inherited[key] -= 1
+            else:
+                offenders.append((path, label, snippet))
     if not offenders:
         return 0
     print(REMINDER, file=sys.stderr)

@@ -138,6 +138,48 @@ def test_apply_patch_is_previewed_and_banned_tactic_blocks_without_editing(run_c
     assert script.read_text() == before
 
 
+def test_apply_patch_h17_ignores_inherited_noncanonical_suspend(run_codex_hook, tmp_path):
+    script = tmp_path / "fooScript.sml"
+    before = (
+        "open HolKernel Parse boolLib bossLib;\n\n"
+        "Theorem old:\n  T\nProof\n  `T` by suspend \"legacy\"\nQED\n"
+    )
+    script.write_text(before)
+    patch = """*** Begin Patch
+*** Update File: fooScript.sml
+@@
+ open HolKernel Parse boolLib bossLib;
++Theorem new_lemma: T Proof simp[] QED
+*** End Patch"""
+    result = run_codex_hook(
+        ADAPTER, payload(tmp_path, "apply_patch", {"command": patch}),
+        "h17_then_suspend.py",
+    )
+    assert result.returncode == 0, result.stderr
+    assert script.read_text() == before
+
+
+def test_apply_patch_h17_blocks_new_noncanonical_suspend(run_codex_hook, tmp_path):
+    script = tmp_path / "fooScript.sml"
+    before = "Theorem foo:\n  T\nProof\n  simp[]\nQED\n"
+    script.write_text(before)
+    patch = """*** Begin Patch
+*** Update File: fooScript.sml
+@@
+ Proof
+-  simp[]
++  `T` by suspend "new_bad"
+ QED
+*** End Patch"""
+    result = run_codex_hook(
+        ADAPTER, payload(tmp_path, "apply_patch", {"command": patch}),
+        "h17_then_suspend.py",
+    )
+    assert result.returncode == 2
+    assert "H17" in result.stderr and "new_bad" in result.stderr
+    assert script.read_text() == before
+
+
 def test_apply_patch_advisory_is_returned_as_valid_codex_json(run_codex_hook, tmp_path):
     script = tmp_path / "fooScript.sml"
     script.write_text("Theorem foo:\n  T\nProof\n  cheat\nQED\n")

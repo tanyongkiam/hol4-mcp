@@ -299,8 +299,16 @@ def _format_context_error(output: str) -> str:
     if output.startswith("TIMEOUT"):
         return "Timeout executing file content (a definition or proof may be looping)\n  Hint: check for infinite loops or increase timeout"
 
-    # Generic: truncate raw output
-    return output[:300]
+    # Generic: keep the end, where Poly/ML reports the actual parse/type error.
+    # Retain a short beginning for context without letting successful prefix
+    # chatter hide the diagnostic that caused context loading to fail.
+    limit = 2000
+    if len(output) <= limit:
+        return output
+    head = output[:200].rstrip()
+    tail = output[-(limit - 300):].lstrip()
+    omitted = len(output) - len(head) - len(tail)
+    return f"{head}\n...[{omitted} characters omitted; showing final diagnostics]...\n{tail}"
 
 
 async def get_script_dependencies(script_path: Path) -> list[str]:

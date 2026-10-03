@@ -381,6 +381,21 @@ def test_format_context_error_value_constructor_forward_ref_hint():
     assert "hol_check_proof" in msg
 
 
+def test_format_context_error_generic_fallback_preserves_trailing_error():
+    output = (
+        "val earlier_definition = |- T\n"
+        + "successful prefix output\n" * 200
+        + "poly: /tmp/testScript.sml:42: error: Type error in function application\n"
+    )
+
+    msg = _format_context_error(output)
+
+    assert "earlier_definition" in msg
+    assert "characters omitted; showing final diagnostics" in msg
+    assert "testScript.sml:42: error: Type error" in msg
+    assert len(msg) <= 2100
+
+
 # =============================================================================
 # Definition ... Termination ... End
 # =============================================================================
