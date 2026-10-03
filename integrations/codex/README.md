@@ -4,7 +4,7 @@ This directory is an adapter layer; the MCP server itself is client-neutral.
 
 ## Installing the local release
 
-The `0.1.0+codex.20260930.1` release is a local snapshot, not an upstream release.
+The `0.1.0+codex.20261003` release is a local snapshot, not an upstream release.
 Use the supplied wheel and plugin bundle together. Python 3.11 or newer and a
 built HOL4 installation are required; set `HOLDIR` if HOL is outside `~/HOL`.
 
@@ -13,7 +13,7 @@ From that directory, install the supplied wheel into a dedicated environment:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install dist/hol4_mcp-0.1.0+codex.20260930.1-py3-none-any.whl
+.venv/bin/python -m pip install dist/hol4_mcp-0.1.0+codex.20261003-py3-none-any.whl
 export PATH="$PWD/.venv/bin:$PATH"
 ```
 
