@@ -104,6 +104,15 @@ class HOLSession:
             # Wait for initial prompt (null-terminated).
             await self._read_response(timeout=60)
 
+            # CompilerSpecific is compiled into hol.state by poly-init.ML but
+            # ordinary REPL startup does not register it with Meta.loadedMods.
+            # holdeptool can therefore report it for Q-filter-expanded source,
+            # and a later `load "CompilerSpecific"` spuriously searches for a
+            # nonexistent .ui.  Mirror HOL's LSP startup registration here.
+            output = await self.send('Meta.fakeload "CompilerSpecific";', timeout=5)
+            if _FAILURE_RE.search(output) or output.startswith("ERROR:"):
+                raise RuntimeError(f"Failed to register CompilerSpecific: {output}")
+
             # etq supports manual goaltree workflows; tactic_prefix supplies
             # goalstack replay. A failed helper/init load is a failed startup.
             startup_files = (

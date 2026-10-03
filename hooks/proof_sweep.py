@@ -19,6 +19,7 @@ Used by h25_proof_text_sweep.py on the theorem a successful hol_check_proof just
 confirmed, and by h27_commit_audit_gate.py on each theorem a commit touches.
 """
 import difflib
+import hashlib
 import re
 import sys
 
@@ -255,6 +256,38 @@ def _theorem_windows(lines):
     if start is not None:
         out.append((start, len(lines)))
     return out or [(0, len(lines))]
+
+
+def block_fingerprints(text):
+    """Stable block-id -> content hash for theorem-like proof blocks."""
+    lines = clean(text).splitlines()
+    result = {}
+    for lo, hi in _theorem_windows(lines):
+        if lo >= len(lines):
+            continue
+        match = re.match(
+            r"^(Theorem|Definition|Triviality|Resume)\s+([^\s:]+)", lines[lo]
+        )
+        if not match or not any(RE_BODY.match(line) for line in lines[lo:hi]):
+            continue
+        kind, name = match.groups()
+        if kind != "Resume":
+            name = re.sub(r"\[[^]]+\]$", "", name)
+        key = f"{kind}:{name}"
+        if key in result:
+            key = f"{key}@{lo + 1}"
+        result[key] = hashlib.sha256("\n".join(lines[lo:hi]).encode()).hexdigest()
+    return result
+
+
+def theorem_fingerprint(text, theorem):
+    """Return (block-id, hash) for the named theorem/Resume, if present."""
+    suffixes = (f":{theorem}",)
+    for key, digest in block_fingerprints(text).items():
+        base = key.rsplit("@", 1)[0]
+        if base.endswith(suffixes):
+            return key, digest
+    return None
 
 
 def sweep(text, first=None, last=None):

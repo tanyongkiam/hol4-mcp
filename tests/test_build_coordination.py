@@ -9,6 +9,13 @@ import pytest
 from hol4_mcp import hol_mcp_server as srv
 
 
+async def _wait_for_job_finished(job, timeout=10):
+    async def finished():
+        while srv._build_jobs[job].finished is None:
+            await asyncio.sleep(.01)
+    await asyncio.wait_for(finished(), timeout)
+
+
 async def test_sibling_builds_do_not_consume_overlapping_writes(tmp_path):
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -69,7 +76,7 @@ async def test_cancelling_one_detached_build_does_not_kill_independent_job(tmp_p
         other = await srv.hol_build_status(job_ids[1])
         assert "running" in other, other
         (roots[1] / "release").touch()
-        await asyncio.wait_for(srv._build_jobs[job_ids[1]].proc.wait(), 10)
+        await _wait_for_job_finished(job_ids[1])
         other = await srv.hol_build_status(job_ids[1])
         assert "Build succeeded" in other, other
     finally:
@@ -128,7 +135,7 @@ async def test_peer_starting_during_shared_write_is_refused_then_can_retry(tmp_p
         # No peer process may consume the first writer's partial output.
         (shared / "release").touch()
         for job in job_ids:
-            await asyncio.wait_for(srv._build_jobs[job].proc.wait(), 10)
+            await _wait_for_job_finished(job)
             status = await srv.hol_build_status(job)
             assert "Build succeeded" in status, status
         retried = await srv.holmake(str(tmp_path / "b"), target="result", timeout=10)
@@ -169,6 +176,8 @@ async def test_cancelled_shared_writer_does_not_leave_silent_partial_dependency(
         await asyncio.wait_for(wait_started(), 10)
         cancelled = await srv.hol_build_status(job, cancel=True)
         assert "cancelled" in cancelled, cancelled
+        assert srv._build_jobs[job].done.is_set()
+        assert job not in srv.build_claims.active
         result = await srv.holmake(str(peer), target="result", timeout=10)
         assert result.startswith("ERROR:") and "partial" in result.lower(), result
         assert str(output) in result and job in result, result
@@ -224,7 +233,7 @@ async def test_independent_writers_share_read_only_dependency_in_parallel(tmp_pa
         for root in roots:
             (root / "release").touch()
         for job in jobs:
-            await asyncio.wait_for(srv._build_jobs[job].proc.wait(), 10)
+            await _wait_for_job_finished(job)
             assert "Build succeeded" in await srv.hol_build_status(job)
     finally:
         for root in roots:
@@ -248,10 +257,12 @@ async def test_build_preexec_generates_rules_once_and_retains_diagnostics(tmp_pa
         if detach:
             assert "Build started" in result, result
             job = re.search(r"job=(\S+)", result).group(1)
-            await asyncio.wait_for(srv._build_jobs[job].proc.wait(), 10)
+            await _wait_for_job_finished(job)
             result = await srv.hol_build_status(job)
         assert "Build succeeded" in result, result
         assert "fixture preexec diagnostic" in result, result
+        assert "=== Dependency discovery / preexec output ===" in result, result
+        assert "=== Build output (preexec already ran; disabled below) ===" in result, result
         assert (tmp_path / "result").exists()
         assert (tmp_path / "preexec-count").read_text().splitlines() == ["run"]
     finally:
@@ -279,7 +290,7 @@ async def test_detached_build_does_not_use_synchronous_timeout_for_preflight(tmp
     try:
         assert "Build started" in result, result
         job = re.search(r"job=(\S+)", result).group(1)
-        await asyncio.wait_for(srv._build_jobs[job].proc.wait(), 10)
+        await _wait_for_job_finished(job)
         assert "Build succeeded" in await srv.hol_build_status(job)
     finally:
         if job:
@@ -324,7 +335,7 @@ async def test_recursive_clean_is_refused_while_peer_reads_shared_interfaces(tmp
         assert job in result, result
         assert interface_path.read_text() == interface
         (reader / "release").touch()
-        await asyncio.wait_for(srv._build_jobs[job].proc.wait(), 10)
+        await _wait_for_job_finished(job)
         assert "Build succeeded" in await srv.hol_build_status(job)
     finally:
         (reader / "release").touch()

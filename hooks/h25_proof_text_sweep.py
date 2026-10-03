@@ -8,6 +8,9 @@ Primary trigger: `hol_check_proof` returning `Status: OK`. The result carries
 confirmed -- the done-claim for that theorem, made mechanical instead of
 depending on the agent remembering to run an audit.
 
+Successful `hol_check_proof` and QED-position `hol_state_at` calls also record
+the exact validated proof revision for H7's edit-then-rebuild advisory.
+
 Backstop: `holmake` on success, reporting COUNTS ONLY for the built theory's
 Script.sml, and only when that file is git-modified -- otherwise every build
 would report on code the session never touched.
@@ -63,6 +66,45 @@ def emit(msg):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PostToolUse", "additionalContext": msg}}))
     return 0
+
+
+def record_validation(session, path, theorem):
+    """Record the exact proof revision a successful theorem check validated."""
+    if not (path and theorem and os.path.exists(path)):
+        return
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            text = stream.read()
+        fingerprint = proof_sweep.theorem_fingerprint(text, theorem)
+        if fingerprint is None:
+            return
+        key, digest = fingerprint
+        directory = os.path.join(STATE, session or "nosession")
+        state_path = os.path.join(directory, "h7_validations.json")
+        try:
+            with open(state_path, encoding="utf-8") as stream:
+                state = json.load(stream)
+        except Exception:
+            state = {}
+        state.setdefault(os.path.abspath(path), {})[key] = digest
+        os.makedirs(directory, exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as stream:
+            json.dump(state, stream)
+    except OSError:
+        pass
+
+
+def successful_theorem(text):
+    """The theorem name iff this output is a trustworthy completed check."""
+    if any(marker in text for marker in (
+        "PROOF BROKEN", "ERROR:", "depends on cheat",
+        "context has admission history", "prefix-skip mode ON",
+    )):
+        return None
+    if "Status: OK" not in text and "No goals (proof complete)" not in text:
+        return None
+    match = re.search(r"^Theorem:\s*(\S+)", text, re.M)
+    return match.group(1) if match else None
 
 
 def git_modified(path):
@@ -127,6 +169,7 @@ def main():
     path = cached_file(payload.get("session_id"), tool_input)
     text = output_text(payload)
     try:
+        record_validation(payload.get("session_id"), path, successful_theorem(text))
         if tool.endswith("hol_check_proof"):
             return do_check_proof(text, path)
         if tool.endswith("holmake"):

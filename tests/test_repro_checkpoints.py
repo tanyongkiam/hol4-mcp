@@ -75,6 +75,16 @@ class _SaveStateSession:
         return "> val it = () : unit"
 
 
+class _NoOverwriteSaveStateSession(_SaveStateSession):
+    """Poly/ML-like refusal when a live parent filename is reused."""
+
+    async def send(self, command: str, timeout: float | None = None) -> str:
+        match = re.search(r'saveChild\s*\("([^"]+)"', command)
+        if match and Path(match.group(1)).exists():
+            return "Exception- SysErr: File being saved is used as a parent of this file"
+        return await super().send(command, timeout)
+
+
 class _TimeoutSession:
     """Stub session whose sends succeed except for the one carrying
     ``marker``, which reports a HOL timeout."""
@@ -216,6 +226,25 @@ async def test_merge_save_refreshes_checkpoint_hash(tmp_path: Path, kind: str):
         f"already invalid: entry hash {ckpt.content_hash[:12]}... vs file hash "
         f"{cursor._content_hash[:12]}..., so the very next navigation re-replays"
     )
+
+
+async def test_repeated_context_save_uses_fresh_path(tmp_path: Path):
+    script = tmp_path / "reprockpttwoScript.sml"
+    script.write_text(TWO_THEOREM_SCRIPT)
+    cursor = FileProofCursor(
+        script, session=_NoOverwriteSaveStateSession(), checkpoint_dir=tmp_path / "ckpt"
+    )
+    cursor._reparse_if_changed()
+    cursor._base_checkpoint_saved = True
+
+    await cursor._save_context_checkpoint("first_thm")
+    first = cursor._checkpoints["first_thm"].context_path
+    await cursor._save_context_checkpoint("first_thm")
+    second = cursor._checkpoints["first_thm"].context_path
+
+    assert first != second
+    assert first.exists() and second.exists()
+    assert not cursor.take_notices()
 
 
 # ---------------------------------------------------------------------------

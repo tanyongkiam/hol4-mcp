@@ -78,6 +78,20 @@ def test_slow_prefix_does_not_blame_target_proof():
         srv._slow_nav_lines("target", "file", "loop", 200, 1))
 
 
+def test_slow_navigation_count_resets_after_proof_revision_changes():
+    key = ("revised", "file", "theorem")
+    srv._slow_nav_counts.pop(key, None)
+    assert not srv._slow_nav_lines(
+        "revised", "file", "theorem", 200, 1, revision="before"
+    )
+    assert not srv._slow_nav_lines(
+        "revised", "file", "theorem", 200, 1, revision="after"
+    )
+    assert "SLOW NAVIGATION #2" in "".join(srv._slow_nav_lines(
+        "revised", "file", "theorem", 200, 1, revision="after"
+    ))
+
+
 def test_preceding_theorem_timeout_names_preceding_theorem():
     result = srv._timeout_error_text(300, 300, 0, False,
         {"phase": "preceding theorem", "item": "earlier", "budget": 120,

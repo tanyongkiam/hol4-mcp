@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -451,6 +452,12 @@ class FileProofCursor:
             self._checkpoint_dir = source_file.parent / ".hol" / "cursor_checkpoints"
         else:
             self._checkpoint_dir = checkpoint_dir
+        # Per-theorem SaveState paths are never reused within a live cursor.
+        # Poly/ML refuses to save over any file in the loaded state's parent
+        # chain; a fresh name avoids both that collision and corrupting child
+        # checkpoints that still refer to the earlier file.
+        self._checkpoint_nonce = uuid.uuid4().hex[:8]
+        self._checkpoint_generation = 0
 
         # Cached file state
         self._content: str = ""
@@ -930,6 +937,20 @@ class FileProofCursor:
         safe_name = re.sub(r"[^a-zA-Z0-9_']", "_", theorem_name) or "unnamed"
         return self._checkpoint_dir / f"{safe_name}_{checkpoint_type}.save"
 
+    def _new_checkpoint_path(self, theorem_name: str, checkpoint_type: str) -> Path:
+        """Return a fresh per-theorem path safe to save in this live heap.
+
+        Old saves remain until cursor GC because newer child states may name
+        them as parents.  Reusing or unlinking one while the heap is live can
+        cause SaveState parent collisions or later ENOENT loads.
+        """
+        safe_name = re.sub(r"[^a-zA-Z0-9_']", "_", theorem_name) or "unnamed"
+        self._checkpoint_generation += 1
+        return self._checkpoint_dir / (
+            f"{safe_name}_{self._checkpoint_nonce}_{self._checkpoint_generation:06d}_"
+            f"{checkpoint_type}.save"
+        )
+
     async def _get_hierarchy_depth(self) -> int:
         """Get current PolyML SaveState hierarchy length.
         
@@ -1103,7 +1124,7 @@ class FileProofCursor:
             return False
 
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = self._get_checkpoint_path(theorem_name, "end_of_proof")
+        ckpt_path = self._new_checkpoint_path(theorem_name, "end_of_proof")
         ckpt_path_str = escape_sml_string(str(ckpt_path))
 
         depth = await self._get_hierarchy_depth()
@@ -1157,7 +1178,7 @@ class FileProofCursor:
             return
 
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = self._get_checkpoint_path(theorem_name, "context")
+        ckpt_path = self._new_checkpoint_path(theorem_name, "context")
         ckpt_path_str = escape_sml_string(str(ckpt_path))
 
         depth = await self._get_hierarchy_depth()

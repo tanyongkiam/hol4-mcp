@@ -37,7 +37,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H4  | 📝     | PreToolUse            | `Edit\|Write\|MultiEdit` | Warn on `Resume` body starting with `‘Q’ by tac` (step-plan splits at `by`) |
 | H5  | ⏭     | PreToolUse            | `mcp__hol4__hol_check_proof` | ~~Block re-call after FAILED with no intervening `hol_state_at` (RULE C)~~ — skipped (H6 covers the failure-time nudge; the block-step needs per-session state that wasn't worth the machinery) |
 | H6  | ✅     | PostToolUse           | `mcp__hol4__hol_check_proof\|hol_state_at\|hol_goals` | On `FAILED` / `TIMEOUT` / `PROOF BROKEN`: the symptom-table hint for the failing tactic on every failure; the RULE C reminder only from the SECOND consecutive failure on the same theorem (per-session state; a pass or another theorem resets). Silent first failure with no matching row. Advisory only |
-| H7  | ✅     | PostToolUse           | `mcp__hol4__holmake`    | RULE A reminder on repeated builds of the same target within 30 min after an authored proof-block change. Assertion-only, translation-prefix-only, unrelated-file and timestamp-only changes are silent. Advisory only |
+| H7  | ✅     | PostToolUse           | `mcp__hol4__holmake`    | RULE A reminder on repeated builds of the same target within 30 min after an authored proof-block change. Assertion-only, translation-prefix-only, unrelated-file, timestamp-only and already-validated proof revisions are silent. Advisory only |
 | H8  | ✅     | PostToolUse           | `mcp__hol4__hol_state_at` | Inject cost-discipline reminder on any single `hol_state_at` call whose `replay` time ≥ 30s (stateless; cache hits and error paths skipped) |
 | H9  | ⏭     | PreToolUse            | `mcp__hol4__hol_restart` | ~~Default-block; CLAUDE.md says "effectively never"~~ — skipped (escape-hatch design too messy for the rare legitimate case; CLAUDE.md text is sufficient deterrent) |
 | H10 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Inject Finalise reminder when a Resume block introduces a new theorem to a `Script.sml` without a matching `Finalise <thm>;` (diff-aware on theorem names; sub-Resumes on existing theorems silent) |
@@ -277,11 +277,15 @@ neither tactic would help and the nudge would be misleading.
 only when the call fits the edit-then-rebuild loop: the same (workdir, target)
 was built within the last 30 minutes AND the named target's authored proof
 blocks changed. The first build, unchanged proofs, assertion-only scripts,
-top-level translation edits and changes to unrelated scripts are silent.
+top-level translation edits and changes to unrelated scripts are silent. A
+changed proof revision that has since completed `hol_state_at` at its QED or a
+clean `hol_check_proof` is also silent; every changed block must have such a
+validation before the next build.
 
 State: `~/.claude/hook-state/<session_id>/h7_builds.json`, a timestamp and proof fingerprints per
-(workdir, target). The reminder names the interval and says what to do with
-the edit instead (hol_state_at, hol_check_proof; rebuild once at the end).
+(workdir, target), plus exact successful proof revisions recorded by H25 in
+`h7_validations.json`. The reminder names the interval and says what to do
+with the edit instead (hol_state_at, hol_check_proof; rebuild once at the end).
 
 ## H10 — Resume-needs-Finalise reminder
 

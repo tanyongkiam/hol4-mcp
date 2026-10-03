@@ -15,7 +15,7 @@ import re
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import wraps
@@ -496,17 +496,19 @@ def _target_self_cheated_reason(cursor, target_name: str | None) -> str | None:
 
 
 _SLOW_NAV_SECS = 120.0
-_slow_nav_counts: dict[tuple[str, str, str], int] = {}
+_slow_nav_counts: dict[tuple[str, str, str], tuple[str | None, int]] = {}
 
 
 def _slow_nav_lines(session: str, file, theorem: str | None,
                     elapsed_secs: float, prefix_secs: float = 0,
-                    cause: str | None = None) -> list[str]:
-    """Warn when the SAME theorem is navigated slowly more than once.
+                    cause: str | None = None,
+                    revision: str | None = None) -> list[str]:
+    """Warn when the SAME theorem revision is navigated slowly more than once.
 
     One slow replay is the unavoidable cold start. Every later one re-pays for a
-    replayed unit that should have been shrunk instead, so the COUNT — not the
-    duration — is the signal.
+    replayed unit that should have been shrunk instead. Editing/restructuring the
+    theorem starts a new revision: its required final validation is not counted
+    as another probe of the old body.
 
     ``cause`` names what the prefix/setup time was spent on when the cursor
     knows (a cold init, a scheduled session reinit and why); a slow prefix
@@ -526,8 +528,12 @@ def _slow_nav_lines(session: str, file, theorem: str | None,
                 "translation/dependency loads and checkpoint reuse; this timing "
                 "does not justify splitting the target proof.]"]
     key = (session, str(file or ""), theorem)
-    n = _slow_nav_counts.get(key, 0) + 1
-    _slow_nav_counts[key] = n
+    previous = _slow_nav_counts.get(key)
+    if previous is None or previous[0] != revision:
+        n = 1
+    else:
+        n = previous[1] + 1
+    _slow_nav_counts[key] = (revision, n)
     if n < 2:
         return []
     return [
@@ -1704,6 +1710,28 @@ async def _kill_process_group(proc):
             pass
 
 
+def _signal_process_group(proc, sig: signal.Signals) -> bool:
+    """Signal a build process group without competing to reap its parent."""
+    if proc is None:
+        return False
+    try:
+        os.killpg(proc.pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+async def _kill_reaped_process_group(proc):
+    """Stop children left behind after the detached build parent was reaped."""
+    if not _signal_process_group(proc, signal.SIGTERM):
+        return
+    try:
+        await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        pass
+    _signal_process_group(proc, signal.SIGKILL)
+
+
 # Progress reporting interval for long builds (resets MCP client timeout)
 _PROGRESS_INTERVAL = 10  # seconds
 
@@ -1736,6 +1764,13 @@ async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace
         claim = claim_from_graph(stdout.decode("utf-8"), workdir, target)
         claim.detached = detach
         claim.preflight_output += stderr.decode("utf-8", errors="replace")
+        if claim.preflight_output.strip():
+            discovery = claim.preflight_output.rstrip()
+            claim.preflight_output = (
+                "=== Dependency discovery / preexec output ===\n"
+                f"{discovery}\n"
+                "=== Build output (preexec already ran; disabled below) ===\n"
+            )
     except asyncio.TimeoutError:
         return (f"ERROR: dependency preflight timed out after {timeout}s in {workdir}. "
                 f"No build was started; this is not a proof verdict.\n{trace_note}").rstrip()
@@ -1976,6 +2011,8 @@ class _BuildJob:
     finished: float | None = None
     trace_note: str = ""
     claim: object = None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    cancel_requested: bool = False
 
 
 _build_jobs: dict[str, _BuildJob] = {}
@@ -2011,11 +2048,19 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     _build_jobs[job_id] = job
 
     async def _reap():
-        await proc.wait()
-        await _kill_process_group(proc)
-        if claim is not None:
-            build_claims.finish(claim)
-        job.finished = time.time()
+        try:
+            # This task is the sole waiter for a detached process.  asyncio's
+            # subprocess transport can strand one of two concurrent waiters,
+            # leaving the build reservation live after cancellation.
+            await proc.wait()
+            await _kill_reaped_process_group(proc)
+        finally:
+            try:
+                if claim is not None:
+                    build_claims.finish(claim)
+            finally:
+                job.finished = time.time()
+                job.done.set()
     asyncio.create_task(_reap())
     return (f"Build started in background: job={job_id} target={target or '(all)'} "
             f"workdir={workdir_path}\nlog={log}\n{trace_note}\n"
@@ -2032,24 +2077,36 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
         cancel: Kill the build's process group (default False)
         tail: Bytes of log to include (default 2000, 0 to omit the log)
 
-    Returns: `running`/`done`/`cancelled` with elapsed time, exit code and the
-             log tail; a done job's line says `Build succeeded` or `Build failed`.
+    Returns: job state with elapsed time, exit code and the log tail; a done
+             job's line says `Build succeeded` or `Build failed`. Cancellation
+             is not reported complete until the reaper releases its claim.
     """
     entry = _build_jobs.get(job)
     if entry is None:
         known = ", ".join(sorted(_build_jobs)) or "none"
         return f"ERROR: unknown build job '{job}' (known: {known})."
     proc = entry.proc
-    if cancel and proc.returncode is None:
-        await _kill_process_group(proc)
-        if entry.claim is not None:
-            build_claims.finish(entry.claim)
-        entry.finished = time.time()
-        state = "cancelled"
+    if cancel and not entry.done.is_set() and proc.returncode is None:
+        entry.cancel_requested = True
+        _signal_process_group(proc, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(entry.done.wait(), timeout=2.5)
+        except asyncio.TimeoutError:
+            _signal_process_group(proc, signal.SIGKILL)
+            try:
+                await asyncio.wait_for(entry.done.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+    if entry.done.is_set():
+        state = "cancelled" if entry.cancel_requested else "done"
+    elif entry.cancel_requested:
+        state = "cancellation pending"
     elif proc.returncode is None:
         state = "running"
     else:
-        state = "done"
+        # The reaper has observed process exit and is cleaning up descendants
+        # before releasing the build reservation.
+        state = "finishing"
     end = entry.finished or time.time()
     elapsed = end - entry.started
     try:
@@ -2709,7 +2766,9 @@ async def hol_state_at(
                                      result.timings.get('total', 0),
                                      max(0, result.timings.get('total', 0) -
                                          result.timings.get('replay', 0)),
-                                     cause=result.timings.get('startup_cause')))
+                                     cause=result.timings.get('startup_cause'),
+                                     revision=(hashlib.sha256(thm.proof_body.encode()).hexdigest()
+                                               if thm and thm.proof_body is not None else None)))
 
     _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)
@@ -2873,8 +2932,11 @@ async def hol_check_proof(
     total_steps = len(trace_data)
 
     # Emitted before the verdict so it survives every early return below.
-    lines.extend(_slow_nav_lines(session, cursor.file, theorem,
-                                 total_ms / 1000.0))
+    lines.extend(_slow_nav_lines(
+        session, cursor.file, theorem, total_ms / 1000.0,
+        revision=(hashlib.sha256(thm.proof_body.encode()).hexdigest()
+                  if thm.proof_body is not None else None),
+    ))
 
     if final.error:
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")

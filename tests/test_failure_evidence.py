@@ -81,6 +81,13 @@ async def test_live_hol_failure_evidence(tmp_path):
         assert "42" in await session.send("40 + 2;", timeout=5)
 
 
+async def test_compiler_specific_is_registered_as_baked_in(tmp_path):
+    async with HOLSession(str(tmp_path)) as session:
+        output = await session.send('load "CompilerSpecific";', timeout=5)
+        assert "Cannot find file CompilerSpecific.ui" not in output
+        assert session.failure_evidence.latest is None
+
+
 def test_evidence_is_capped_and_discarded_at_exit(monkeypatch):
     from hol4_mcp import failure_evidence as module
 

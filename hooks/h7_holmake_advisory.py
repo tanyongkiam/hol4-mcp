@@ -8,6 +8,8 @@ Advisory only, never blocks. Keyed on repeats per session (state under
 (workdir, target) is silent, and so is a rebuild with unchanged authored proof
 text. A rebuild within 30 minutes AFTER a target proof edit gets the reminder.
 Executable assertions, top-level translations and unrelated scripts do not.
+A changed block already validated at its current revision by hol_state_at at QED
+or hol_check_proof also does not trigger the reminder.
 
 Rule source: hol4-proving skill '⛔ RULE A' / 'HOL4 - iteration loop'.
 """
@@ -16,14 +18,13 @@ HOOK_EVENT = "PostToolUse"
 HOOK_MATCHER = "mcp__hol4__holmake"   # None = all calls for this event
 
 import glob
-import hashlib
 import json
 import os
 import re
 import sys
 import time
 
-from proof_sweep import clean, _theorem_windows
+from proof_sweep import block_fingerprints
 
 STATE = os.path.expanduser("~/.claude/hook-state")
 WINDOW_S = 30 * 60
@@ -80,14 +81,34 @@ def proof_fingerprints(workdir, target):
     for p in paths:
         try:
             with open(p, encoding="utf-8") as source:
-                lines = clean(source.read()).splitlines()
+                fingerprints = block_fingerprints(source.read())
         except OSError:
             continue
-        bodies = ["\n".join(lines[lo:hi]) for lo, hi in _theorem_windows(lines)
-                  if any(re.match(r"^(Proof|Resume)\b", line) for line in lines[lo:hi])]
-        if bodies:
-            result[p] = hashlib.sha256("\n".join(bodies).encode()).hexdigest()
+        if fingerprints:
+            result[p] = fingerprints
     return result
+
+
+def validated_since_edit(payload, previous, current):
+    """True iff every changed current proof block was explicitly validated."""
+    try:
+        with open(os.path.join(STATE, payload.get("session_id") or "nosession",
+                               "h7_validations.json"), encoding="utf-8") as stream:
+            validations = json.load(stream)
+    except Exception:
+        return False
+    changed = []
+    for path, blocks in current.items():
+        old_blocks = previous.get(path)
+        if not isinstance(blocks, dict) or not isinstance(old_blocks, dict):
+            return False  # legacy state: retain the conservative reminder once
+        for block, digest in blocks.items():
+            if old_blocks.get(block) != digest:
+                changed.append((os.path.abspath(path), block, digest))
+    return bool(changed) and all(
+        validations.get(path, {}).get(block) == digest
+        for path, block, digest in changed
+    )
 
 
 def main():
@@ -114,6 +135,8 @@ def main():
         return 0
     if "proofs" not in prev or not any(prev["proofs"].get(p) != h
                                         for p, h in proofs.items()):
+        return 0
+    if validated_since_edit(payload, prev["proofs"], proofs):
         return 0
     print(json.dumps({
         "hookSpecificOutput": {

@@ -14,6 +14,13 @@ import pytest
 from hol4_mcp import hol_mcp_server as srv
 
 
+async def _wait_for_job_finished(job, timeout=10):
+    async def finished():
+        while srv._build_jobs[job].finished is None:
+            await asyncio.sleep(.01)
+    await asyncio.wait_for(finished(), timeout)
+
+
 async def _foreign_build(workdir, target="result", tempdir=None):
     code = ("import asyncio,sys; from hol4_mcp import hol_mcp_server as s; "
             "print(asyncio.run(s.holmake(sys.argv[1],target=sys.argv[2],timeout=10)))")
@@ -103,7 +110,7 @@ async def test_separate_server_refuses_late_reader_and_can_retry(tmp_path, priva
         assert job in result and str(shared) in result, result
         assert not (peer / "result").exists()
         (shared / "release").touch()
-        await asyncio.wait_for(srv._build_jobs[job].proc.wait(), 10)
+        await _wait_for_job_finished(job)
         result = await _foreign_build(peer, tempdir=tempdir)
         assert "Build succeeded" in result, result
         assert (peer / "result").read_text() == "complete"

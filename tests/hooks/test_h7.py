@@ -51,6 +51,35 @@ def test_rebuild_after_script_edit_gets_reminder(run_hook, workdir):
     assert "edit" in ctx.lower() and "rebuil" in ctx.lower()
 
 
+def test_rebuild_after_successful_qed_navigation_is_silent(run_hook, workdir):
+    build(run_hook, workdir)
+    script = workdir / "fooScript.sml"
+    script.write_text(script.read_text().replace("simp[]", "rw[]"))
+    checked = run_hook(
+        "h25_proof_text_sweep.py", "mcp__hol4__hol_state_at",
+        {"file": str(script), "line": 6}, event="PostToolUse",
+        tool_response="Theorem: t\nProof position\n\n=== Goals ===\nNo goals (proof complete)",
+        session_id=SESSION,
+    )
+    assert checked[0] == 0
+    assert build(run_hook, workdir)[2] == ""
+
+
+def test_every_changed_proof_must_be_validated(run_hook, workdir):
+    script = workdir / "fooScript.sml"
+    script.write_text(script.read_text() + "\nTheorem u:\n T\nProof\n simp[]\nQED\n")
+    build(run_hook, workdir)
+    script.write_text(script.read_text().replace("simp[]", "rw[]"))
+    run_hook(
+        "h25_proof_text_sweep.py", "mcp__hol4__hol_check_proof",
+        {"file": str(script)}, event="PostToolUse",
+        tool_response="Theorem: t\nLines: 2-6\nStatus: OK (1ms, 1 steps)",
+        session_id=SESSION,
+    )
+    output = build(run_hook, workdir)[2]
+    assert "H7" in output
+
+
 def test_assertion_only_rebuild_is_silent(run_hook, workdir):
     script = workdir / "fooScript.sml"
     script.write_text('Theory foo\nval _ = assert (K true) ();\n')
