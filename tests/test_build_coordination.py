@@ -43,6 +43,25 @@ def test_completed_outputs_follows_the_monitor_verdicts():
     assert completed_outputs(tags, compiled, "", None) == set()
 
 
+PADDED_MONITOR_OUTPUT = """\
+Starting work on word_elimTheory
+word_elimTheory              $(CAKEMLDIR)/compiler/backend  (8s)  [1/94]     OK
+Starting work on clos_to_bvlProofTheory
+clos_to_bvlProofTheory     $(CAKEMLDIR)/.../backend/proofs(320s) [45/94]     OK
+Starting work on npbc_mo_fullProofTheory
+npbc_mo_fullProofTheory          $(pseudo_bool)/.../proofs (53s)        FAIL<1>
+"""
+
+
+def test_completed_outputs_reads_padded_and_abutting_columns():
+    tags = {t: {Path(f"/w/{t}.dat")}
+            for t in ("word_elimTheory", "clos_to_bvlProofTheory",
+                      "npbc_mo_fullProofTheory")}
+    done = completed_outputs(tags, set(), PADDED_MONITOR_OUTPUT, 1)
+    assert done == {Path("/w/word_elimTheory.dat"),
+                    Path("/w/clos_to_bvlProofTheory.dat")}
+
+
 def test_job_tag_names_the_monitor_line():
     assert job_tag(Path("/w/fooTheory.dat"), "BIC_Build /w/foo") == "fooTheory"
     assert job_tag(Path("/w/fooTheory.sml"), "BIC_Build /w/foo") == "fooTheory"
