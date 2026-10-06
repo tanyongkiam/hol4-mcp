@@ -158,10 +158,13 @@ def job_tag(target: Path, command: str) -> str | None:
 
 
 # Holmake's monitor, when stdout is not a terminal, prints one line as a job
-# starts and one as it ends: `<tag> [dir] (<time>) [k/n]<verdict>`.
+# starts and one as it ends: `<tag> [dir] (<time>) [k/n] <verdict>`. The
+# columns are space-padded; the padding can be absent (a long dir abuts the
+# time, the counter abuts the verdict), and the dir may itself contain
+# parentheses, as in `$(CAKEMLDIR)/...`.
 _JOB_START_RE = re.compile(r"^Starting work on (\S+)\s*$")
 _JOB_RESULT_RE = re.compile(
-    r"^(?P<tag>\S+)(?:\s+\S+)?\s+\([^)]*\)\s+(?:\[[^\]]*\])?"
+    r"^(?P<tag>\S+)(?:\s+\S*?)?\s*\([^)]*\)\s*(?:\[[^\]]*\])?\s*"
     r"(?P<verdict>OK|CHEATED|F-CHEAT|CACHED|RETRY|FAIL<[^>]*>)\s*$")
 _SUCCESS_VERDICTS = {"OK", "CHEATED", "F-CHEAT", "CACHED"}
 # A sequential build (-j1) has no monitor. After each theory script it ran
