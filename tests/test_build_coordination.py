@@ -43,6 +43,24 @@ def test_completed_outputs_follows_the_monitor_verdicts():
     assert completed_outputs(tags, compiled, "", None) == set()
 
 
+def test_completed_outputs_reads_sequential_progress_lines():
+    output = """\
+/bin/cp /w/export/cake-sexpr-x64-64 cake-sexpr-64
+Holmake: Linking /w/to_word32ProgScript.uo to produce theory-builder executable
+Exporting theory "to_word32Prog" ... done.
+Theory "to_word32Prog" took 12m47s to build
+Holmake: [2/8] to_word32Prog
+Holmake: [↓3] bigProg
+Holmake: Linking /w/from_pancake32ProgScript.uo to produce theory-builder executable
+Holmake: Failed script build for /w/from_pancake32ProgScript - exited with code 1
+"""
+    tags = {t: {Path(f"/w/{t}.dat")}
+            for t in ("to_word32ProgTheory", "bigProgTheory",
+                      "from_pancake32ProgTheory", "cake-sexpr-64")}
+    assert completed_outputs(tags, set(), output, 1) == {
+        Path("/w/to_word32ProgTheory.dat"), Path("/w/bigProgTheory.dat")}
+
+
 def test_job_tag_names_the_monitor_line():
     assert job_tag(Path("/w/fooTheory.dat"), "BIC_Build /w/foo") == "fooTheory"
     assert job_tag(Path("/w/fooTheory.sml"), "BIC_Build /w/foo") == "fooTheory"

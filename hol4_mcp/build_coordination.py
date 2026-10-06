@@ -164,13 +164,19 @@ _JOB_RESULT_RE = re.compile(
     r"^(?P<tag>\S+)(?:\s+\S+)?\s+\([^)]*\)\s+(?:\[[^\]]*\])?"
     r"(?P<verdict>OK|CHEATED|F-CHEAT|CACHED|RETRY|FAIL<[^>]*>)\s*$")
 _SUCCESS_VERDICTS = {"OK", "CHEATED", "F-CHEAT", "CACHED"}
+# A sequential build (-j1) has no monitor. After each theory script it ran
+# successfully it prints `Holmake: [k/n] <thy>` (or `[↓m] <thy>` past 99
+# theories), naming the job its monitor would print as `<thy>Theory`; shell
+# command targets get no such line.
+_J1_THEORY_DONE_RE = re.compile(r"^(?:Holmake: )?\[(?:\d+/\d+|↓\d+)\] (\S+)\s*$")
 
 
 def completed_outputs(tags, in_process, output, returncode):
     """Outputs a build that did not succeed as a whole nevertheless finished.
 
     A monitored job's outputs are complete when its last line is a success
-    verdict and no later start line reopened it. Holmake's in-process
+    verdict and no later start line reopened it; in a sequential build, a
+    theory's are complete once its progress line follows. Holmake's in-process
     compiles are complete when Holmake exited of its own accord (a small
     positive status): it writes them one at a time and nothing interrupted
     it. A signal — cancellation, a timeout kill, a vanished controller —
@@ -185,6 +191,10 @@ def completed_outputs(tags, in_process, output, returncode):
         result = _JOB_RESULT_RE.match(line)
         if result:
             state[result.group("tag")] = result.group("verdict")
+            continue
+        theory = _J1_THEORY_DONE_RE.match(line)
+        if theory:
+            state[theory.group(1) + "Theory"] = "OK"
     done = set()
     for tag, paths in tags.items():
         if state.get(tag) in _SUCCESS_VERDICTS:
