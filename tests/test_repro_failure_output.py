@@ -11,6 +11,7 @@ import pytest
 from hol4_mcp.hol_mcp_server import (
     _init_file_cursor,
     hol_check_proof,
+    hol_goals,
     hol_send,
     hol_state_at,
     hol_stop,
@@ -345,6 +346,43 @@ async def test_failed_top_level_definition_is_reported_as_prefix_error(tmp_path)
         f.write_text(PREFIX_ERROR_SCRIPT.replace("bad (n + 1)", "bad (n - 1)"))
         r = await hol_state_at(line=12, col=3, session=session)
         assert "[prefix errors" not in r, r
+    finally:
+        await hol_stop(session)
+
+
+TIMEOUT_WORD_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "tword";
+
+Theorem mentions_timeout:
+  T
+Proof
+  FAIL_TAC "Rtimeout_error is a constructor, not a timeout"
+QED
+
+val _ = export_theory();
+"""
+
+
+async def test_hol_goals_navigation_carries_the_timing_footer(tmp_path):
+    session = "fo_goals_timing"
+    try:
+        f = await init(tmp_path, "opq", OPAQUE_SCRIPT, session)
+        r = await hol_goals(file=str(f), line=8, col=3, session=session)
+        assert "goal(s)" in r, r
+        assert "[Timing: total=" in r and "[Cache: pos_before=" in r, r
+    finally:
+        await hol_stop(session)
+
+
+async def test_check_proof_labels_a_timeout_only_for_a_timeout(tmp_path):
+    session = "fo_tword"
+    try:
+        await init(tmp_path, "tword", TIMEOUT_WORD_SCRIPT, session)
+        r = await hol_check_proof(theorem="mentions_timeout", session=session)
+        assert "Status: FAILED" in r, r
+        assert "TIMEOUT: step" not in r and "LOOPING tactic" not in r, r
     finally:
         await hol_stop(session)
 

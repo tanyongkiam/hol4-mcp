@@ -1,14 +1,19 @@
 """Exercise shared build behavior with the installed Holmake, not a mock lock."""
 import asyncio
+import json
 from pathlib import Path
 import re
 import shlex
 import sys
+import time
 
 import pytest
 
 from hol4_mcp import hol_mcp_server as srv
-from hol4_mcp.build_coordination import completed_outputs, job_tag
+from hol4_mcp import build_coordination as coordination
+from hol4_mcp.build_coordination import (
+    BuildClaim, artifact_unit, completed_outputs, job_tag, job_verdicts,
+)
 
 
 MONITOR_OUTPUT = """\
@@ -78,6 +83,161 @@ Holmake: Failed script build for /w/from_pancake32ProgScript - exited with code 
                       "from_pancake32ProgTheory", "cake-sexpr-64")}
     assert completed_outputs(tags, set(), output, 1) == {
         Path("/w/to_word32ProgTheory.dat"), Path("/w/bigProgTheory.dat")}
+
+
+SEQUENTIAL_SHELL_OUTPUT = """\
+touch first
+quiet-recipe
+Holmake: Linking /w/fooScript.uo to produce theory-builder executable
+Exporting theory "foo" ... done.
+Holmake: [1/2] foo
+cp second third && false
+cp: cannot stat 'second': No such file or directory
+"""
+
+
+def test_sequential_shell_targets_complete_once_a_later_target_began():
+    commands = {"first": "touch first", "second": None, "third": "cp second third && false",
+                "fourth": "touch fourth"}
+    state = job_verdicts(SEQUENTIAL_SHELL_OUTPUT, commands)
+    assert state["first"] == "OK" and state["fooTheory"] == "OK"
+    assert "second" not in state     # a quiet recipe shows nothing to certify
+    assert "third" not in state      # the last target to begin is the failure
+    assert "fourth" not in state
+    tags = {t: {Path(f"/w/{t}")} for t in commands} | {"fooTheory": {Path("/w/fooTheory.dat")}}
+    done = completed_outputs(tags, set(), SEQUENTIAL_SHELL_OUTPUT, 1, commands)
+    assert done == {Path("/w/first"), Path("/w/fooTheory.dat")}
+    # With a monitor present the echo rule does not apply.
+    assert "first" not in job_verdicts("Starting work on x\n" + SEQUENTIAL_SHELL_OUTPUT, commands)
+
+
+def test_artifact_unit_groups_a_theory_with_its_object_files(tmp_path):
+    objs = tmp_path / ".hol" / "objs"
+    assert artifact_unit(tmp_path / "fooTheory.dat") == (tmp_path, "fooTheory")
+    assert artifact_unit(objs / "fooTheory.uo") == (tmp_path, "fooTheory")
+    assert artifact_unit(objs / "fooTheory.ui") == artifact_unit(tmp_path / "fooTheory.sig")
+    assert artifact_unit(tmp_path / "barTheory.dat") != artifact_unit(tmp_path / "fooTheory.dat")
+    assert artifact_unit(tmp_path / "cake-sexpr-64") == (tmp_path, "cake-sexpr-64")
+
+
+def test_stale_in_memory_claim_is_reaped_by_the_next_registration(tmp_path):
+    from types import SimpleNamespace
+    claims = coordination.BuildClaims()
+    stuck = BuildClaim(tmp_path, set(), set())
+    stuck.proc = SimpleNamespace(returncode=1)       # exited; nothing ever finished it
+    claims.active[stuck.token] = stuck
+    never_spawned = BuildClaim(tmp_path, set(), set())
+    never_spawned.created -= 600
+    claims.active[never_spawned.token] = never_spawned
+    fresh = BuildClaim(tmp_path, set(), set())
+    try:
+        assert claims.register(fresh) is None
+        assert set(claims.active) == {fresh.token}
+    finally:
+        claims.finish(fresh)
+
+
+def test_legacy_in_project_records_are_still_read_and_cleared(tmp_path):
+    artifact = tmp_path / "ready"
+    artifact.write_text("partial")
+    legacy = coordination._legacy_state_file(artifact, "failed")
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"path": str(artifact), "label": "job=oldone workdir=x",
+                                  "token": "0123456789ab",
+                                  "stamp": list(coordination._stamp(artifact))}))
+    assert coordination._suspect(artifact)["token"] == "0123456789ab"
+    coordination._unlink_state(artifact, "failed")
+    assert not legacy.exists() and coordination._suspect(artifact) is None
+
+
+def test_discovery_output_is_condensed_and_the_result_summarised():
+    text = "Scanning a\nScanning b\nExecuting x/.hol_preexec:\nScanning c\n"
+    assert srv._condense_discovery(text) == "Scanned 3 directories\nExecuting x/.hol_preexec:\n"
+    text = "Scanning a\nScanned 1 directories\nBuilding 1 theory file\n"
+    assert srv._condense_discovery(text) == "Scanned 1 directories\nBuilding 1 theory file\n"
+    assert srv._build_summary(MONITOR_OUTPUT) == (
+        " built 3: aTheory, bTheory, result; failed 1: dTheory.")
+    assert srv._build_summary("nothing to do\n") == ""
+
+
+async def test_independent_targets_in_one_directory_build_concurrently(tmp_path):
+    python = shlex.quote(sys.executable)
+    (tmp_path / "worker.py").write_text(
+        "from pathlib import Path\nimport time\n"
+        "Path('started').touch()\n"
+        "while not Path('release').exists(): time.sleep(.01)\n"
+        "Path('slow').write_text('ok')\n")
+    (tmp_path / "Holmakefile").write_text(
+        f"slow:\n\t{python} worker.py\n\nfast:\n\ttouch fast\n")
+    started = await srv.holmake(str(tmp_path), target="slow", detach=True)
+    job = re.search(r"job=(\S+)", started).group(1)
+    try:
+        async def ready():
+            while not (tmp_path / "started").exists():
+                await asyncio.sleep(.01)
+        await asyncio.wait_for(ready(), 10)
+        # Nothing the two targets touch is shared: no refusal.
+        result = await srv.holmake(str(tmp_path), target="fast", timeout=30)
+        assert "Build succeeded" in result, result
+        assert (tmp_path / "fast").exists() and not (tmp_path / "slow").exists()
+        # The same unit is still exclusive while it is being written.
+        result = await srv.holmake(str(tmp_path), target="slow", timeout=30)
+        assert result.startswith("ERROR:") and "overlap" in result.lower(), result
+        assert job in result and f"{tmp_path}/slow" in result, result
+        (tmp_path / "release").touch()
+        await _wait_for_job_finished(job)
+        assert "Build succeeded" in await srv.hol_build_status(job)
+    finally:
+        (tmp_path / "release").touch()
+        await srv.hol_build_status(job, cancel=True)
+
+
+async def test_project_mode_preflight_survives_a_starred_script_rule(tmp_path):
+    (tmp_path / "holproject.toml").write_text('name = "starred"\n')
+    project = tmp_path / "dir"
+    project.mkdir()
+    (project / "fooScript.sml").write_text(
+        'open HolKernel Parse boolLib bossLib;\nval _ = new_theory "foo";\n'
+        'val _ = export_theory();\n')
+    (project / "Holmakefile").write_text(
+        "INCLUDES = $(HOLDIR)/src/boss\n\ncake-x: *fooScript.sml\n\ttouch cake-x\n")
+    result = await srv.holmake(str(project), target="fooTheory", timeout=120)
+    assert "Build succeeded" in result, result
+    assert "Scanning " not in result, result
+
+
+async def test_build_status_waits_for_the_job_to_end(tmp_path):
+    python = shlex.quote(sys.executable)
+    (tmp_path / "worker.py").write_text(
+        "from pathlib import Path\nimport time\n"
+        "print('progress: step one', flush=True)\n"
+        "Path('started').touch()\n"
+        "while not Path('release').exists(): time.sleep(.01)\n"
+        "Path('result').write_text('ok')\n")
+    (tmp_path / "Holmakefile").write_text(f"result:\n\t{python} worker.py\n")
+    started = await srv.holmake(str(tmp_path), target="result", detach=True)
+    job = re.search(r"job=(\S+)", started).group(1)
+    try:
+        async def ready():
+            while not (tmp_path / "started").exists():
+                await asyncio.sleep(.01)
+        await asyncio.wait_for(ready(), 10)
+        status = await srv.hol_build_status(job)
+        assert status.startswith("running") and "[in progress: result" in status, status
+
+        async def release_soon():
+            await asyncio.sleep(.5)
+            (tmp_path / "release").touch()
+        releaser = asyncio.create_task(release_soon())
+        t0 = time.monotonic()
+        status = await srv.hol_build_status(job, wait=20)
+        await releaser
+        assert time.monotonic() - t0 < 15, "wait= must return as soon as the job ends"
+        assert status.startswith("done") and "Build succeeded" in status, status
+        assert "built 1: result" in status, status
+    finally:
+        (tmp_path / "release").touch()
+        await srv.hol_build_status(job, cancel=True)
 
 
 def test_job_tag_names_the_monitor_line():

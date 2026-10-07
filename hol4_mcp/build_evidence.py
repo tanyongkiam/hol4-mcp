@@ -9,6 +9,10 @@ import subprocess
 import sys
 import uuid
 
+from . import build_coordination as coordination
+
+TRACES_KEPT = 5
+
 
 @functools.lru_cache(maxsize=None)
 def _tracer_options(tracer: str) -> tuple[str, ...]:
@@ -29,6 +33,14 @@ def build_failure_heading(returncode: int, output: str, traced: bool) -> str:
     return f"Build failed (exit code {returncode})."
 
 
+def _prune_traces(directory: Path, keep: int) -> None:
+    """Keep the newest ``keep`` trace/context pairs."""
+    traces = sorted(directory.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in traces[keep:]:
+        stale.unlink(missing_ok=True)
+        stale.with_suffix(".json").unlink(missing_ok=True)
+
+
 def traced_build(command: list[str], workdir: Path, enabled: bool,
                  environment: dict) -> tuple[list[str], str]:
     if not enabled:
@@ -36,9 +48,9 @@ def traced_build(command: list[str], workdir: Path, enabled: bool,
     tracer = shutil.which("strace", path=environment.get("PATH"))
     if sys.platform != "linux" or not tracer:
         raise ValueError("trace_discovery=True requires Linux and strace; no build was started")
-    directory = workdir / ".hol"
-    directory.mkdir(parents=True, exist_ok=True)
-    trace = directory / f"mcp-discovery-{uuid.uuid4().hex[:12]}.log"
+    directory = coordination.discovery_directory()
+    _prune_traces(directory, TRACES_KEPT - 1)
+    trace = directory / f"{uuid.uuid4().hex[:12]}.log"
     try:
         namespace = os.readlink("/proc/self/ns/mnt")
     except OSError:
@@ -53,5 +65,6 @@ def traced_build(command: list[str], workdir: Path, enabled: bool,
     note = (f"[Discovery trace: {trace}; context: {metadata}; "
             f"mount namespace: {namespace}. Inspect failed syscalls and their "
             "paths; the last printed directory is not necessarily the failure. "
-            "Tracing is opt-in and adds overhead.]")
+            f"Tracing is opt-in and adds overhead; the newest {TRACES_KEPT} traces "
+            "are kept. One traced run is the whole diagnostic — do not retrace retries.]")
     return wrapped, note

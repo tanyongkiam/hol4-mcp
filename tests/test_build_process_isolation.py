@@ -173,6 +173,28 @@ async def test_orphaned_job_keeps_its_reservation_then_certifies_itself(tmp_path
             pass
 
 
+async def test_foreign_builds_in_one_directory_conflict_only_on_a_shared_unit(tmp_path):
+    shared, peer, output = _shared_fixture(tmp_path)
+    (shared / "Holmakefile").write_text(
+        (shared / "Holmakefile").read_text() + "\nother:\n\ttouch other\n")
+    foreign = await _exiting_controller(shared, "ready")
+    try:
+        # An independent target in the writer's own directory is admitted.
+        result = await srv.holmake(str(shared), target="other", timeout=10)
+        assert "Build succeeded" in result, result
+        assert (shared / "other").exists()
+        # The unit being written is not, and the refusal names its holder.
+        result = await srv.holmake(str(peer), target="result", timeout=10)
+        assert result.startswith("ERROR:") and "overlap" in result.lower(), result
+        assert foreign["job"] in result and "server pid" in result, result
+    finally:
+        (shared / "release").touch()
+        try:
+            os.killpg(foreign["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
 async def test_adopted_job_reports_running_then_done(tmp_path):
     shared, peer, output = _shared_fixture(tmp_path)
     foreign = await _exiting_controller(shared, "ready")

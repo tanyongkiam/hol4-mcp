@@ -581,6 +581,58 @@ def _slow_nav_lines(session: str, file, theorem: str | None,
     ]
 
 
+def _timing_lines(result) -> list[str]:
+    """The `[Timing: …]` and `[Cache: …]` footer of a navigation: where the
+    time went, and what the position cache reused versus replayed. Shared by
+    every tool that navigates, so a slow call is attributable from any of
+    them."""
+    if not result.timings:
+        return []
+    t = result.timings
+    lines = [""]
+    method = t.get('strategy', 'replay')
+    # asms=N is INFORMATION, not prediction: it lets a reader correlate a
+    # slow step with the context it ran in. It implies nothing — fs, gs,
+    # gvs, simp and metis_tac can all fail to terminate at any count.
+    asms_str = (f", asms={len(result.goals[0].get('asms', []))}"
+                if result.goals else "")
+    lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
+                 f"replay={t.get('replay', 0)*1000:.0f}ms, "
+                 f"startup={t.get('startup', 0)*1000:.0f}ms, "
+                 f"method={method}{asms_str}]")
+    # Cache-state diagnostics: show what _pos was BEFORE the call,
+    # the target, and what got reused vs replayed. Useful for
+    # reproducing cache bugs.
+    before_idx = t.get('pos_before_idx', None)
+    if before_idx is not None:
+        before_offset = t.get('pos_before_offset', -1)
+        before_init = t.get('pos_before_init', 0)
+        hash_match = t.get('pos_hash_match', 0)
+        target_idx = t.get('target_idx', '?')
+        target_partial = t.get('target_partial', 0)
+        file_changed = t.get('file_changed', 0)
+        offset_str = f",off={before_offset}" if before_offset >= 0 else ""
+        init_str = "init" if before_init else "uninit"
+        hash_str = "hash=match" if hash_match else "hash=miss"
+        partial_str = "partial" if target_partial else "boundary"
+        changed_str = "changed" if file_changed else "unchanged"
+        parts = [
+            f"pos_before=(idx={before_idx}{offset_str},{init_str},{hash_str})",
+            f"target=(idx={target_idx},{partial_str})",
+            f"file={changed_str}",
+            f"reached={result.tactics_replayed}/{result.tactics_total}",
+        ]
+        if 'incr_first_diff' in t:
+            parts.append(
+                f"incr=(first_diff={t['incr_first_diff']},"
+                f"old_idx={t['incr_old_idx']})"
+            )
+        if result.inside_by:
+            parts.append("inside_by=true")
+        lines.append(f"[Cache: {', '.join(parts)}]")
+    return lines
+
+
 def _phase_description(phase: dict | None) -> str:
     if not phase:
         return ""
@@ -1550,6 +1602,7 @@ async def hol_goals(
             cursor, result, active,
             cursor._get_theorem(active) if active else None, line,
         )
+        caveats = [*caveats, *_timing_lines(result)]
     else:
         s = await _get_session(session)
         if not s:
@@ -1794,6 +1847,15 @@ async def _kill_reaped_process_group(proc):
 _PROGRESS_INTERVAL = 10  # seconds
 
 
+def _project_root(workdir: Path) -> Path | None:
+    """The directory whose holproject.toml puts ``workdir`` in Holmake's
+    project mode, or None."""
+    for directory in (workdir, *workdir.parents):
+        if (directory / "holproject.toml").is_file():
+            return directory
+    return None
+
+
 async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace_discovery=False, detach=False):
     """Discover without executing recipes, then reserve mutable dependencies.
 
@@ -1804,24 +1866,44 @@ async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace
     """
     proc = None
     trace_note = ""
+    clean = target in {"clean", "cleanDeps", "cleanAll"}
     try:
-        command = [str(holmake_bin), "--json", "--dirs", "."]
-        if target in {"clean", "cleanDeps", "cleanAll"}:
-            command.append("--no_preexecs")  # Native cleaning skips hooks.
-        command, trace_note = traced_build(command, workdir, trace_discovery, environment)
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=workdir, env=environment, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, start_new_session=True,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
-        if proc.returncode:
-            output = (stderr + stdout).decode("utf-8", errors="replace")
-            heading = build_failure_heading(proc.returncode, output, bool(trace_note))
-            raise ValueError(f"{heading}\n{output[-2000:]}")
-        claim = claim_from_graph(stdout.decode("utf-8"), workdir, target)
+        # In project mode (a holproject.toml above the directory) Holmake
+        # honours --json for a named target, whose graph needs no directory
+        # scan: `--dirs .` rejects some Holmakefiles outright (a starred
+        # script dependency) and prints one `Scanning` line per include
+        # directory. Outside a project a named target makes Holmake BUILD
+        # instead of printing the graph, so only the directory form is safe
+        # there. A targeted run that yields no graph falls through.
+        attempts = ([[str(holmake_bin), "--json", target]]
+                    if target and not clean and _project_root(workdir) else [])
+        attempts.append([str(holmake_bin), "--json", "--dirs", "."]
+                        + (["--no_preexecs"] if clean else []))  # Native cleaning skips hooks.
+        failure = ""
+        for command in attempts:
+            command, trace_note = traced_build(command, workdir, trace_discovery, environment)
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=workdir, env=environment, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, start_new_session=True,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+            if proc.returncode == 0:
+                try:
+                    claim = claim_from_graph(stdout.decode("utf-8"), workdir, target)
+                    break
+                except ValueError as exc:
+                    failure = f"{exc}"
+            else:
+                output = (stderr + stdout).decode("utf-8", errors="replace")
+                heading = build_failure_heading(proc.returncode, output, bool(trace_note))
+                failure = f"{heading}\n{output[-2000:]}"
+            await _kill_process_group(proc)
+            proc = None
+        else:
+            raise ValueError(failure)
         claim.detached = detach
-        claim.preflight_output += stderr.decode("utf-8", errors="replace")
+        claim.preflight_output += _condense_discovery(stderr.decode("utf-8", errors="replace"))
         if claim.preflight_output.strip():
             discovery = claim.preflight_output.rstrip()
             claim.preflight_output = (
@@ -1844,6 +1926,63 @@ async def _build_claim(holmake_bin, workdir, environment, target, timeout, trace
         return error or claim
     except (OSError, ValueError) as exc:
         return f"ERROR: dependency reservation in {workdir}: {exc}. No build was started."
+
+
+def _condense_discovery(text: str) -> str:
+    """Holmake's per-directory `Scanning` lines say nothing its `Scanned N
+    directories` trailer does not; keep the trailer and everything else."""
+    lines = text.splitlines()
+    scanning = sum(1 for line in lines if line.startswith("Scanning "))
+    kept = [line for line in lines if not line.startswith("Scanning ")]
+    if scanning and not any(line.startswith("Scanned ") for line in kept):
+        kept.insert(0, f"Scanned {scanning} directories")
+    return "\n".join(kept) + ("\n" if kept and text.endswith("\n") else "")
+
+
+def _build_summary(output: str) -> str:
+    """One clause per outcome, from the jobs' verdict lines: what the build
+    actually rebuilt and what failed, so the result reads from the top."""
+    state = coordination.job_verdicts(output)
+    done = sorted(tag for tag, verdict in state.items()
+                  if verdict in coordination._SUCCESS_VERDICTS)
+    failed = sorted(tag for tag, verdict in state.items() if verdict.startswith("FAIL"))
+    if not done and not failed:
+        return ""
+
+    def show(names):
+        return ", ".join(names[:8]) + (f" (+{len(names) - 8} more)" if len(names) > 8 else "")
+
+    parts = []
+    if done:
+        parts.append(f"built {len(done)}: {show(done)}")
+    if failed:
+        parts.append(f"failed {len(failed)}: {show(failed)}")
+    return " " + "; ".join(parts) + "."
+
+
+def _progress_lines(tags: dict, output: str) -> list[str]:
+    """For each job the log shows started and not finished, the tail of
+    Holmake's per-job log — where a theory's own output goes while it
+    builds — so a long single-theory build is not a blank `Starting work on`."""
+    out = []
+    for tag, verdict in coordination.job_verdicts(output).items():
+        if verdict != "started":
+            continue
+        directories = {coordination._unit_directory(Path(p)) for p in tags.get(tag, ())}
+        for directory in sorted(directories):
+            log = directory / ".hol" / "logs" / tag
+            try:
+                text, _ = _read_log_tail(log, 600)
+                age = time.time() - log.stat().st_mtime
+            except OSError:
+                continue
+            last = [line for line in text.splitlines() if line.strip()][-3:]
+            out.append(f"[in progress: {tag} — {log} (last write {age:.0f}s ago)]")
+            out.extend(f"  {line[:200]}" for line in last)
+            break
+        else:
+            out.append(f"[in progress: {tag}]")
+    return out[:12]
 
 
 def _read_log_tail(path: Path, limit: int) -> tuple[str, bool]:
@@ -1887,30 +2026,35 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 Discovery has its own 1800-second safety limit for detached jobs.
         trace_discovery: Opt-in Linux/strace diagnostic for opaque filesystem
                 or discovery failures (e.g. SysErr noent). Retains syscall/path
-                evidence and execution-context metadata under .hol. Adds
-                overhead; defaults to False. Does not ignore missing sources
-                or automatically retry any build.
+                evidence and execution-context metadata under
+                /var/tmp/hol4-mcp-<uid>/discovery (newest five kept). Adds
+                overhead; defaults to False. One traced run is the whole
+                diagnostic: do not retrace retries. Does not ignore missing
+                sources or automatically retry any build.
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
              With detach: the job id and log path.
 
     Before recipes run, checks the requested target's dependency graph. Refuses
-    directory overlaps with another MCP build on the same host and user when
-    either job writes there; read-only dependencies may be shared. The error names the
-    blocking job/build and directories; wait for it to finish, then retry.
+    an overlap with another MCP build on the same host and user on an artifact
+    unit (the files one job writes for a target) that either build writes;
+    read-only dependencies may be shared, and independent theories in one
+    directory build concurrently. The error names the blocking job/build and
+    units; wait for it to finish, then retry.
     When a build fails or is cancelled, each changed output is judged on its
     own: one whose Holmake job reported success keeps its standing, as do the
     .uo/.ui files Holmake compiles in its own process when Holmake exited
     normally; the rest may be partial or unverified and cannot be reused
-    unchanged as up-to-date dependencies (a sequential `jobs=1` build prints
-    no per-job verdicts, so all of its changed outputs are judged by the exit
-    status alone). Evidence survives server restarts in .hol4-mcp/build-state
-    beside the outputs; keep this generated directory out of version control.
-    Inspect/remove and rebuild suspect outputs, or use a build whose graph
-    explicitly schedules their reconstruction. A detached job also records
-    itself and, when Holmake exits, its exit status, so a server started later
-    adopts it: hol_build_status reports or cancels it, and a build that meets
-    its outputs applies that status before judging them.
+    unchanged as up-to-date dependencies. A sequential `jobs=1` build prints
+    no per-job verdicts: its theories are judged by Holmake's progress lines,
+    a shell target by a later target having begun, and a quiet (`@`) recipe
+    only by the exit status. Records, locks, detached-job logs with their exit
+    statuses and discovery traces all live under /var/tmp/hol4-mcp-<uid>/,
+    never in the project tree, and survive server restarts. Inspect/remove
+    and rebuild suspect outputs, or use a build whose graph explicitly
+    schedules their reconstruction. A detached job's record lets a server
+    started later adopt it: hol_build_status reports or cancels it, and a
+    build that meets its outputs applies its exit status before judging them.
     Requires Holmake's --json/--dirs graph interface. External build processes
     and undeclared recipe/pre-exec outputs are outside this coordination.
     """
@@ -2027,8 +2171,9 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
         output = b''.join(stdout_chunks).decode("utf-8", errors="replace")
 
+        output = _condense_discovery(output)
         if proc.returncode == 0:
-            result = f"Build succeeded.\n\n{output}"
+            result = f"Build succeeded.{_build_summary(output)}\n\n{output}"
             if env:
                 # Store env in matching session entries for auto-holmake at startup
                 for entry in _sessions.values():
@@ -2040,7 +2185,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
         # Shared-directory logs may also have changed in a peer build. Label
         # this honestly; the command's own output above is authoritative.
-        result = build_failure_heading(proc.returncode, output, bool(trace_note)) + f"\n\n{output}"
+        result = (build_failure_heading(proc.returncode, output, bool(trace_note))
+                  + _build_summary(output) + f"\n\n{output}")
 
         if logs_dir.exists():
             logs = sorted(
@@ -2059,16 +2205,21 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
         if re.search(r"\b(?:noent|ENOENT|SysErr)\b", output) and not trace_note:
             result += ("\nFilesystem/discovery failure: this is not a proof verdict. "
-                       f"Workdir={workdir_path}. For syscall/path evidence, use "
-                       "trace_discovery=True on a justified diagnostic run; do "
-                       "not infer the failing path from the last printed directory.")
+                       f"Workdir={workdir_path}. For syscall/path evidence, ONE run "
+                       "with trace_discovery=True is the whole diagnostic (it keeps a "
+                       "full strace log; do not retrace retries); do not infer the "
+                       "failing path from the last printed directory.")
         return f"{result}\n[{wall:.1f}s]\n{trace_note}".rstrip()
 
     except Exception as e:
         return f"ERROR: build in {workdir_path}: {type(e).__name__}: {e}\n{trace_note}".rstrip()
     finally:
-        await _kill_process_group(proc)
-        build_claims.finish(claim, b''.join(stdout_chunks).decode("utf-8", errors="replace"))
+        try:
+            await _kill_process_group(proc)
+        finally:
+            # Whatever interrupted the call — a client abort included — the
+            # reservation is released here, never left to block this server.
+            build_claims.finish(claim, b''.join(stdout_chunks).decode("utf-8", errors="replace"))
 
 
 @dataclass
@@ -2094,14 +2245,14 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     it as a job for hol_build_status."""
     import uuid
     job_id = claim.token if claim is not None else uuid.uuid4().hex[:12]
-    log_dir = workdir_path / ".hol"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log = log_dir / f"mcp-build-{job_id}.log"
+    log_dir = coordination.builds_directory()
+    coordination.prune_builds()
+    log = log_dir / f"{job_id}.log"
     # A shell wrapper outlives Holmake just long enough to record its exit
     # status, so a server started later can tell a finished job from a lost
     # one. Killing the process group kills the wrapper too: no status, which
     # is the honest answer for a cancelled build.
-    exit_file = log_dir / f"mcp-build-{job_id}.exit"
+    exit_file = log_dir / f"{job_id}.exit"
     exit_file.unlink(missing_ok=True)
     wrapped = ["/bin/sh", "-c",
                '"$@"; s=$?; printf %s "$s" > "$0.tmp" && mv -f "$0.tmp" "$0"; exit "$s"',
@@ -2123,6 +2274,7 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     if claim is not None:
         claim.proc = proc
         claim.detached = True
+        claim.log = log
         try:
             coordination.write_job(coordination.job_record(
                 claim, pid=proc.pid, target=target, log=log, exit_file=exit_file,
@@ -2159,18 +2311,32 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
             f"with the log tail, and cancel=True stops it.")
 
 
-async def _adopted_build_status(job: str, cancel: bool, tail: int) -> str:
+async def _adopted_build_status(job: str, cancel: bool, tail: int, wait: int = 0) -> str:
     """Report a job this server did not start, from the record its starter
     left: running, done (its wrapper recorded Holmake's exit status, applied
     to its outputs here), cancelled, or lost — controller and process both
-    gone with no status, so its changed outputs stay suspect until rebuilt."""
+    gone with no status, so its changed outputs stay suspect until rebuilt.
+    A token naming one of this server's synchronous builds is reported too,
+    so the overlap check and this tool agree on what exists."""
     record = coordination.read_job(job)
     if record is None:
+        claim = build_claims.active.get(job)
+        if claim is not None:
+            return (f"active (synchronous build in this server): {claim.label}, started "
+                    f"{time.time() - claim.created:.0f}s ago. It ends when its holmake "
+                    f"call returns; the reservation is released then, or reaped by the "
+                    f"next build if the call was abandoned.")
         known = ", ".join(sorted(_build_jobs)) or "none"
         return (f"ERROR: unknown build job '{job}' (known to this server: {known}; "
                 f"no record of it on this host).")
     returncode = coordination.job_exit_status(record)
     alive = returncode is None and coordination.process_alive(record)
+    if wait and alive and not cancel:
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and alive:
+            await asyncio.sleep(0.5)
+            returncode = coordination.job_exit_status(record)
+            alive = returncode is None and coordination.process_alive(record)
     cancelled = False
     if cancel and alive:
         cancelled = True
@@ -2215,33 +2381,50 @@ async def _adopted_build_status(job: str, cancel: bool, tail: int) -> str:
     if state == "done":
         verdict = ("Build succeeded" if returncode == 0 else
                    build_failure_heading(returncode, text, bool(record.get("trace_note"))))
-        head += f"\n{verdict}."
+        head += f"\n{verdict}.{_build_summary(full)}"
     elif state == "lost":
         head += ("\nThe controller and the build process are both gone and no exit "
                  "status was recorded: its changed outputs stay suspect until rebuilt.")
+    elif state == "running":
+        head += "".join(f"\n{line}" for line in _progress_lines(record.get("tags", {}), full))
     return f"{head}\nlog={log}\n{record.get('trace_note', '')}\n\n{text}".rstrip()
 
 
 @mcp.tool()
-async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> str:
+async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000,
+                           wait: int = 0) -> str:
     """Status of a detached holmake job (holmake(detach=True)).
 
     Args:
         job: Job id from the detached holmake call
         cancel: Kill the build's process group (default False)
         tail: Bytes of log to include (default 2000, 0 to omit the log)
+        wait: Seconds to block for the job to end before reporting (0–100;
+              default 0). One call then covers up to 100 s of a long build
+              instead of a poll per turn; the bound keeps the call inside a
+              client's own tool timeout.
 
     Returns: job state with elapsed time, exit code and the log tail; a done
-             job's line says `Build succeeded` or `Build failed`. Cancellation
-             is not reported complete until the reaper releases its claim.
-             A job started by a previous MCP server (replaced or crashed) is
-             adopted from its on-disk record and reported as running, done
-             (its exit status is applied to its outputs), cancelled or lost.
+             job's line says `Build succeeded` or `Build failed` and
+             summarises what its jobs built. While a theory is in progress,
+             the tail of its own per-theory log (.hol/logs/<thy>) follows the
+             state line. Cancellation is not reported complete until the
+             reaper releases its claim. A job started by a previous MCP
+             server (replaced or crashed) is adopted from its on-disk record
+             and reported as running, done (its exit status is applied to its
+             outputs), cancelled or lost; the token of one of this server's
+             synchronous builds is reported as active.
     """
+    wait = max(0, min(int(wait or 0), 100))
     entry = _build_jobs.get(job)
     if entry is None:
-        return await _adopted_build_status(job, cancel, tail)
+        return await _adopted_build_status(job, cancel, tail, wait)
     proc = entry.proc
+    if wait and not cancel and not entry.done.is_set():
+        try:
+            await asyncio.wait_for(entry.done.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
     if cancel and not entry.done.is_set() and proc.returncode is None:
         entry.cancel_requested = True
         _signal_process_group(proc, signal.SIGTERM)
@@ -2265,8 +2448,11 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
         state = "finishing"
     end = entry.finished or time.time()
     elapsed = end - entry.started
+    # The log is read once, bounded by `tail`; the summary and progress below
+    # are drawn from that same text, so a small tail never costs a large read.
+    truncated = False
     try:
-        text = _read_log_tail(entry.log, tail)[0] if tail > 0 else ""
+        text, truncated = _read_log_tail(entry.log, tail) if tail > 0 else ("", False)
     except OSError:
         text = ""
     head = f"{state}: job={job} target={entry.target or '(all)'} workdir={entry.workdir} [{elapsed:.0f}s]"
@@ -2275,7 +2461,12 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000) -> 
     if state == "done":
         verdict = ("Build succeeded" if proc.returncode == 0 else
                    build_failure_heading(proc.returncode, text, bool(entry.trace_note)))
-        head += f"\n{verdict}."
+        summary = _build_summary(text)
+        head += f"\n{verdict}.{summary}" + (
+            " (within the returned log tail)" if summary and truncated else "")
+    elif state == "running":
+        tags = entry.claim.tags if entry.claim is not None else {}
+        head += "".join(f"\n{line}" for line in _progress_lines(tags, text))
     return f"{head}\nlog={entry.log}\n{entry.trace_note}\n\n{text}".rstrip()
 
 
@@ -2941,50 +3132,7 @@ async def hol_state_at(
     lines.extend(await _state_caveat_lines(cursor, result, active_theorem, thm, line))
     lines.extend(_session_notice_lines(cursor))
 
-    # Add timing info if available
-    if result.timings:
-        t = result.timings
-        lines.append("")
-        method = t.get('strategy', 'replay')
-        # asms=N is INFORMATION, not prediction: it lets a reader correlate a
-        # slow step with the context it ran in. It implies nothing — fs, gs,
-        # gvs, simp and metis_tac can all fail to terminate at any count.
-        asms_str = (f", asms={len(result.goals[0].get('asms', []))}"
-                    if result.goals else "")
-        lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
-                     f"replay={t.get('replay', 0)*1000:.0f}ms, "
-                     f"startup={t.get('startup', 0)*1000:.0f}ms, "
-                     f"method={method}{asms_str}]")
-        # Cache-state diagnostics: show what _pos was BEFORE the call,
-        # the target, and what got reused vs replayed. Useful for
-        # reproducing cache bugs.
-        before_idx = t.get('pos_before_idx', None)
-        if before_idx is not None:
-            before_offset = t.get('pos_before_offset', -1)
-            before_init = t.get('pos_before_init', 0)
-            hash_match = t.get('pos_hash_match', 0)
-            target_idx = t.get('target_idx', '?')
-            target_partial = t.get('target_partial', 0)
-            file_changed = t.get('file_changed', 0)
-            offset_str = f",off={before_offset}" if before_offset >= 0 else ""
-            init_str = "init" if before_init else "uninit"
-            hash_str = "hash=match" if hash_match else "hash=miss"
-            partial_str = "partial" if target_partial else "boundary"
-            changed_str = "changed" if file_changed else "unchanged"
-            parts = [
-                f"pos_before=(idx={before_idx}{offset_str},{init_str},{hash_str})",
-                f"target=(idx={target_idx},{partial_str})",
-                f"file={changed_str}",
-                f"reached={result.tactics_replayed}/{result.tactics_total}",
-            ]
-            if 'incr_first_diff' in t:
-                parts.append(
-                    f"incr=(first_diff={t['incr_first_diff']},"
-                    f"old_idx={t['incr_old_idx']})"
-                )
-            if result.inside_by:
-                parts.append("inside_by=true")
-            lines.append(f"[Cache: {', '.join(parts)}]")
+    lines.extend(_timing_lines(result))
 
     if result.timings:
         lines.extend(_slow_nav_lines(session, cursor.file, active_theorem,
@@ -3173,7 +3321,7 @@ async def hol_check_proof(
         # Timeout attribution: name the step's source span so the user can
         # shrink the lump instead of guessing which tactic is slow.
         fe = trace_data[failed_idx]
-        if fe.error and "timeout" in fe.error.lower():
+        if fe.error and fe.error.lstrip().upper().startswith("TIMEOUT"):
             so = fe.start_offset or 0
             sl = _file_offset_to_line_col(
                 thm.proof_body_offset + so, cursor._content)[0]

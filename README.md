@@ -215,8 +215,12 @@ separately from kernel oracle evidence; history alone is not a dependency list.
 
 For an opaque filesystem/discovery failure, an explicit
 `holmake(..., trace_discovery=True)` records Linux syscall/path evidence and
-execution-context metadata under `.hol/mcp-discovery-*`. It requires `strace`
-and tracing permission, adds overhead, and is off for regular builds. A tracer
+execution-context metadata under `/var/tmp/hol4-mcp-<uid>/discovery/` (the
+newest five traces are kept; one traced run is the whole diagnostic). It
+requires `strace` and tracing permission, adds overhead, and is off for
+regular builds. Build coordination keeps everything else it needs — artifact
+records, locks, detached-job logs and exit statuses — in the same per-user
+directory, never in a project tree. A tracer
 permission/setup failure is not reported as a proof-failure verdict. Missing
 directories are not silently ignored or created, and no retry is automatic.
 

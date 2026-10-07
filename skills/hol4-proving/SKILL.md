@@ -79,7 +79,7 @@ The violation has one shape: **the same target built twice with an edit between 
 - **Allowed**: ONCE at end-of-file, after every theorem passed the per-theorem ladder AND the audit gates; or to unstick a stale dependency `.dat` so a session can load (setup, not iteration).
 - **Executable assertion tests / translation-only scripts**: run the named build target to execute their assertions or generated code. With no authored theorem proof, there is no goal-navigation substitute. This exception does not cover proof edits in mixed scripts.
 - Reaching for holmake mid-proof → STOP: `hol_state_at` reads the goal (it auto-detects the edit); an arm nested inside `THEN1 (...)` is sub-suspended and read there — not built.
-- **Build ownership**: always name the `target`; an untargeted directory-wide build is the user's call (H32, soft). Always the `holmake` MCP tool, never `Holmake` through Bash (H28, soft); a long build is `holmake(detach=True)` + `hol_build_status`.
+- **Build ownership**: always name the `target`; an untargeted directory-wide build is the user's call (H32, soft). Always the `holmake` MCP tool, never `Holmake` through Bash (H28, soft); a long build is `holmake(detach=True)` + `hol_build_status(job, wait=100)` — one call blocks up to 100 s and shows the building theory's own log tail, so never a turn per poll and never a shell waiter (H33).
 
 ### ⛔ RULE B — PLAN before TACTICS, every time
 Before a single tactic against a non-trivial cheat/goal, in user-facing text:

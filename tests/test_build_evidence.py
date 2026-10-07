@@ -50,6 +50,24 @@ async def test_trace_exposes_failed_chdir_and_namespace(tmp_path):
     assert not missing.exists()  # diagnosis must not create/ignore the missing source
 
 
+def test_traces_live_outside_the_project_and_only_the_newest_are_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr("hol4_mcp.build_evidence.shutil.which", lambda *a, **k: "/bin/true")
+    from hol4_mcp import build_evidence
+    from hol4_mcp import build_coordination as coordination
+    (tmp_path / "root").mkdir()
+    monkeypatch.setattr(coordination, "storage_root", lambda: tmp_path / "root")
+    for _ in range(build_evidence.TRACES_KEPT + 2):
+        _, note = traced_build(["Holmake", "target"], tmp_path / "project", True, {})
+        trace = Path(re.search(r"Discovery trace: ([^;]+);", note).group(1))
+        assert trace.parent == tmp_path / "root" / "discovery"
+        trace.write_text("trace")
+    kept = sorted((tmp_path / "root" / "discovery").glob("*.log"))
+    assert len(kept) == build_evidence.TRACES_KEPT
+    assert all(p.with_suffix(".json").exists() for p in kept)
+    assert not (tmp_path / "project").exists()
+    assert "do not retrace retries" in note
+
+
 def test_tracer_permission_failure_is_not_a_proof_verdict():
     output = "/usr/bin/strace: is_exitkill_supported: PTRACE_TRACEME: Operation not permitted"
     result = build_failure_heading(1, output, True)

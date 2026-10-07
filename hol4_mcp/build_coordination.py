@@ -1,9 +1,16 @@
-"""Coordinate MCP build dependency directories across server lifetimes.
+"""Coordinate MCP builds' artifacts across server lifetimes.
 
 Holmake locks competing writers, but can skip an existing partial dependency.
-Read/read overlap is safe; a write/read or write/write overlap is refused.
-Locks cover cooperating servers on the same host/user; undeclared outputs and
-plain external Holmake processes remain outside this protocol.
+Builds are compared per artifact unit — the files one Holmake job writes for a
+target (fooTheory.sml/.sig/.dat/.ui/.uo) — so independent theories in one
+directory build concurrently. Read/read overlap is safe; a write/read or
+write/write overlap on a unit is refused. Locks cover cooperating servers on
+the same host/user; undeclared outputs and plain external Holmake processes
+remain outside this protocol.
+
+Everything the coordination keeps lives under one per-user host directory
+(`storage_root`), never in a project tree: lock files, output records,
+detached-job records with their logs, discovery traces.
 
 When a build ends, each of its outputs is judged on its own: a job Holmake's
 monitor reported as finished wrote complete files even if a later job failed.
@@ -19,6 +26,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import stat
 import sys
 import tempfile
@@ -63,9 +71,15 @@ class BuildClaim:
     state_error: str = ""
     clean: bool = False
     # Outputs by the name Holmake's monitor prints for the job writing them,
-    # and the outputs Holmake compiles in its own process (no job line).
+    # the outputs Holmake compiles in its own process (no job line), and each
+    # job's first command line as a sequential build echoes it.
     tags: dict = field(default_factory=dict)
     in_process: set = field(default_factory=set)
+    commands: dict = field(default_factory=dict)
+    read_units: set = field(default_factory=set)
+    write_units: set = field(default_factory=set)
+    created: float = field(default_factory=time.time)
+    log: Path | None = None
 
     @property
     def label(self):
@@ -128,21 +142,36 @@ def claim_from_graph(output: str, workdir: Path, target: str | None) -> BuildCla
         node = graph[key]
         if not (node["command"] and node["needs_rebuild"]):
             continue
-        tag = job_tag(nominal[key], str(node["command"]))
+        command = str(node["command"])
+        tag = job_tag(nominal[key], command)
         paths = set(_artifact_paths(nominal[key]))
         if tag is None:
             claim.in_process |= paths
         else:
             claim.tags.setdefault(tag, set()).update(paths)
             tag_dirs.setdefault(tag, set()).add(paths_dir(nominal[key]))
+            if not command.startswith("BIC_"):
+                first = command.split("\n", 1)[0].strip()
+                claim.commands[tag] = None if first.startswith("@") else first
     for tag, dirs in tag_dirs.items():
         if len(dirs) > 1:
             del claim.tags[tag]   # the printed name alone cannot tell them apart
+            claim.commands.pop(tag, None)
     return claim
 
 
 def paths_dir(path):
     return path.resolve().parent
+
+
+def artifact_unit(path):
+    """(directory, stem): the files one Holmake job writes for a target —
+    fooTheory.sml/.sig/.dat/.ui/.uo in the theory's directory or its
+    .hol/objs — which is the granularity at which builds can conflict."""
+    directory = path.parent
+    if directory.name == "objs" and directory.parent.name == ".hol":
+        directory = directory.parent.parent
+    return (directory, path.name.split(".")[0])
 
 
 def job_tag(target: Path, command: str) -> str | None:
@@ -174,19 +203,19 @@ _SUCCESS_VERDICTS = {"OK", "CHEATED", "F-CHEAT", "CACHED"}
 _J1_THEORY_DONE_RE = re.compile(r"^(?:Holmake: )?\[(?:\d+/\d+|↓\d+)\] (\S+)\s*$")
 
 
-def completed_outputs(tags, in_process, output, returncode):
-    """Outputs a build that did not succeed as a whole nevertheless finished.
+def job_verdicts(output, commands=None):
+    """Each job's final state from a build's output: a verdict word, or
+    "started" for a job the monitor opened and never closed.
 
-    A monitored job's outputs are complete when its last line is a success
-    verdict and no later start line reopened it; in a sequential build, a
-    theory's are complete once its progress line follows. Holmake's in-process
-    compiles are complete when Holmake exited of its own accord (a small
-    positive status): it writes them one at a time and nothing interrupted
-    it. A signal — cancellation, a timeout kill, a vanished controller —
-    certifies nothing beyond the verdict lines.
+    A sequential build (-j1) has no monitor. Its theories get progress lines;
+    its shell command targets only echo their command, so one of those is
+    taken as succeeded once a later target demonstrably began — with `--qof`
+    Holmake moves on only after success. A quiet (`@`) recipe echoes nothing
+    and is never certified this way.
     """
     state = {}
-    for line in output.splitlines():
+    lines = output.splitlines()
+    for line in lines:
         start = _JOB_START_RE.match(line)
         if start:
             state[start.group(1)] = "started"
@@ -198,6 +227,35 @@ def completed_outputs(tags, in_process, output, returncode):
         theory = _J1_THEORY_DONE_RE.match(line)
         if theory:
             state[theory.group(1) + "Theory"] = "OK"
+    if commands and not any(_JOB_START_RE.match(line) for line in lines):
+        wanted = {command: tag for tag, command in commands.items() if command}
+        events = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped in wanted:
+                events.append(wanted[stripped])
+            elif (_J1_THEORY_DONE_RE.match(stripped)
+                  or stripped.startswith(("Holmake: Linking", "Holmake: Failed script build"))):
+                events.append(None)
+        for index, tag in enumerate(events[:-1]):
+            if tag is not None and tag not in state:
+                state[tag] = "OK"
+    return state
+
+
+def completed_outputs(tags, in_process, output, returncode, commands=None):
+    """Outputs a build that did not succeed as a whole nevertheless finished.
+
+    A monitored job's outputs are complete when its last line is a success
+    verdict and no later start line reopened it; in a sequential build, a
+    theory's are complete once its progress line follows and a shell target's
+    once a later target began. Holmake's in-process compiles are complete
+    when Holmake exited of its own accord (a small positive status): it
+    writes them one at a time and nothing interrupted it. A signal —
+    cancellation, a timeout kill, a vanished controller — certifies nothing
+    beyond the verdict lines.
+    """
+    state = job_verdicts(output, commands)
     done = set()
     for tag, paths in tags.items():
         if state.get(tag) in _SUCCESS_VERDICTS:
@@ -207,14 +265,48 @@ def completed_outputs(tags, in_process, output, returncode):
     return done
 
 
-def _state_directory(path):
+def storage_root():
+    """The per-user home of everything the coordination keeps: /var/tmp
+    survives reboots, and the identity depends on neither a client's private
+    TMPDIR nor its HOME, so every server of one user meets the same files."""
+    root = Path("/var/tmp") / f"hol4-mcp-{os.getuid()}"
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError(f"Coordination directory is not private and owned by this user: {root}")
+    return root
+
+
+def _storage(kind):
+    directory = storage_root() / kind
+    directory.mkdir(mode=0o700, exist_ok=True)
+    return directory
+
+
+def builds_directory():
+    """Detached jobs' logs and exit-status files."""
+    return _storage("builds")
+
+
+def discovery_directory():
+    """Opt-in discovery traces and their context files."""
+    return _storage("discovery")
+
+
+def _unit_directory(path):
     directory = path.parent
     if directory.name == "objs" and directory.parent.name == ".hol":
         directory = directory.parent.parent
-    # Native cleanAll removes .hol, including unfamiliar subdirectories.
-    # Keep failure evidence outside it so cleaning cannot certify a surviving
-    # arbitrary recipe output that was previously only partially written.
-    return directory / ".hol4-mcp" / "build-state"
+    return directory
+
+
+def _state_directory(path):
+    return _storage("state") / hashlib.sha256(str(_unit_directory(path)).encode()).hexdigest()
+
+
+def _legacy_state_directory(path):
+    """Where records lived inside the project tree; read, never written."""
+    return _unit_directory(path) / ".hol4-mcp" / "build-state"
 
 
 def _state_file(path, phase):
@@ -222,10 +314,24 @@ def _state_file(path, phase):
     return _state_directory(path) / f"{digest}.{phase}.json"
 
 
+def _legacy_state_file(path, phase):
+    digest = hashlib.sha256(str(path).encode()).hexdigest()
+    return _legacy_state_directory(path) / f"{digest}.{phase}.json"
+
+
+def _unlink_state(path, phase):
+    _state_file(path, phase).unlink(missing_ok=True)
+    _legacy_state_file(path, phase).unlink(missing_ok=True)
+
+
 def _read_state(path, phase):
-    try:
-        data = json.loads(_state_file(path, phase).read_text())
-    except FileNotFoundError:
+    for location in (_state_file(path, phase), _legacy_state_file(path, phase)):
+        try:
+            data = json.loads(location.read_text())
+            break
+        except FileNotFoundError:
+            continue
+    else:
         return None
     if not isinstance(data, dict) or not {"path", "stamp", "label", "token"} <= data.keys():
         raise ValueError(f"Invalid build coordination record for {path}")
@@ -279,9 +385,30 @@ _TOKEN_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
 def jobs_directory():
-    directory = _lock_storage() / "jobs"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    return directory
+    return _storage("jobs")
+
+
+BUILD_LOGS_KEPT = 20
+
+
+def prune_builds(keep=BUILD_LOGS_KEPT):
+    """Keep the logs and exit files of the newest ``keep`` finalized jobs; a
+    job still running, or finished but never reported, keeps its files."""
+    finalized = []
+    for record_path in jobs_directory().glob("*.json"):
+        try:
+            record = json.loads(record_path.read_text())
+            if record.get("finalized"):
+                finalized.append((record["finalized"]["at"], record))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    finalized.sort(key=lambda item: item[0], reverse=True)
+    for _, record in finalized[keep:]:
+        for key in ("log", "exit_file"):
+            try:
+                Path(record[key]).unlink(missing_ok=True)
+            except (OSError, KeyError, TypeError):
+                pass
 
 
 def _process_start(pid):
@@ -304,6 +431,7 @@ def job_record(claim, *, pid, target, log, exit_file, trace_note, started):
         "before": {str(p): s for p, s in claim.before.items()},
         "tags": {t: sorted(str(p) for p in ps) for t, ps in claim.tags.items()},
         "in_process": sorted(str(p) for p in claim.in_process),
+        "commands": dict(claim.commands),
     }
 
 
@@ -368,7 +496,8 @@ def finalize_job(record, returncode, output):
               for p, s in record["before"].items()}
     tags = {t: {Path(p) for p in ps} for t, ps in record["tags"].items()}
     in_process = {Path(p) for p in record["in_process"]}
-    completed = (completed_outputs(tags, in_process, output, returncode)
+    completed = (completed_outputs(tags, in_process, output, returncode,
+                                   record.get("commands"))
                  if returncode else set())
     finalize(outputs, before, returncode, owner, completed)
     record["finalized"] = {"returncode": returncode, "at": time.time()}
@@ -409,24 +538,56 @@ def record_finalized(token, returncode):
 
 
 def _lock_storage():
-    # Coordination identity must not depend on a client's private TMPDIR.
-    directory = Path("/tmp") / f"hol4-mcp-build-locks-{os.getuid()}"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    info = directory.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ValueError(f"Build lock directory is not private and owned by this user: {directory}")
-    return directory
+    return _storage("locks")
 
 
-def _foreign_label(directory):
-    # Atomic intent records are evidence for names, never evidence that a
-    # process is still alive. Only failure to acquire flock proves overlap.
+def _unit_lock(unit):
+    directory, stem = unit
+    digest = hashlib.sha256(f"{directory}\0{stem}".encode()).hexdigest()
+    return _lock_storage() / f"{digest}.lock"
+
+
+def _note_holder(unit, mode, claim):
+    """Best-effort record of who holds a unit's lock, for the message the
+    next server shows when it is refused; the lock itself is the evidence."""
     try:
-        records = _state_directory(directory / "placeholder").glob("*.running.json")
+        _unit_lock(unit).with_suffix(".holder.json").write_text(json.dumps({
+            "unit": f"{unit[0]}/{unit[1]}", "mode": mode, "label": claim.label,
+            "pid": os.getpid(), "since": time.time()}))
+    except OSError:
+        pass
+
+
+def _foreign_label(unit):
+    # Holder notes and intent records are evidence for names, never evidence
+    # that a process is still alive. Only failure to acquire flock proves overlap.
+    try:
+        holder = json.loads(_unit_lock(unit).with_suffix(".holder.json").read_text())
+        return f"{holder['label']} (server pid {holder['pid']}, {holder['mode']})"
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        records = _state_directory(unit[0] / "placeholder").glob("*.running.json")
         labels = {json.loads(path.read_text())["label"] for path in records}
         return "; ".join(sorted(labels)) or "another MCP server's build"
     except (OSError, ValueError, KeyError):
         return "another MCP server's build"
+
+
+def _ensure_fd_budget(needed):
+    """Raise the soft open-file limit when a closure needs more lock files
+    than it allows; False when even the hard limit cannot hold them."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = needed + 256
+    if wanted <= soft:
+        return True
+    if hard != resource.RLIM_INFINITY and wanted > hard:
+        return False
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(wanted, soft), hard))
+    except (ValueError, OSError):
+        return False
+    return True
 
 
 def finalize(outputs, before, returncode, owner, completed=frozenset()):
@@ -443,10 +604,10 @@ def finalize(outputs, before, returncode, owner, completed=frozenset()):
             if stamp is not None and stamp != before.get(path):
                 _write_state(path, "failed", stamp, owner)
         elif failed is not None and stamp != _record_stamp(failed):
-            _state_file(path, "failed").unlink(missing_ok=True)
+            _unlink_state(path, "failed")
         running = _read_state(path, "running")
         if running is not None and running["token"] == owner.token:
-            _state_file(path, "running").unlink(missing_ok=True)
+            _unlink_state(path, "running")
 
 
 class BuildClaims:
@@ -462,7 +623,8 @@ class BuildClaims:
             return  # Keep protection if killing/reaping the process failed.
         try:
             returncode = claim.proc.returncode if claim.proc is not None else None
-            completed = (completed_outputs(claim.tags, claim.in_process, output, returncode)
+            completed = (completed_outputs(claim.tags, claim.in_process, output, returncode,
+                                           claim.commands)
                          if returncode else set())
             finalize(claim.outputs, claim.before, returncode, claim, completed)
         except (OSError, ValueError) as exc:
@@ -474,38 +636,59 @@ class BuildClaims:
             self.active.pop(claim.token, None)
             claim.release_locks()
 
+    def reap_stale(self):
+        """Finish claims whose build is over but whose finishing never ran —
+        a process that exited without its controller noticing, or a claim
+        that never spawned one — so they cannot block this server forever."""
+        for previous in list(self.active.values()):
+            if previous.proc is not None:
+                stale = previous.proc.returncode is not None
+            else:
+                stale = time.time() - previous.created > 120
+            if not stale:
+                continue
+            output = ""
+            if previous.log is not None:
+                try:
+                    output = previous.log.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    output = ""
+            self.finish(previous, output)
+
     def register(self, claim):
-        read_dirs = {path.parent for path in claim.reads} | {claim.workdir}
-        write_dirs = {path.parent for path in claim.outputs}
+        claim.read_units = {artifact_unit(path) for path in claim.reads}
+        claim.write_units = {artifact_unit(path) for path in claim.outputs}
         if claim.clean:
-            write_dirs |= read_dirs
+            claim.write_units |= claim.read_units
+        self.reap_stale()
         for previous in self.active.values():
-            previous_reads = {path.parent for path in previous.reads} | {previous.workdir}
-            previous_writes = {path.parent for path in previous.outputs}
-            if previous.clean:
-                previous_writes |= previous_reads
-            overlap = (write_dirs & previous_reads) | (read_dirs & previous_writes)
+            overlap = ((claim.write_units & (previous.read_units | previous.write_units))
+                       | (claim.read_units & previous.write_units))
             if overlap:
+                shown = sorted(f"{d}/{s}" for d, s in overlap)
                 return (f"ERROR: dependency overlap with {previous.label}: "
-                        f"{', '.join(map(str, sorted(overlap)))}. No build was started. "
-                        "Wait for the running build to finish, then retry; "
-                        "hol_build_status reports detached jobs.")
+                        f"{', '.join(shown[:8])}{' …' if len(shown) > 8 else ''}. "
+                        "No build was started. Wait for the running build to finish, "
+                        "then retry; hol_build_status reports detached jobs.")
+        units = claim.read_units | claim.write_units
+        if not _ensure_fd_budget(len(units)):
+            return (f"ERROR: this build touches {len(units)} artifact units, more lock "
+                    "files than the process may open (RLIMIT_NOFILE); raise the hard "
+                    "limit or build a smaller target. No build was started.")
         accepted = False
         try:
-            storage = _lock_storage()
-            for directory in sorted(read_dirs | write_dirs):
-                digest = hashlib.sha256(str(directory).encode()).hexdigest()
-                fd = os.open(storage / f"{digest}.lock",
-                             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            for unit in sorted(units, key=lambda u: (str(u[0]), u[1])):
+                fd = os.open(_unit_lock(unit), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
                 claim.lock_fds.append(fd)
-                mode = fcntl.LOCK_EX if directory in write_dirs else fcntl.LOCK_SH
+                writing = unit in claim.write_units
                 try:
-                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    fcntl.flock(fd, (fcntl.LOCK_EX if writing else fcntl.LOCK_SH) | fcntl.LOCK_NB)
                 except BlockingIOError:
-                    return (f"ERROR: dependency overlap with {_foreign_label(directory)}: "
-                            f"{directory}. No build was started. Wait for the blocking "
-                            "build to finish and retry; foreign job IDs belong to their "
-                            "originating MCP server.")
+                    return (f"ERROR: dependency overlap with {_foreign_label(unit)}: "
+                            f"{unit[0]}/{unit[1]}. No build was started. Wait for the "
+                            "blocking build to finish and retry; foreign job IDs belong "
+                            "to their originating MCP server.")
+                _note_holder(unit, "writing" if writing else "reading", claim)
             for path in sorted(claim.reads):
                 record = _suspect(path)
                 if record is not None and path not in claim.outputs:
@@ -533,7 +716,7 @@ class BuildClaims:
                     for path in claim.outputs:
                         running = _read_state(path, "running")
                         if running is not None and running["token"] == claim.token:
-                            _state_file(path, "running").unlink(missing_ok=True)
+                            _unlink_state(path, "running")
                 finally:
                     claim.release_locks()
 
