@@ -19,7 +19,8 @@ blank the whole construct.
 Rationale: a detached job that writes a log needs no waiter. Its state is one
 read of that log, and a waiter's completion notification can only arrive
 between turns -- exactly when the log would have been read anyway. The waiter
-adds a process to abandon and a second mechanism for one question.
+adds a process to abandon and a second mechanism for one question. A detached
+MCP build already has its blocking wait: `hol_build_status(job, wait=...)`.
 
 Soft hook: the same command is blocked once, then an identical retry passes
 with an override note and is logged (hook_payload.soft_block). The literal
@@ -104,6 +105,9 @@ def main():
         "read of that log, and a waiter's notification can only arrive between",
         "turns -- exactly when the log would have been read anyway. Read the",
         "log when there is a reason to.",
+        "",
+        "A detached MCP build is waited on with hol_build_status(job, wait=100):",
+        "one call blocks up to 100 s and shows the building theory's log tail.",
         "",
         "If the job is the thing you want to wait for, background the command",
         "ITSELF (Bash run_in_background) so the harness tracks it and reports",
