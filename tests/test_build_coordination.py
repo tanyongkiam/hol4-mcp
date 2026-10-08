@@ -120,6 +120,23 @@ def test_artifact_unit_groups_a_theory_with_its_object_files(tmp_path):
     assert artifact_unit(tmp_path / "cake-sexpr-64") == (tmp_path, "cake-sexpr-64")
 
 
+def test_lock_descriptors_leave_low_numbers_to_children(tmp_path):
+    import os
+    import subprocess
+    count = 1100
+    assert coordination._ensure_fd_budget(count)
+    fds = [coordination._open_lock(tmp_path / f"{index}.lock") for index in range(count)]
+    try:
+        assert min(fds) >= coordination._LOCK_FD_BASE
+        child = subprocess.run(
+            [sys.executable, "-c", "import os; print(os.open(os.devnull, os.O_RDONLY))"],
+            pass_fds=fds, capture_output=True, text=True, check=True)
+        assert int(child.stdout) < 1024
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 def test_stale_in_memory_claim_is_reaped_by_the_next_registration(tmp_path):
     from types import SimpleNamespace
     claims = coordination.BuildClaims()

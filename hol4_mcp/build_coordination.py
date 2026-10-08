@@ -547,6 +547,21 @@ def _unit_lock(unit):
     return _lock_storage() / f"{digest}.lock"
 
 
+# Holmake and its children inherit the lock descriptors (pass_fds). Numbered
+# at or above FD_SETSIZE they leave the low numbers free for the children's
+# own descriptors: glibc aborts select() on a descriptor of FD_SETSIZE or more,
+# and a large closure holds thousands of locks.
+_LOCK_FD_BASE = 1024
+
+
+def _open_lock(path):
+    low = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        return fcntl.fcntl(low, fcntl.F_DUPFD_CLOEXEC, _LOCK_FD_BASE)
+    finally:
+        os.close(low)
+
+
 def _note_holder(unit, mode, claim):
     """Best-effort record of who holds a unit's lock, for the message the
     next server shows when it is refused; the lock itself is the evidence."""
@@ -578,7 +593,7 @@ def _ensure_fd_budget(needed):
     """Raise the soft open-file limit when a closure needs more lock files
     than it allows; False when even the hard limit cannot hold them."""
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    wanted = needed + 256
+    wanted = _LOCK_FD_BASE + needed + 256
     if wanted <= soft:
         return True
     if hard != resource.RLIM_INFINITY and wanted > hard:
@@ -678,7 +693,7 @@ class BuildClaims:
         accepted = False
         try:
             for unit in sorted(units, key=lambda u: (str(u[0]), u[1])):
-                fd = os.open(_unit_lock(unit), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                fd = _open_lock(_unit_lock(unit))
                 claim.lock_fds.append(fd)
                 writing = unit in claim.write_units
                 try:
