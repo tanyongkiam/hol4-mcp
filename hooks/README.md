@@ -62,7 +62,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H30 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|hol_goals\|hol_check_proof\|hol_send\|hol_start` | Block HOL navigation of a file whose ANCESTOR theories are stale — script newer than its built artifacts, artifacts missing (mid-rebuild), or built before their own ancestors' artifacts. Forecloses "edited upstream, kept working downstream": sessions and fresh loads read the built `.dat`, so downstream checks silently run against the pre-edit upstream with no native symptom. Make-style check over the `Ancestors`/`open` closure (comment-stripped, duplicate names resolved nearest-first, mtime-memoized under `~/.claude/hook-state/h30/`); self-clears on rebuild; target file itself exempt; also keeps H25's `hol4_file` cache current for `hol_goals`/`hol_start`. SOFT: a given (file, stale set) is blocked once with rebuild commands from each ancestor's own directory; an identical retry passes with an override note; a newly stale theory blocks again. Pre-grant: `stale ok` |
 | H31 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|mcp__hol4__hol_goals` | SOFT. Block `skip_prefix: true` once per file with the RULE K caveat (prefix-skip binds every earlier theorem by `cheat`); an identical retry passes with an override note and is logged. `false`/absent never fires. Pre-grant: `skip prefix ok` |
 | H32 | ✅     | PreToolUse            | `mcp__hol4__holmake`    | SOFT. Build ownership (RULE A): block a `holmake` with no `target` (whole-directory build) once per workdir; an identical retry passes with an override note. Targeted builds always pass — rebuilding stale ancestors in other directories is what H30 asks for. Pre-grant: `build ok` |
-| H33 | ✅     | PreToolUse            | `Bash`                  | SOFT. Block a self-defeating background waiter once — `pgrep -f` with no bracket-escape or `-x` (it matches its own command line, so the loop never ends), an `until`/`while … do … sleep` poll loop, or `sleep N` followed by a log read — redirecting to one read of the job's log, or to backgrounding the command itself; an identical retry passes with an override note. Matched on the raw command (these loops sit inside `bash -c '…'`). General shell policy, not HOL4: Claude-only like H14. Pre-grant: `waiter ok` |
+| H33 | ✅     | PreToolUse            | `Bash`                  | SOFT. Block a self-defeating background waiter once — `pgrep -f` with no bracket-escape or `-x` (it matches its own command line, so the loop never ends), an `until`/`while … do … sleep` poll loop, or `sleep N` followed by a log read — redirecting to one read of the job's log, to `hol_build_status(job, wait=…)` for a detached MCP build, or to backgrounding the command itself; an identical retry passes with an override note. Matched on the raw command (these loops sit inside `bash -c '…'`). General shell policy, not HOL4: Claude-only like H14. Pre-grant: `waiter ok` |
 
 Skipped: H2, H3, H5, H9, H11, H12, H13, H15. H21 (holmake-on-cheated-theory
 blocker) was proposed and rejected. H4 is the only live proposal.
@@ -634,7 +634,9 @@ pre-grant `waiter ok`.
 
 A detached job that writes a log needs no waiter: its state is one read of
 that log, and a waiter's notification can only arrive between turns — when
-the log would have been read anyway. To wait on a job, background the
+the log would have been read anyway. A detached MCP build is waited on with
+`hol_build_status(job, wait=100)`: one call blocks up to 100 s and shows the
+building theory's log tail. To wait on anything else, background the
 command itself (Bash `run_in_background`) so the harness reports its exit.
 Rule source: global `~/.claude/CLAUDE.md` (every background job is
 time-limited; one mechanism per question). This is general shell policy,
