@@ -120,21 +120,27 @@ def test_artifact_unit_groups_a_theory_with_its_object_files(tmp_path):
     assert artifact_unit(tmp_path / "cake-sexpr-64") == (tmp_path, "cake-sexpr-64")
 
 
-def test_lock_descriptors_leave_low_numbers_to_children(tmp_path):
-    import os
+def test_theory_builder_reads_files_under_a_closure_past_fd_setsize(tmp_path, monkeypatch):
+    # A theory builder inherits every lock of its claim. Poly/ML select()s the
+    # streams it reads, and glibc aborts that on a descriptor >= FD_SETSIZE,
+    # so the inherited locks must leave the builder low descriptor numbers.
     import subprocess
-    count = 1100
-    assert coordination._ensure_fd_budget(count)
-    fds = [coordination._open_lock(tmp_path / f"{index}.lock") for index in range(count)]
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    monkeypatch.setattr(coordination, "_lock_storage", lambda: locks)
+    script = tmp_path / "probe.sml"
+    script.write_text('val _ = print "builder read its script\\n";\n')
+    claims = coordination.BuildClaims()
+    claim = BuildClaim(tmp_path, {tmp_path / f"unit{index}" for index in range(1100)}, set())
     try:
-        assert min(fds) >= coordination._LOCK_FD_BASE
+        assert claims.register(claim) is None
         child = subprocess.run(
-            [sys.executable, "-c", "import os; print(os.open(os.devnull, os.O_RDONLY))"],
-            pass_fds=fds, capture_output=True, text=True, check=True)
-        assert int(child.stdout) < 1024
+            [str(srv.HOLDIR / "bin" / "hol"), "--gcthreads=1", "run", str(script)],
+            pass_fds=claim.lock_fds, capture_output=True, text=True, timeout=120)
     finally:
-        for fd in fds:
-            os.close(fd)
+        claims.finish(claim)
+    assert child.returncode == 0, child.stdout + child.stderr
+    assert "builder read its script" in child.stdout
 
 
 def test_stale_in_memory_claim_is_reaped_by_the_next_registration(tmp_path):
